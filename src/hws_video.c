@@ -15,6 +15,8 @@
 #include <sound/initval.h>
 #include <media/v4l2-ctrls.h>
 #include <media/v4l2-device.h>
+#include <linux/debugfs.h>
+#include <linux/seq_file.h>
 #include "hws.h"
 #include "hws_reg.h"
 #include "hws_compat.h"
@@ -27,6 +29,122 @@ static int StartVideoCapture(struct hws_pcie_dev *pdx,int index);
 static int StartAudioCapture(struct hws_pcie_dev *pdx,int index);
 static void StopAudioCapture(struct hws_pcie_dev *pdx,int index);
 static void StopVideoCapture(struct hws_pcie_dev *pdx,int index);
+static int diag_enable;
+module_param_named(diag_enable, diag_enable, int, 0644);
+MODULE_PARM_DESC(diag_enable, "Enable HWS runtime diagnostics (0=off, 1=on)");
+
+struct hws_diag_stats {
+	atomic64_t work_runs;
+	atomic64_t work_ns_total;
+	atomic64_t work_ns_max;
+	atomic64_t buf_processed;
+	atomic64_t buf_done;
+	atomic64_t buf_error;
+	atomic64_t copy_path_frames;
+	atomic64_t scaler_path_frames;
+	atomic64_t novideo_frames;
+	atomic64_t miss_frame_fallbacks;
+	atomic64_t memcopy_ns_total;
+	atomic64_t scaler_ns_total;
+};
+
+static struct hws_diag_stats hws_diag[MAX_VID_CHANNELS];
+static struct dentry *hws_diag_root;
+
+static inline void hws_diag_reset(void)
+{
+	int i;
+
+	for (i = 0; i < MAX_VID_CHANNELS; i++) {
+		atomic64_set(&hws_diag[i].work_runs, 0);
+		atomic64_set(&hws_diag[i].work_ns_total, 0);
+		atomic64_set(&hws_diag[i].work_ns_max, 0);
+		atomic64_set(&hws_diag[i].buf_processed, 0);
+		atomic64_set(&hws_diag[i].buf_done, 0);
+		atomic64_set(&hws_diag[i].buf_error, 0);
+		atomic64_set(&hws_diag[i].copy_path_frames, 0);
+		atomic64_set(&hws_diag[i].scaler_path_frames, 0);
+		atomic64_set(&hws_diag[i].novideo_frames, 0);
+		atomic64_set(&hws_diag[i].miss_frame_fallbacks, 0);
+		atomic64_set(&hws_diag[i].memcopy_ns_total, 0);
+		atomic64_set(&hws_diag[i].scaler_ns_total, 0);
+	}
+}
+
+static inline void hws_diag_update_max(atomic64_t *slot, u64 value)
+{
+	u64 old;
+
+	for (;;) {
+		old = atomic64_read(slot);
+		if (value <= old)
+			return;
+		if (atomic64_cmpxchg(slot, old, value) == old)
+			return;
+	}
+}
+
+static int hws_diag_show(struct seq_file *m, void *unused)
+{
+	int i;
+
+	seq_puts(m, "ch work_runs work_ns_total work_ns_max buf_processed buf_done buf_error copy_frames scaler_frames novideo_frames miss_fallbacks memcopy_ns_total scaler_ns_total\n");
+	for (i = 0; i < MAX_VID_CHANNELS; i++) {
+		seq_printf(m,
+			"%d %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld\n",
+			i,
+			(long long)atomic64_read(&hws_diag[i].work_runs),
+			(long long)atomic64_read(&hws_diag[i].work_ns_total),
+			(long long)atomic64_read(&hws_diag[i].work_ns_max),
+			(long long)atomic64_read(&hws_diag[i].buf_processed),
+			(long long)atomic64_read(&hws_diag[i].buf_done),
+			(long long)atomic64_read(&hws_diag[i].buf_error),
+			(long long)atomic64_read(&hws_diag[i].copy_path_frames),
+			(long long)atomic64_read(&hws_diag[i].scaler_path_frames),
+			(long long)atomic64_read(&hws_diag[i].novideo_frames),
+			(long long)atomic64_read(&hws_diag[i].miss_frame_fallbacks),
+			(long long)atomic64_read(&hws_diag[i].memcopy_ns_total),
+			(long long)atomic64_read(&hws_diag[i].scaler_ns_total));
+	}
+
+	return 0;
+}
+
+static int hws_diag_open(struct inode *inode, struct file *file)
+{
+	return single_open(file, hws_diag_show, inode->i_private);
+}
+
+static const struct file_operations hws_diag_fops = {
+	.owner = THIS_MODULE,
+	.open = hws_diag_open,
+	.read = seq_read,
+	.llseek = seq_lseek,
+	.release = single_release,
+};
+
+static void hws_diag_init_debugfs(void)
+{
+	if (hws_diag_root)
+		return;
+
+	hws_diag_root = debugfs_create_dir("hwsuhdx1", NULL);
+	if (IS_ERR_OR_NULL(hws_diag_root)) {
+		hws_diag_root = NULL;
+		return;
+	}
+
+	debugfs_create_file("video_diag", 0444, hws_diag_root, NULL, &hws_diag_fops);
+}
+
+static void hws_diag_remove_debugfs(void)
+{
+	if (!hws_diag_root)
+		return;
+
+	debugfs_remove_recursive(hws_diag_root);
+	hws_diag_root = NULL;
+}
 static void InitVideoSys(struct hws_pcie_dev *pdx,int set);
 
 //------------------------
@@ -219,7 +337,7 @@ static int v4l2_get_suport_VideoFormatIndex(struct v4l2_format *fmt)
 	}
 	return videoIndex;
 }
-v4l2_model_timing_t *v4l2_model_get_support_videoformat(int index)
+static v4l2_model_timing_t *v4l2_model_get_support_videoformat(int index)
 {
 	if(index <0 ||index >=V4L2_MODEL_VIDEOFORMAT_NUM)
 			return NULL;
@@ -228,14 +346,14 @@ v4l2_model_timing_t *v4l2_model_get_support_videoformat(int index)
 }
 
 
-framegrabber_pixfmt_t *v4l2_model_get_support_pixformat(int index)
+static framegrabber_pixfmt_t *v4l2_model_get_support_pixformat(int index)
 {
 	if(index <0 ||index >=ARRAY_SIZE(support_pixfmts))
 			return NULL;
 
 	return (framegrabber_pixfmt_t *)&support_pixfmts[index];
 }
-const framegrabber_pixfmt_t *framegrabber_g_support_pixelfmt_by_fourcc(u32 fourcc)
+static const framegrabber_pixfmt_t *framegrabber_g_support_pixelfmt_by_fourcc(u32 fourcc)
 {
 	int i;
 	int pixfmt_index=-1;
@@ -305,14 +423,7 @@ static int hws_vidioc_enum_fmt_vid_cap(struct file *file, void *priv_fh,struct v
 	}
 	return 0;
 }
-void framegrabber_g_Curr_input_framesize(struct hws_video *dev,int *width,int *height)
-{	
-	struct hws_pcie_dev *pdx = dev->dev;
-	int index = dev->index;
-	*width= pdx->m_pVCAPStatus[index][0].dwWidth;
-	*height=pdx->m_pVCAPStatus[index][0].dwHeight;
-}
-const framegrabber_pixfmt_t *framegrabber_g_out_pixelfmt(struct hws_video *dev)
+static const framegrabber_pixfmt_t *framegrabber_g_out_pixelfmt(struct hws_video *dev)
 {
 	return &support_pixfmts[dev->current_out_pixfmt];
 }
@@ -428,16 +539,13 @@ static int vidioc_s_fmt_vid_cap(struct file *file, void *priv,struct v4l2_format
 	unsigned long flags;
 	struct hws_pcie_dev *pdx = videodev->dev;
 	//printk( "%s()\n", __func__);
-  err = hws_vidioc_try_fmt_vid_cap(file, priv, f);
-    if (err)
-        return err;
+	err = hws_vidioc_try_fmt_vid_cap(file, priv, f);
+	if (err)
+		return err;
 
 	nVideoFmtIndex = v4l2_get_suport_VideoFormatIndex(f);
-	if(nVideoFmtIndex ==-1) return -EINVAL;
-
-	err = hws_vidioc_try_fmt_vid_cap(file, priv, f);
-	if (0 != err)
-		return err;
+	if (nVideoFmtIndex == -1)
+		return -EINVAL;
 	spin_lock_irqsave(&pdx->videoslock[videodev->index], flags);	
 	videodev->current_out_size_index = nVideoFmtIndex;
 	videodev->pixfmt     = f->fmt.pix.pixelformat;
@@ -463,7 +571,7 @@ static int hws_vidioc_s_std(struct file *file, void *priv,v4l2_std_id tvnorms)
 	return 0;
 }
 
-int hws_vidioc_g_parm(struct file *file,void *fh, struct v4l2_streamparm *setfps)
+static int hws_vidioc_g_parm(struct file *file,void *fh, struct v4l2_streamparm *setfps)
 {
 	struct hws_video *videodev = video_drvdata(file);
 	v4l2_model_timing_t *p_SupportmodeTiming;
@@ -600,7 +708,7 @@ static int hws_vidioc_s_input(struct file *file, void *priv, unsigned int i)
 	//printk( "%s(%d)\n", __func__,i);
 	return i ? -EINVAL : 0;
 }
-static int vidioc_log_status(struct file *file, void *priv)
+static int hws_vidioc_log_status(struct file *file, void *priv)
 {
 	//printk( "%s()\n", __func__);
 	return 0;
@@ -819,6 +927,7 @@ static struct v4l2_queryctrl *find_ctrl(unsigned int id)
 }
 //-----------------------------
 
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6,13,0)
 static struct v4l2_query_ext_ctrl g_hws_ext_ctrls[] = {
     {
         .id = V4L2_CID_BRIGHTNESS,
@@ -894,6 +1003,7 @@ static struct v4l2_query_ext_ctrl *find_ext_ctrlByIndex(int index)
     return NULL;
 }
 //-------------------------
+#endif
 #if LINUX_VERSION_CODE < KERNEL_VERSION(6,13,0)
 static int hws_vidioc_g_ctrl(struct file *file, void *fh,struct v4l2_control *a)//
 {
@@ -1102,11 +1212,7 @@ static int hws_v4l2_s_ext_ctrls(struct file *file, void *fh,struct v4l2_ext_cont
     return 0;
 
 }
-#endif 
-void mem_model_memset(void *s,int c,unsigned int n)
-{
-    memset(s,c,n);
-}
+#endif
 #if LINUX_VERSION_CODE < KERNEL_VERSION(6,13,0)
 static int hws_vidioc_queryctrl(struct file *file, void *fh,struct v4l2_queryctrl *a)
 {
@@ -1304,7 +1410,7 @@ static int hws_vidioc_enum_frameintervals(struct file *file, void *fh,
 	//printk( "%s FrameIndex=%d W=%d H=%d  FrameRate=%d \n", __func__,Index,fival->width,fival->height,FrameRate);
     return 0;
 }
-int hws_vidioc_s_parm(struct file *file, void *fh,struct v4l2_streamparm *a)
+static int hws_vidioc_s_parm(struct file *file, void *fh,struct v4l2_streamparm *a)
 {
 	struct hws_video *videodev = video_drvdata(file);
 	int io_frame_rate;
@@ -1441,7 +1547,7 @@ static const struct v4l2_ioctl_ops hws_ioctl_fops = {
 	.vidioc_enum_input = hws_vidioc_enum_input,
 	.vidioc_g_input = hws_vidioc_g_input,
 	.vidioc_s_input = hws_vidioc_s_input,
-	//.vidioc_log_status = vidioc_log_status,
+	.vidioc_log_status = hws_vidioc_log_status,
 	.vidioc_subscribe_event = v4l2_ctrl_subscribe_event,
 	.vidioc_unsubscribe_event = v4l2_event_unsubscribe,
 
@@ -1809,7 +1915,7 @@ static int _deliver_samples(struct hws_audio *drv, void *aud_data, u32 aud_len)
     return frames * 2 * drv->channels;
 }
 
-void audio_data_process(struct work_struct *p_work)
+static void audio_data_process(struct work_struct *p_work)
 {
 	struct hws_audio *drv = container_of(p_work, struct hws_audio, audiowork);
 	//struct snd_pcm_substream *substream = drv->substream;
@@ -3431,74 +3537,63 @@ static struct hwsvideo_buffer *hws_pop_any_buffer(struct hws_video *videodev, st
 
     return buf;
 }
-void video_data_process(struct work_struct *p_work)
+static void video_data_process(struct work_struct *p_work)
 {
 	struct hws_video *videodev = container_of(p_work, struct hws_video, videowork);
-	struct hwsvideo_buffer *buf;
-	//unsigned long flags;
 	unsigned long devflags;
-	int nVindex=-1;
+	int nVindex = -1;
 	int i;
-	//int copysize;
-	//uint8_t *pSrc;
 	int in_width;
 	int in_height;
 	int in_vsize;
-	int out_size=0;
+	int out_size = 0;
 	BYTE *bBuf[4];
-	int  nCopySize[4];
-	int interlace;
-	int miss_freme =0;
+	int nCopySize[4];
+	int interlace = 0;
+	int miss_freme = 0;
+	int curr_no_video;
 	struct hws_pcie_dev *pdx = videodev->dev;
 	int nCh;
+	bool diag_on = !!diag_enable;
+	u64 work_start_ns = 0;
+	u64 work_elapsed_ns = 0;
+	u64 memcopy_ns = 0;
+	u64 scaler_ns = 0;
+	u64 buf_processed = 0;
+	u64 buf_done = 0;
+	u64 buf_error = 0;
+	u64 copy_frames = 0;
+	u64 scaler_frames = 0;
+	u64 novideo_frames = 0;
+
 	bBuf[0] = NULL;
 	bBuf[1] = NULL;
 	bBuf[2] = NULL;
 	bBuf[3] = NULL;
-	nCopySize[0] =0;
-	nCopySize[1] =0;
-	nCopySize[2] =0;
-	nCopySize[3] =0;
+	nCopySize[0] = 0;
+	nCopySize[1] = 0;
+	nCopySize[2] = 0;
+	nCopySize[3] = 0;
 	nCh = videodev->index;
+
+	if (diag_on)
+		work_start_ns = ktime_get_ns();
+
+	/* Hold the device lock only while selecting/snapshotting source buffers. */
 	spin_lock_irqsave(&pdx->videoslock[nCh], devflags);
-	in_width = pdx->m_pVCAPStatus[nCh][0].dwWidth ;
+	in_width = pdx->m_pVCAPStatus[nCh][0].dwWidth;
 	in_height = pdx->m_pVCAPStatus[nCh][0].dwHeight;
-	if(pdx->m_pVCAPStatus[nCh][0].dwinterlace ==1)
-	{
-		in_height = in_height*2;
+	if (pdx->m_pVCAPStatus[nCh][0].dwinterlace == 1) {
+		in_height = in_height * 2;
 	}
-	in_vsize = in_width*in_height*2;
-	
-	//printk("video_data_process [%d]dev->m_curr_No_Video[videodev->index] =%d \n",videodev->index,dev->m_curr_No_Video[videodev->index]);
-	//---------------------------
-	if(pdx->m_curr_No_Video[nCh]==0 )
-	{
-		nVindex = -1; 
-		if(pdx->m_VideoInfo[nCh].pStatusInfo[pdx->m_nRDVideoIndex[nCh]].byLock == MEM_LOCK)
-		{
-				nVindex =pdx->m_nRDVideoIndex[nCh];
-				bBuf[0]  = pdx->m_VideoInfo[nCh].m_pVideoBufData[nVindex];
-				bBuf[1] = pdx->m_VideoInfo[nCh].m_pVideoBufData1[nVindex];
-				bBuf[2] = pdx->m_VideoInfo[nCh].m_pVideoBufData2[nVindex];
-				bBuf[3] = pdx->m_VideoInfo[nCh].m_pVideoBufData3[nVindex];
-				nCopySize[0] = pdx->m_VideoInfo[nCh].m_VideoBufferSize[0];
-				nCopySize[1] = pdx->m_VideoInfo[nCh].m_VideoBufferSize[1];
-				nCopySize[2] = pdx->m_VideoInfo[nCh].m_VideoBufferSize[2];
-				nCopySize[3] = pdx->m_VideoInfo[nCh].m_VideoBufferSize[3];
-				interlace = pdx->m_VideoInfo[nCh].pStatusInfo[nVindex].dwinterlace;
-		}
-		if(nVindex== -1)
-		{
-			miss_freme = 1;
-			if(pdx->m_nRDVideoIndex[nCh] == 0)
-			{
-				nVindex = MAX_VIDEO_QUEUE-1;
-			}
-			else
-			{
-				nVindex = pdx->m_nRDVideoIndex[nCh]-1;
-			}
-			bBuf[0]  = pdx->m_VideoInfo[nCh].m_pVideoBufData[nVindex];
+	in_vsize = in_width * in_height * 2;
+	curr_no_video = pdx->m_curr_No_Video[nCh];
+
+	if (curr_no_video == 0) {
+		nVindex = -1;
+		if (pdx->m_VideoInfo[nCh].pStatusInfo[pdx->m_nRDVideoIndex[nCh]].byLock == MEM_LOCK) {
+			nVindex = pdx->m_nRDVideoIndex[nCh];
+			bBuf[0] = pdx->m_VideoInfo[nCh].m_pVideoBufData[nVindex];
 			bBuf[1] = pdx->m_VideoInfo[nCh].m_pVideoBufData1[nVindex];
 			bBuf[2] = pdx->m_VideoInfo[nCh].m_pVideoBufData2[nVindex];
 			bBuf[3] = pdx->m_VideoInfo[nCh].m_pVideoBufData3[nVindex];
@@ -3508,79 +3603,114 @@ void video_data_process(struct work_struct *p_work)
 			nCopySize[3] = pdx->m_VideoInfo[nCh].m_VideoBufferSize[3];
 			interlace = pdx->m_VideoInfo[nCh].pStatusInfo[nVindex].dwinterlace;
 		}
-	}
-	else
-	{
-		//spin_lock_irqsave(&pdx->videoslock[nCh], devflags);
-		for( i = 0 ;i<MAX_VIDEO_QUEUE;i++)
-		{
-			if(pdx->m_VideoInfo[nCh].pStatusInfo[i].byLock == MEM_LOCK)
-			{
-				pdx->m_VideoInfo[nCh].pStatusInfo[i].byLock = MEM_UNLOCK;		
+		if (nVindex == -1) {
+			miss_freme = 1;
+			if (pdx->m_nRDVideoIndex[nCh] == 0) {
+				nVindex = MAX_VIDEO_QUEUE - 1;
+			} else {
+				nVindex = pdx->m_nRDVideoIndex[nCh] - 1;
 			}
+			bBuf[0] = pdx->m_VideoInfo[nCh].m_pVideoBufData[nVindex];
+			bBuf[1] = pdx->m_VideoInfo[nCh].m_pVideoBufData1[nVindex];
+			bBuf[2] = pdx->m_VideoInfo[nCh].m_pVideoBufData2[nVindex];
+			bBuf[3] = pdx->m_VideoInfo[nCh].m_pVideoBufData3[nVindex];
+			nCopySize[0] = pdx->m_VideoInfo[nCh].m_VideoBufferSize[0];
+			nCopySize[1] = pdx->m_VideoInfo[nCh].m_VideoBufferSize[1];
+			nCopySize[2] = pdx->m_VideoInfo[nCh].m_VideoBufferSize[2];
+			nCopySize[3] = pdx->m_VideoInfo[nCh].m_VideoBufferSize[3];
+			interlace = pdx->m_VideoInfo[nCh].pStatusInfo[nVindex].dwinterlace;
 		}
-		//spin_unlock_irqrestore(&pdx->videoslock[nCh], devflags);
-	}
-	//---------------------------
-	for (;;) {
-        struct hws_vfh_ctx *ctx;
-        struct hwsvideo_buffer *buf;
-
-        /* We cannot hold pdx spinlock while taking other locks. So: keep pdx lock held,
-         * but hws_pop_any_buffer only takes spinlocks (OK). */
-        buf = hws_pop_any_buffer(videodev, &ctx);
-        if (!buf)
-            break;
-
-        buf->vb.vb2_buf.timestamp = ktime_get_ns();
-        buf->vb.field = V4L2_FIELD_NONE;
-
-        if (!buf->mem) {
-            vb2_buffer_done(&buf->vb.vb2_buf, VB2_BUF_STATE_ERROR);
-            continue;
-        }
-		// copy data to buffer 
-		if(pdx->m_curr_No_Video[nCh]==0 )
-		{
-			out_size = videodev->current_out_width*videodev->curren_out_height*2;
-			if(in_vsize != out_size)
-			{
-				//printk("in_width =%d  in_height =%d \n",in_width,in_height);
-				//printk("out_width =%d out_height =%d \n",videodev->current_out_width,videodev->curren_out_height);
-				if(pdx->m_VideoInfo[nCh].m_pVideoScalerBuf)
-				{
-					MemCopyFrame(nCh,pdx->m_VideoInfo[nCh].m_pVideoScalerBuf,in_width,in_height,interlace,bBuf,nCopySize);
-					VideoScaler(pdx->m_VideoInfo[nCh].m_pVideoScalerBuf,buf->mem,in_width,in_height,videodev->current_out_width,videodev->curren_out_height);
-				}
+	} else {
+		for (i = 0; i < MAX_VIDEO_QUEUE; i++) {
+			if (pdx->m_VideoInfo[nCh].pStatusInfo[i].byLock == MEM_LOCK) {
+				pdx->m_VideoInfo[nCh].pStatusInfo[i].byLock = MEM_UNLOCK;
 			}
-			else
-			{
-				MemCopyFrame(nCh,buf->mem,in_width,in_height,interlace,bBuf,nCopySize);
-			}
-		}
-		else
-		{
-			SetNoVideoMem(buf->mem,videodev->current_out_width,videodev->curren_out_height);
-		}
-		buf->vb.sequence = videodev->seqnr++;
-        vb2_buffer_done(&buf->vb.vb2_buf, VB2_BUF_STATE_DONE);	
-	}
-	
-		
-
-vexit:
-	//spin_lock_irqsave(&pdx->videoslock[nCh], devflags);
-	if(pdx->m_curr_No_Video[nCh]==0 && nVindex >= 0)
-	{
-		pdx->m_VideoInfo[nCh].pStatusInfo[nVindex].byLock  = MEM_UNLOCK;
-		pdx->m_nRDVideoIndex[nCh] = nVindex+1;
-		if(pdx->m_nRDVideoIndex[nCh] >=MAX_VIDEO_QUEUE)
-		{
-			pdx->m_nRDVideoIndex[nCh] =0;
 		}
 	}
 	spin_unlock_irqrestore(&pdx->videoslock[nCh], devflags);
-	return;
+
+	for (;;) {
+		struct hws_vfh_ctx *ctx;
+		struct hwsvideo_buffer *buf;
+
+		buf = hws_pop_any_buffer(videodev, &ctx);
+		if (!buf) {
+			break;
+		}
+		buf_processed++;
+
+		buf->vb.vb2_buf.timestamp = ktime_get_ns();
+		buf->vb.field = V4L2_FIELD_NONE;
+
+		if (!buf->mem) {
+			vb2_buffer_done(&buf->vb.vb2_buf, VB2_BUF_STATE_ERROR);
+			buf_error++;
+			continue;
+		}
+
+		if (curr_no_video == 0) {
+			u64 copy_start;
+
+			out_size = videodev->current_out_width * videodev->curren_out_height * 2;
+			if (in_vsize != out_size) {
+				if (pdx->m_VideoInfo[nCh].m_pVideoScalerBuf) {
+					copy_start = diag_on ? ktime_get_ns() : 0;
+					MemCopyFrame(nCh, pdx->m_VideoInfo[nCh].m_pVideoScalerBuf, in_width, in_height, interlace, bBuf, nCopySize);
+					if (diag_on)
+						memcopy_ns += ktime_get_ns() - copy_start;
+
+					copy_start = diag_on ? ktime_get_ns() : 0;
+					VideoScaler(pdx->m_VideoInfo[nCh].m_pVideoScalerBuf, buf->mem, in_width, in_height,
+						videodev->current_out_width, videodev->curren_out_height);
+					if (diag_on)
+						scaler_ns += ktime_get_ns() - copy_start;
+					scaler_frames++;
+				}
+			} else {
+				copy_start = diag_on ? ktime_get_ns() : 0;
+				MemCopyFrame(nCh, buf->mem, in_width, in_height, interlace, bBuf, nCopySize);
+				if (diag_on)
+					memcopy_ns += ktime_get_ns() - copy_start;
+				copy_frames++;
+			}
+		} else {
+			SetNoVideoMem(buf->mem, videodev->current_out_width, videodev->curren_out_height);
+			novideo_frames++;
+		}
+
+		buf->vb.sequence = videodev->seqnr++;
+		vb2_buffer_done(&buf->vb.vb2_buf, VB2_BUF_STATE_DONE);
+		buf_done++;
+	}
+
+	spin_lock_irqsave(&pdx->videoslock[nCh], devflags);
+	if (curr_no_video == 0 && nVindex >= 0) {
+		pdx->m_VideoInfo[nCh].pStatusInfo[nVindex].byLock = MEM_UNLOCK;
+		pdx->m_nRDVideoIndex[nCh] = nVindex + 1;
+		if (pdx->m_nRDVideoIndex[nCh] >= MAX_VIDEO_QUEUE) {
+			pdx->m_nRDVideoIndex[nCh] = 0;
+		}
+	}
+	spin_unlock_irqrestore(&pdx->videoslock[nCh], devflags);
+
+	if (diag_on) {
+		work_elapsed_ns = ktime_get_ns() - work_start_ns;
+		atomic64_inc(&hws_diag[nCh].work_runs);
+		atomic64_add(work_elapsed_ns, &hws_diag[nCh].work_ns_total);
+		hws_diag_update_max(&hws_diag[nCh].work_ns_max, work_elapsed_ns);
+		atomic64_add(buf_processed, &hws_diag[nCh].buf_processed);
+		atomic64_add(buf_done, &hws_diag[nCh].buf_done);
+		atomic64_add(buf_error, &hws_diag[nCh].buf_error);
+		atomic64_add(copy_frames, &hws_diag[nCh].copy_path_frames);
+		atomic64_add(scaler_frames, &hws_diag[nCh].scaler_path_frames);
+		atomic64_add(novideo_frames, &hws_diag[nCh].novideo_frames);
+		if (miss_freme)
+			atomic64_inc(&hws_diag[nCh].miss_frame_fallbacks);
+		atomic64_add(memcopy_ns, &hws_diag[nCh].memcopy_ns_total);
+		atomic64_add(scaler_ns, &hws_diag[nCh].scaler_ns_total);
+	}
+
+	(void)miss_freme;
 }
 static void hws_get_video_param(struct hws_pcie_dev *dev,int index)
 {
@@ -3606,7 +3736,7 @@ static void hws_adapters_init(struct hws_pcie_dev *dev)
 		hws_get_video_param(dev,i);
 	}
 }
-void hws_remove_deviceregister(struct hws_pcie_dev *dev)
+static void hws_remove_deviceregister(struct hws_pcie_dev *dev)
 {
 	int i;
 	struct video_device *vdev ;
@@ -3620,7 +3750,7 @@ void hws_remove_deviceregister(struct hws_pcie_dev *dev)
 		}
 	}
 }
-int hws_video_register(struct hws_pcie_dev *dev)
+static int hws_video_register(struct hws_pcie_dev *dev)
 {
 	struct video_device *vdev ;
 	struct vb2_queue *q ;
@@ -3782,7 +3912,7 @@ static struct snd_pcm_hardware audio_pcm_hardware ={
 	.buffer_bytes_max = HWS_AUDIO_CELL_SIZE*4,
 };
 #endif
-int hws_pcie_audio_open(struct snd_pcm_substream *substream)
+static int hws_pcie_audio_open(struct snd_pcm_substream *substream)
 {
 	struct hws_audio *drv = snd_pcm_substream_chip(substream);
 	struct snd_pcm_runtime *runtime = substream->runtime;
@@ -3797,25 +3927,25 @@ int hws_pcie_audio_open(struct snd_pcm_substream *substream)
 	return 0;
 }
 
-int hws_pcie_audio_close(struct snd_pcm_substream *substream)
+static int hws_pcie_audio_close(struct snd_pcm_substream *substream)
 {
 //	struct hws_audio *chip = snd_pcm_substream_chip(substream);
 	//printk(KERN_INFO "%s() \n",__func__);
 	return 0;
 } 
-int hws_pcie_audio_hw_params(struct snd_pcm_substream *substream, struct snd_pcm_hw_params *hw_params)
+static int hws_pcie_audio_hw_params(struct snd_pcm_substream *substream, struct snd_pcm_hw_params *hw_params)
 {
 	//printk(KERN_INFO "%s() \n",__func__);
 	return snd_pcm_lib_malloc_pages(substream, params_buffer_bytes(hw_params));
 }  
 
-int hws_pcie_audio_hw_free(struct snd_pcm_substream *substream)
+static int hws_pcie_audio_hw_free(struct snd_pcm_substream *substream)
 {
 	//printk(KERN_INFO "%s() \n",__func__);
 	return snd_pcm_lib_free_pages(substream);
 } 
 
-int hws_pcie_audio_prepare(struct snd_pcm_substream *substream)
+static int hws_pcie_audio_prepare(struct snd_pcm_substream *substream)
 {
 	struct snd_pcm_runtime *runtime = substream->runtime;
 	struct hws_audio *drv = snd_pcm_substream_chip(substream);
@@ -3835,7 +3965,7 @@ int hws_pcie_audio_prepare(struct snd_pcm_substream *substream)
 	
 	return 0;
 }  
-int hws_pcie_audio_trigger(struct snd_pcm_substream *substream, int cmd)
+static int hws_pcie_audio_trigger(struct snd_pcm_substream *substream, int cmd)
 {
 	struct hws_audio *chip = snd_pcm_substream_chip(substream);
 	struct hws_pcie_dev *dev= chip->dev;
@@ -3893,7 +4023,7 @@ struct snd_pcm_ops hws_pcie_pcm_ops ={
 	.pointer =		hws_pcie_audio_pointer
 };
 
-int hws_audio_register(struct hws_pcie_dev *dev)
+static int hws_audio_register(struct hws_pcie_dev *dev)
 {
 	struct snd_pcm		*pcm;
 	struct snd_card 	*card;
@@ -4518,7 +4648,7 @@ static void irq_teardown(struct hws_pcie_dev *lro)
 		free_irq(lro->irq_line, lro);
 	}
 }
-void StopKSThread(struct hws_pcie_dev *pdx)
+static void StopKSThread(struct hws_pcie_dev *pdx)
 {
 	if(pdx->mMain_tsk)
 	{
@@ -4535,6 +4665,7 @@ static void hws_remove(struct pci_dev *pdev)
 		(struct hws_pcie_dev*) pci_get_drvdata(pdev);
 	//----------------------------
 	if(dev->map_bar0_addr == NULL) return;
+	hws_diag_remove_debugfs();
 	//StopSys(dev);
 	StopDevice(dev);
 	/* disable interrupts */
@@ -4963,7 +5094,7 @@ static int SetQuene(struct hws_pcie_dev  *pdx,int nDecoder)
 }
 
 //------------------------------------
-int MemCopyAudioToSteam( struct hws_pcie_dev  *pdx,int dwAudioCh)
+static int MemCopyAudioToSteam( struct hws_pcie_dev  *pdx,int dwAudioCh)
 {
 	int i=0;
 	BYTE *bBuf = NULL;
@@ -5042,7 +5173,7 @@ int MemCopyAudioToSteam( struct hws_pcie_dev  *pdx,int dwAudioCh)
    return 0;
 }
 
-int SetAudioQuene( struct hws_pcie_dev *pdx,int dwAudioCh)
+static int SetAudioQuene( struct hws_pcie_dev *pdx,int dwAudioCh)
 {
 	int status =-1;
 	//int i;
@@ -5756,7 +5887,7 @@ static void CheckVideFmt (struct hws_pcie_dev *pdx)
 		
 }
 
-int MainKsThreadHandle(void *arg)
+static int MainKsThreadHandle(void *arg)
 {
         int need_check=0;
 		int i=0;
@@ -5799,7 +5930,7 @@ static void StartKSThread(struct hws_pcie_dev *pdx)
 
 
 #ifndef arch_msi_check_device
-int arch_msi_check_device(struct pci_dev *dev, int nvec, int type)
+static int arch_msi_check_device(struct pci_dev *dev, int nvec, int type)
 {
 	return 0;
 }
@@ -6244,6 +6375,8 @@ static int hws_probe(struct pci_dev *pdev, const struct pci_device_id *pci_id)
 	gdev->wq =   create_singlethread_workqueue("hwsuhdx1");
 	gdev->auwq = create_singlethread_workqueue("hwsuhdx1-audio");
 	//----------------
+	hws_diag_reset();
+	hws_diag_init_debugfs();
 	if( hws_video_register(gdev) )
 		goto err_mem_alloc;
 #if 1
@@ -6252,6 +6385,7 @@ static int hws_probe(struct pci_dev *pdev, const struct pci_device_id *pci_id)
 #endif	
 	return 0;
 err_mem_alloc:
+hws_diag_remove_debugfs();
 	
 		 gdev->m_bBufferAllocate = TRUE;
 		 DmaMemFreePool(gdev);
