@@ -17,6 +17,7 @@
 #include <media/v4l2-device.h>
 #include <linux/debugfs.h>
 #include <linux/seq_file.h>
+#include <linux/sched.h>
 #include "hws.h"
 #include "hws_reg.h"
 #include "hws_compat.h"
@@ -32,6 +33,15 @@ static void StopVideoCapture(struct hws_pcie_dev *pdx,int index);
 static int diag_enable;
 module_param_named(diag_enable, diag_enable, int, 0644);
 MODULE_PARM_DESC(diag_enable, "Enable HWS runtime diagnostics (0=off, 1=on)");
+
+static int video_work_budget = 2;
+module_param_named(video_work_budget, video_work_budget, int, 0644);
+MODULE_PARM_DESC(video_work_budget, "Max queued buffers handled per video worker run (min 1)");
+
+static inline bool hws_diag_enabled(void)
+{
+	return diag_enable != 0;
+}
 
 struct hws_diag_stats {
 	atomic64_t work_runs;
@@ -710,7 +720,12 @@ static int hws_vidioc_s_input(struct file *file, void *priv, unsigned int i)
 }
 static int hws_vidioc_log_status(struct file *file, void *priv)
 {
-	//printk( "%s()\n", __func__);
+	/*
+	 * Avoid START/END STATUS banner spam unless diagnostics were explicitly
+	 * enabled by module parameter.
+	 */
+	if (!hws_diag_enabled())
+		return -ENOTTY;
 	return 0;
 }
 
@@ -724,6 +739,20 @@ static ssize_t hws_read(struct file *file,char *buf,size_t count, loff_t *ppos)
 static inline struct hws_vfh_ctx *hws_ctx_from_file(struct file *file)
 {
     return container_of(file->private_data, struct hws_vfh_ctx, fh);
+}
+
+static bool hws_cmd_requires_exclusive_owner(unsigned int cmd)
+{
+    switch (cmd) {
+    case VIDIOC_S_FMT:
+    case VIDIOC_REQBUFS:
+    case VIDIOC_CREATE_BUFS:
+    case VIDIOC_STREAMON:
+    case VIDIOC_STREAMOFF:
+        return true;
+    default:
+        return false;
+    }
 }
 
 /* B1 multi-consumer vb2 ops (per-file queue). Defined later in this file. */
@@ -746,6 +775,7 @@ static int hws_open(struct file *file)
     INIT_LIST_HEAD(&ctx->buf_queue);
     spin_lock_init(&ctx->qlock);
     ctx->streaming = false;
+    ctx->seqnr = 0;
 
     /* v4l2 file-handle */
     v4l2_fh_init(&ctx->fh, &videodev->vdev);
@@ -804,10 +834,25 @@ static int hws_release(struct file *file)
         videodev->fileindex--;
     spin_unlock_irqrestore(&pdx->videoslock[videodev->index], flags);
 
+    /*
+     * Ensure no in-flight videowork still references this ctx while we
+     * tear down vb2 resources.
+     */
+    flush_work(&videodev->videowork);
+
     /* remove from consumers */
     spin_lock_irqsave(&videodev->consumers_lock, flags);
     list_del(&ctx->node);
     spin_unlock_irqrestore(&videodev->consumers_lock, flags);
+
+    /*
+     * Single-owner mode: if this fd owned stream-affecting ioctls, release
+     * ownership on close so a later opener can claim it.
+     */
+    mutex_lock(&videodev->ioctl_lock);
+    if (videodev->ioctl_owner == ctx)
+        videodev->ioctl_owner = NULL;
+    mutex_unlock(&videodev->ioctl_lock);
 
     /* release vb2 queue resources */
     vb2_queue_release(&ctx->vbq);
@@ -1014,7 +1059,8 @@ static int hws_vidioc_g_ctrl(struct file *file, void *fh,struct v4l2_control *a)
 	//int bchs_select=0;
 	if(ctrl ==NULL)
 	{
-		printk( "%s(ch-%d)ctrl=NULL\n", __func__,videodev->index);
+		if (hws_diag_enabled())
+			pr_info_ratelimited("hws: %s ch=%d ctrl is NULL\n", __func__, videodev->index);
 		return ret;
 	}
 	//printk( "%s(ch-%d)\n", __func__,videodev->index);
@@ -1053,7 +1099,8 @@ static int hws_vidioc_g_ctrl(struct file *file, void *fh,struct v4l2_control *a)
 			break; // 			
 		default:
 		    ctrl->value =0;
-			printk("control id %d not handled\n", ctrl->id);
+			if (hws_diag_enabled())
+				pr_info_ratelimited("hws: g_ctrl unsupported id=0x%x\n", ctrl->id);
 		    break;	
 		
 	}
@@ -1068,7 +1115,8 @@ static int hws_v4l2_g_ext_ctrls(struct file *file, void *fh,struct v4l2_ext_cont
     int i;
 	if(cs ==NULL)
 	{
-		printk( "%s(ch-%d)cs=NULL\n", __func__,videodev->index);
+		if (hws_diag_enabled())
+		pr_info_ratelimited("hws: %s ch=%d ext ctrls are NULL\n", __func__, videodev->index);
 		return -EINVAL;
 	}
 	//printk( "%s(ch-%d)-%d\n", __func__,videodev->index,cs->count);
@@ -1092,7 +1140,8 @@ static int hws_v4l2_g_ext_ctrls(struct file *file, void *fh,struct v4l2_ext_cont
             default:
                 // 设置错误索引并返回
                 cs->error_idx = i;
-                printk("Unsupported control id: 0x%x\n", c->id);
+                if (hws_diag_enabled())
+					pr_info_ratelimited("hws: g_ext_ctrls unsupported id=0x%x\n", c->id);
                 return -EINVAL;
         }
     }
@@ -1109,7 +1158,8 @@ static int hws_vidioc_s_ctrl(struct file *file, void *fh,struct v4l2_control *a)
 	int ret = -EINVAL;
 	if(ctrl ==NULL)
 	{
-		printk( "%s(ch-%d)ctrl=NULL\n", __func__,videodev->index);
+		if (hws_diag_enabled())
+			pr_info_ratelimited("hws: %s ch=%d ctrl is NULL\n", __func__, videodev->index);
 		return ret;
 	}
 	//printk( "%s(ch-%d ctrl->id =%X )\n", __func__,videodev->index,ctrl->id);
@@ -1144,13 +1194,15 @@ static int hws_vidioc_s_ctrl(struct file *file, void *fh,struct v4l2_control *a)
 			{
 				//error
 				ret = -ERANGE;
-				printk("control %s out of range\n", found_ctrl->name);
+				if (hws_diag_enabled())
+					pr_info_ratelimited("hws: s_ctrl out of range: %s\n", found_ctrl->name);
 			}
 			break;
 		default:
 		{
 			//error
-			printk("control type %d not handled\n", found_ctrl->type);
+			if (hws_diag_enabled())
+					pr_info_ratelimited("hws: s_ctrl unsupported type=%d\n", found_ctrl->type);
 			}
 			
 		}
@@ -1166,7 +1218,8 @@ static int hws_v4l2_s_ext_ctrls(struct file *file, void *fh,struct v4l2_ext_cont
     int i;
 	if(cs ==NULL)
 	{
-		printk( "%s(ch-%d)cs=NULL\n", __func__,videodev->index);
+		if (hws_diag_enabled())
+		pr_info_ratelimited("hws: %s ch=%d ext ctrls are NULL\n", __func__, videodev->index);
 		return -EINVAL;
 	}
 	printk( "%s(ch-%d)-%d\n", __func__,videodev->index,cs->count);
@@ -1279,59 +1332,56 @@ static int hws_vidioc_queryctrl(struct file *file, void *fh,struct v4l2_queryctr
 
 }
 #else
-static int hws_v4l2_query_ext_ctrl(struct file *file, void *fh,struct v4l2_query_ext_ctrl  *qc)
+static int hws_v4l2_query_ext_ctrl(struct file *file, void *fh, struct v4l2_query_ext_ctrl *qc)
 {
 	struct hws_video *videodev = video_drvdata(file);
-    struct v4l2_query_ext_ctrl *found_ctrl;
-    unsigned int id;
-    unsigned int mask_id;
-    int ret = -EINVAL;
-	if(qc ==NULL)
-	{
-		printk( "%s(ch-%d)cs=NULL\n", __func__,videodev->index);
+	struct v4l2_query_ext_ctrl *found_ctrl;
+	unsigned int id;
+	unsigned int mask_id;
+	int ret = -EINVAL;
+
+	if (qc == NULL) {
+		if (hws_diag_enabled())
+			pr_info_ratelimited("hws: %s ch=%d ext ctrls are NULL\n", __func__, videodev->index);
 		return ret;
 	}
-	printk( "%s(ch-%d)\n", __func__,videodev->index);
-	
-    id = qc->id & (~V4L2_CTRL_FLAG_NEXT_CTRL);
-    mask_id = qc->id & V4L2_CTRL_FLAG_NEXT_CTRL;
-	printk( "id= %d mask_id=%dn",id ,mask_id);
-	return ret;
-    if (mask_id == V4L2_CTRL_FLAG_NEXT_CTRL) {
-        if (id == 0) {
-            videodev->queryIndex = 0;
-            found_ctrl = find_ext_ctrlByIndex(videodev->queryIndex);
-            if (found_ctrl) {
-                memcpy(qc, found_ctrl, sizeof(*qc));
-                // 清除 NEXT_CTRL 标志
-                qc->id = found_ctrl->id; 
-                ret = 0;
-            }
-        } else {
-            videodev->queryIndex++;
-            found_ctrl = find_ext_ctrlByIndex(videodev->queryIndex);
-            if (found_ctrl) {
-                memcpy(qc, found_ctrl, sizeof(*qc));
-                qc->id = found_ctrl->id;
-                ret = 0;
-            } else {
-                // 返回空控制项表示结束
-                memset(qc, 0, sizeof(*qc));
-                ret = -EINVAL;
-            }
-        }
-    } else {
-        found_ctrl = find_ext_ctrlByIndex(id);
-        if (found_ctrl) {
-            memcpy(qc, found_ctrl, sizeof(*qc));
-            ret = 0;
-        } else {
-            memset(qc, 0, sizeof(*qc));
-            ret = -EINVAL;
-        }
-    }
-    return ret;
 
+	id = qc->id & (~V4L2_CTRL_FLAG_NEXT_CTRL);
+	mask_id = qc->id & V4L2_CTRL_FLAG_NEXT_CTRL;
+
+	if (mask_id == V4L2_CTRL_FLAG_NEXT_CTRL) {
+		if (id == 0) {
+			videodev->queryIndex = 0;
+			found_ctrl = find_ext_ctrlByIndex(videodev->queryIndex);
+			if (found_ctrl) {
+				memcpy(qc, found_ctrl, sizeof(*qc));
+				qc->id = found_ctrl->id;
+				ret = 0;
+			}
+		} else {
+			videodev->queryIndex++;
+			found_ctrl = find_ext_ctrlByIndex(videodev->queryIndex);
+			if (found_ctrl) {
+				memcpy(qc, found_ctrl, sizeof(*qc));
+				qc->id = found_ctrl->id;
+				ret = 0;
+			} else {
+				memset(qc, 0, sizeof(*qc));
+				ret = -EINVAL;
+			}
+		}
+	} else {
+		found_ctrl = find_ext_ctrl(id);
+		if (found_ctrl) {
+			memcpy(qc, found_ctrl, sizeof(*qc));
+			ret = 0;
+		} else {
+			memset(qc, 0, sizeof(*qc));
+			ret = -EINVAL;
+		}
+	}
+
+	return ret;
 }
 #endif 
 #if 0
@@ -1436,6 +1486,8 @@ static long hws_unlocked_ioctl(struct file *file, unsigned int cmd, unsigned lon
     struct hws_vfh_ctx *ctx;
     struct hws_video *videodev;
     struct vb2_queue *oldq;
+    bool needs_owner;
+    bool owner_claimed = false;
     long ret;
 
     if (!fh)
@@ -1443,11 +1495,42 @@ static long hws_unlocked_ioctl(struct file *file, unsigned int cmd, unsigned lon
     ctx = container_of(fh, struct hws_vfh_ctx, fh);
     videodev = ctx->video;
 
+    /*
+     * Some userspace stacks aggressively call VIDIOC_LOG_STATUS and can flood
+     * the kernel log. Keep it opt-in behind diag_enable.
+     */
+    if (cmd == VIDIOC_LOG_STATUS && !hws_diag_enabled())
+        return -ENOTTY;
+
     mutex_lock(&videodev->ioctl_lock);
+
+    needs_owner = hws_cmd_requires_exclusive_owner(cmd);
+    if (needs_owner) {
+        if (videodev->ioctl_owner && videodev->ioctl_owner != ctx) {
+            ret = -EBUSY;
+            goto out_unlock;
+        }
+        if (!videodev->ioctl_owner) {
+            videodev->ioctl_owner = ctx;
+            owner_claimed = true;
+        }
+    }
+
     oldq = videodev->vdev.queue;
     videodev->vdev.queue = &ctx->vbq;
     ret = video_ioctl2(file, cmd, arg);
     videodev->vdev.queue = oldq;
+
+    /*
+     * If a first claim fails immediately, do not keep stale ownership.
+     * STREAMOFF (or close) releases ownership after a successful stop.
+     */
+    if (ret && owner_claimed)
+        videodev->ioctl_owner = NULL;
+    else if (!ret && cmd == VIDIOC_STREAMOFF && videodev->ioctl_owner == ctx)
+        videodev->ioctl_owner = NULL;
+
+out_unlock:
     mutex_unlock(&videodev->ioctl_lock);
 
     return ret;
@@ -1796,6 +1879,7 @@ static int hws_start_streaming_multi(struct vb2_queue *q, unsigned int count)
     struct hws_video *videodev = ctx->video;
 
     ctx->streaming = true;
+    ctx->seqnr = 0;
 
     /* Start hardware engine only once, on first streamer */
     if (atomic_inc_return(&videodev->engine_users) == 1) {
@@ -1813,6 +1897,12 @@ static void hws_stop_streaming_multi(struct vb2_queue *q)
     unsigned long flags;
 
     ctx->streaming = false;
+
+    /*
+     * Serialize with worker-side dequeue so buffers from this ctx are not
+     * completed after vb2 teardown starts.
+     */
+    flush_work(&videodev->videowork);
 
     /* Return all pending buffers for this ctx */
     spin_lock_irqsave(&ctx->qlock, flags);
@@ -2665,6 +2755,8 @@ void All_VideoScaler(BYTE *pSrc,BYTE *pOut,int in_w,int in_h,int out_w,int out_h
    
    for(y=0;y<(out_h-(dumyY*2));y++)
    {
+		if ((y & 0x1f) == 0)
+			cond_resched();
    		if(dumyX>0)
    		{
    			pDstYUV = pDestBuf;
@@ -3400,6 +3492,8 @@ static int  MemCopyFrame(int nDecoder,BYTE * dest,int nWidth,int nHeight,int int
 		//DbgPrint("MemCopyFrame bufer0 nCopySize[0]= %d  res_size=%d line_cnt =%d \n",nCopySize[0],res_size,line_cnt);
 		for(h=0; h <line_cnt; h++)
 		{
+				if ((h & 0x3f) == 0)
+					cond_resched();
 			memcpy(dest,pSrcBuf,nWidth*2);
 			dest += nWidth*2;
 			memcpy(dest,pSrcBuf,nWidth*2);
@@ -3433,6 +3527,8 @@ static int  MemCopyFrame(int nDecoder,BYTE * dest,int nWidth,int nHeight,int int
 		//DbgPrint("MemCopyFrame bufer1 nCopySize[1]= %d  res_size=%d line_cnt =%d \n",nCopySize[1],res_size,line_cnt);
 		for(h=0; h <line_cnt; h++)
 		{
+				if ((h & 0x3f) == 0)
+					cond_resched();
 			memcpy(dest,pSrcBuf,nWidth*2);
 			dest += nWidth*2;
 			memcpy(dest,pSrcBuf,nWidth*2);
@@ -3467,6 +3563,8 @@ static int  MemCopyFrame(int nDecoder,BYTE * dest,int nWidth,int nHeight,int int
 		//DbgPrint("MemCopyFrame bufer2 nCopySize[2]= %d  res_size=%d line_cnt =%d \n",nCopySize[2],res_size,line_cnt);
 		for(h=0; h <line_cnt; h++)
 		{
+				if ((h & 0x3f) == 0)
+					cond_resched();
 			memcpy(dest,pSrcBuf,nWidth*2);
 			dest += nWidth*2;
 			memcpy(dest,pSrcBuf,nWidth*2);
@@ -3496,6 +3594,8 @@ static int  MemCopyFrame(int nDecoder,BYTE * dest,int nWidth,int nHeight,int int
 		//DbgPrint("MemCopyFrame bufer3 nCopySize[3]= %d  res_size=%d line_cnt =%d \n",nCopySize[3],res_size,line_cnt);
 		for(h=0; h <line_cnt; h++)
 		{
+				if ((h & 0x3f) == 0)
+					cond_resched();
 			memcpy(dest,pSrcBuf,nWidth*2);
 			dest += nWidth*2;
 			memcpy(dest,(dest-nWidth*2),nWidth*2);
@@ -3510,24 +3610,25 @@ static int  MemCopyFrame(int nDecoder,BYTE * dest,int nWidth,int nHeight,int int
 }
 
 //--------------------------------
-static struct hwsvideo_buffer *hws_pop_any_buffer(struct hws_video *videodev, struct hws_vfh_ctx **out_ctx)
+static struct hwsvideo_buffer *hws_pop_any_buffer(struct hws_video *videodev)
 {
     struct hws_vfh_ctx *ctx;
     struct hwsvideo_buffer *buf = NULL;
     unsigned long flags;
 
-    *out_ctx = NULL;
-
     spin_lock_irqsave(&videodev->consumers_lock, flags);
     list_for_each_entry(ctx, &videodev->consumers, node) {
         unsigned long qflags;
+
         if (!ctx->streaming)
             continue;
+
         spin_lock_irqsave(&ctx->qlock, qflags);
         if (!list_empty(&ctx->buf_queue)) {
             buf = list_first_entry(&ctx->buf_queue, struct hwsvideo_buffer, queue);
             list_del(&buf->queue);
-            *out_ctx = ctx;
+            /* Round-robin fairness across active consumers. */
+            list_move_tail(&ctx->node, &videodev->consumers);
             spin_unlock_irqrestore(&ctx->qlock, qflags);
             break;
         }
@@ -3537,6 +3638,33 @@ static struct hwsvideo_buffer *hws_pop_any_buffer(struct hws_video *videodev, st
 
     return buf;
 }
+
+static bool hws_has_pending_buffers(struct hws_video *videodev)
+{
+    struct hws_vfh_ctx *ctx;
+    unsigned long flags;
+    bool pending = false;
+
+    spin_lock_irqsave(&videodev->consumers_lock, flags);
+    list_for_each_entry(ctx, &videodev->consumers, node) {
+        unsigned long qflags;
+
+        if (!ctx->streaming)
+            continue;
+
+        spin_lock_irqsave(&ctx->qlock, qflags);
+        if (!list_empty(&ctx->buf_queue)) {
+            pending = true;
+            spin_unlock_irqrestore(&ctx->qlock, qflags);
+            break;
+        }
+        spin_unlock_irqrestore(&ctx->qlock, qflags);
+    }
+    spin_unlock_irqrestore(&videodev->consumers_lock, flags);
+
+    return pending;
+}
+
 static void video_data_process(struct work_struct *p_work)
 {
 	struct hws_video *videodev = container_of(p_work, struct hws_video, videowork);
@@ -3546,7 +3674,10 @@ static void video_data_process(struct work_struct *p_work)
 	int in_width;
 	int in_height;
 	int in_vsize;
+	int out_width;
+	int out_height;
 	int out_size = 0;
+	bool needs_scaler;
 	BYTE *bBuf[4];
 	int nCopySize[4];
 	int interlace = 0;
@@ -3565,6 +3696,9 @@ static void video_data_process(struct work_struct *p_work)
 	u64 copy_frames = 0;
 	u64 scaler_frames = 0;
 	u64 novideo_frames = 0;
+	unsigned int budget;
+	unsigned int processed_in_run = 0;
+	bool budget_exhausted = false;
 
 	bBuf[0] = NULL;
 	bBuf[1] = NULL;
@@ -3575,6 +3709,7 @@ static void video_data_process(struct work_struct *p_work)
 	nCopySize[2] = 0;
 	nCopySize[3] = 0;
 	nCh = videodev->index;
+	budget = (video_work_budget > 0) ? (unsigned int)video_work_budget : 1U;
 
 	if (diag_on)
 		work_start_ns = ktime_get_ns();
@@ -3583,9 +3718,8 @@ static void video_data_process(struct work_struct *p_work)
 	spin_lock_irqsave(&pdx->videoslock[nCh], devflags);
 	in_width = pdx->m_pVCAPStatus[nCh][0].dwWidth;
 	in_height = pdx->m_pVCAPStatus[nCh][0].dwHeight;
-	if (pdx->m_pVCAPStatus[nCh][0].dwinterlace == 1) {
+	if (pdx->m_pVCAPStatus[nCh][0].dwinterlace == 1)
 		in_height = in_height * 2;
-	}
 	in_vsize = in_width * in_height * 2;
 	curr_no_video = pdx->m_curr_No_Video[nCh];
 
@@ -3605,11 +3739,10 @@ static void video_data_process(struct work_struct *p_work)
 		}
 		if (nVindex == -1) {
 			miss_freme = 1;
-			if (pdx->m_nRDVideoIndex[nCh] == 0) {
+			if (pdx->m_nRDVideoIndex[nCh] == 0)
 				nVindex = MAX_VIDEO_QUEUE - 1;
-			} else {
+			else
 				nVindex = pdx->m_nRDVideoIndex[nCh] - 1;
-			}
 			bBuf[0] = pdx->m_VideoInfo[nCh].m_pVideoBufData[nVindex];
 			bBuf[1] = pdx->m_VideoInfo[nCh].m_pVideoBufData1[nVindex];
 			bBuf[2] = pdx->m_VideoInfo[nCh].m_pVideoBufData2[nVindex];
@@ -3622,21 +3755,32 @@ static void video_data_process(struct work_struct *p_work)
 		}
 	} else {
 		for (i = 0; i < MAX_VIDEO_QUEUE; i++) {
-			if (pdx->m_VideoInfo[nCh].pStatusInfo[i].byLock == MEM_LOCK) {
+			if (pdx->m_VideoInfo[nCh].pStatusInfo[i].byLock == MEM_LOCK)
 				pdx->m_VideoInfo[nCh].pStatusInfo[i].byLock = MEM_UNLOCK;
-			}
 		}
 	}
 	spin_unlock_irqrestore(&pdx->videoslock[nCh], devflags);
 
-	for (;;) {
-		struct hws_vfh_ctx *ctx;
-		struct hwsvideo_buffer *buf;
+	out_width = videodev->current_out_width;
+	out_height = videodev->curren_out_height;
+	out_size = out_width * out_height * 2;
+	needs_scaler = (in_vsize != out_size);
 
-		buf = hws_pop_any_buffer(videodev, &ctx);
-		if (!buf) {
+	for (;;) {
+		struct hwsvideo_buffer *buf;
+		int copy_ret = 0;
+		u64 copy_start;
+
+		if (processed_in_run >= budget) {
+			budget_exhausted = true;
 			break;
 		}
+
+		buf = hws_pop_any_buffer(videodev);
+		if (!buf)
+			break;
+
+		processed_in_run++;
 		buf_processed++;
 
 		buf->vb.vb2_buf.timestamp = ktime_get_ns();
@@ -3649,47 +3793,57 @@ static void video_data_process(struct work_struct *p_work)
 		}
 
 		if (curr_no_video == 0) {
-			u64 copy_start;
-
-			out_size = videodev->current_out_width * videodev->curren_out_height * 2;
-			if (in_vsize != out_size) {
-				if (pdx->m_VideoInfo[nCh].m_pVideoScalerBuf) {
+			if (needs_scaler) {
+				if (!pdx->m_VideoInfo[nCh].m_pVideoScalerBuf) {
+					copy_ret = -ENOMEM;
+				} else {
 					copy_start = diag_on ? ktime_get_ns() : 0;
-					MemCopyFrame(nCh, pdx->m_VideoInfo[nCh].m_pVideoScalerBuf, in_width, in_height, interlace, bBuf, nCopySize);
+					copy_ret = MemCopyFrame(nCh, pdx->m_VideoInfo[nCh].m_pVideoScalerBuf,
+						in_width, in_height, interlace, bBuf, nCopySize);
 					if (diag_on)
 						memcopy_ns += ktime_get_ns() - copy_start;
-
-					copy_start = diag_on ? ktime_get_ns() : 0;
-					VideoScaler(pdx->m_VideoInfo[nCh].m_pVideoScalerBuf, buf->mem, in_width, in_height,
-						videodev->current_out_width, videodev->curren_out_height);
-					if (diag_on)
-						scaler_ns += ktime_get_ns() - copy_start;
-					scaler_frames++;
+					if (!copy_ret) {
+						copy_start = diag_on ? ktime_get_ns() : 0;
+						VideoScaler(pdx->m_VideoInfo[nCh].m_pVideoScalerBuf, buf->mem,
+							in_width, in_height, out_width, out_height);
+						if (diag_on)
+							scaler_ns += ktime_get_ns() - copy_start;
+						scaler_frames++;
+					}
 				}
 			} else {
 				copy_start = diag_on ? ktime_get_ns() : 0;
-				MemCopyFrame(nCh, buf->mem, in_width, in_height, interlace, bBuf, nCopySize);
+				copy_ret = MemCopyFrame(nCh, buf->mem, in_width, in_height,
+					interlace, bBuf, nCopySize);
 				if (diag_on)
 					memcopy_ns += ktime_get_ns() - copy_start;
-				copy_frames++;
+				if (!copy_ret)
+					copy_frames++;
+			}
+			if (copy_ret) {
+				vb2_buffer_done(&buf->vb.vb2_buf, VB2_BUF_STATE_ERROR);
+				buf_error++;
+				continue;
 			}
 		} else {
-			SetNoVideoMem(buf->mem, videodev->current_out_width, videodev->curren_out_height);
+			SetNoVideoMem(buf->mem, out_width, out_height);
 			novideo_frames++;
 		}
 
 		buf->vb.sequence = videodev->seqnr++;
 		vb2_buffer_done(&buf->vb.vb2_buf, VB2_BUF_STATE_DONE);
 		buf_done++;
+
+		if ((processed_in_run & 0x3U) == 0)
+			cond_resched();
 	}
 
 	spin_lock_irqsave(&pdx->videoslock[nCh], devflags);
 	if (curr_no_video == 0 && nVindex >= 0) {
 		pdx->m_VideoInfo[nCh].pStatusInfo[nVindex].byLock = MEM_UNLOCK;
 		pdx->m_nRDVideoIndex[nCh] = nVindex + 1;
-		if (pdx->m_nRDVideoIndex[nCh] >= MAX_VIDEO_QUEUE) {
+		if (pdx->m_nRDVideoIndex[nCh] >= MAX_VIDEO_QUEUE)
 			pdx->m_nRDVideoIndex[nCh] = 0;
-		}
 	}
 	spin_unlock_irqrestore(&pdx->videoslock[nCh], devflags);
 
@@ -3710,8 +3864,12 @@ static void video_data_process(struct work_struct *p_work)
 		atomic64_add(scaler_ns, &hws_diag[nCh].scaler_ns_total);
 	}
 
+	if (budget_exhausted && hws_has_pending_buffers(videodev))
+		queue_work(pdx->wq, &videodev->videowork);
+
 	(void)miss_freme;
 }
+
 static void hws_get_video_param(struct hws_pcie_dev *dev,int index)
 {
 	
@@ -3801,6 +3959,7 @@ static int hws_video_register(struct hws_pcie_dev *dev)
 		mutex_init(&(dev->video[i].queue_lock));
 		spin_lock_init(&dev->video[i].consumers_lock);
 		mutex_init(&dev->video[i].ioctl_lock);
+		dev->video[i].ioctl_owner = NULL;
 		INIT_LIST_HEAD(&dev->video[i].consumers);
 		atomic_set(&dev->video[i].engine_users, 0);
 
@@ -5166,7 +5325,8 @@ static int MemCopyAudioToSteam( struct hws_pcie_dev  *pdx,int dwAudioCh)
 			}
 			else
 			{
-				printk("No Audio Buffer Write %d",dwAudioCh);
+				if (hws_diag_enabled())
+				pr_info_ratelimited("hws: no audio buffer ch=%d\n", dwAudioCh);
 
 			}
 	}

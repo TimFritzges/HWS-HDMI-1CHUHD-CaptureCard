@@ -10,9 +10,215 @@ MODULE="${MODULE:-HwsUHDX1Capture}"
 RUN_TAG="${RUN_TAG:-}"
 PRETEST_SECONDS="${PRETEST_SECONDS:-}"
 DIAG_FILE="${DIAG_FILE:-/sys/kernel/debug/hwsuhdx1/video_diag}"
+CONCURRENT_MODE="${CONCURRENT_MODE:-auto}"
+SAVE_RAW="${SAVE_RAW:-0}"
+SAVE_MKV="${SAVE_MKV:-0}"
+SAVE_DIR="${SAVE_DIR:-}"
 
 rate_per_sec() {
   awk -v d="${1}" -v s="${2}" 'BEGIN { if (s <= 0) printf "0.000"; else printf "%.3f", d / s }'
+}
+
+have_cmd() {
+  command -v "${1}" >/dev/null 2>&1
+}
+
+module_diag_path() {
+  local found
+  found="$(find /sys/module -maxdepth 3 -type f -name diag_enable 2>/dev/null | head -n1 || true)"
+  if [[ -n "${found}" ]]; then
+    echo "${found}"
+  else
+    echo "/sys/module/${MODULE}/parameters/diag_enable"
+  fi
+}
+
+module_srcversion_path() {
+  echo "/sys/module/${MODULE}/srcversion"
+}
+
+diag_delta_from_snapshots() {
+  local before_file="${1}"
+  local after_file="${2}"
+  local out_file="${3}"
+
+  if [[ ! -s "${before_file}" || ! -s "${after_file}" ]]; then
+    return 0
+  fi
+
+  awk '
+    FNR == 1 { next }
+    NR == FNR {
+      ch = $1
+      b_work[ch]=$2
+      b_buf_processed[ch]=$5
+      b_buf_done[ch]=$6
+      b_buf_error[ch]=$7
+      b_copy[ch]=$8
+      b_scaler[ch]=$9
+      b_novideo[ch]=$10
+      b_fallback[ch]=$11
+      next
+    }
+    FNR == 1 {
+      print "ch delta_work_runs delta_buf_processed delta_buf_done delta_buf_error delta_copy_frames delta_scaler_frames delta_novideo_frames delta_miss_fallbacks"
+      next
+    }
+    {
+      ch = $1
+      printf "%s %d %d %d %d %d %d %d %d\n",
+        ch,
+        ($2 - b_work[ch]),
+        ($5 - b_buf_processed[ch]),
+        ($6 - b_buf_done[ch]),
+        ($7 - b_buf_error[ch]),
+        ($8 - b_copy[ch]),
+        ($9 - b_scaler[ch]),
+        ($10 - b_novideo[ch]),
+        ($11 - b_fallback[ch])
+    }
+  ' "${before_file}" "${after_file}" > "${out_file}" || true
+}
+
+run_preflight() {
+  local preflight_file="${1}"
+  local warnings_file="${2}"
+  local module_name="${3}"
+  local device="${4}"
+  local diag_param_path="${5}"
+  local diag_data_path="${6}"
+  local srcversion_path="${7}"
+  local holders_file="${8}"
+  local mode_hint="${9}"
+  local warning_count=0
+  local module_loaded=0
+  local device_exists=0
+  local device_readable=0
+  local modinfo_ok=0
+  local runtime_srcversion_ok=0
+  local srcversion_match=0
+  local diag_param_readable=0
+  local diag_data_readable=0
+  local modinfo_path=""
+  local modinfo_src=""
+  local runtime_src=""
+  local holder_lines=0
+
+  : > "${preflight_file}"
+  : > "${warnings_file}"
+
+  if [[ -e "${device}" ]]; then
+    device_exists=1
+  fi
+  if [[ -r "${device}" ]]; then
+    device_readable=1
+  fi
+
+  if have_cmd lsmod && lsmod | awk '{print $1}' | grep -qx "${module_name}"; then
+    module_loaded=1
+  fi
+
+  if have_cmd modinfo; then
+    modinfo_path="$(modinfo -n "${module_name}" 2>/dev/null || true)"
+    modinfo_src="$(modinfo "${module_name}" 2>/dev/null | awk -F': *' '/^srcversion/ {print $2; exit}')"
+    if [[ -n "${modinfo_path}" ]]; then
+      modinfo_ok=1
+    fi
+  fi
+
+  if [[ -r "${srcversion_path}" ]]; then
+    runtime_src="$(cat "${srcversion_path}" 2>/dev/null || true)"
+    if [[ -n "${runtime_src}" ]]; then
+      runtime_srcversion_ok=1
+    fi
+  fi
+
+  if [[ -n "${modinfo_src}" && -n "${runtime_src}" && "${modinfo_src}" == "${runtime_src}" ]]; then
+    srcversion_match=1
+  fi
+
+  if [[ -r "${diag_param_path}" ]]; then
+    diag_param_readable=1
+  fi
+  if [[ -r "${diag_data_path}" ]]; then
+    diag_data_readable=1
+  fi
+  if [[ -s "${holders_file}" ]]; then
+    holder_lines="$(wc -l < "${holders_file}" | tr -d ' ')"
+  fi
+
+  if [[ "${module_loaded}" -ne 1 ]]; then
+    echo "module_not_loaded:${module_name}" >> "${warnings_file}"
+    warning_count=$((warning_count + 1))
+  fi
+  if [[ "${device_exists}" -ne 1 ]]; then
+    echo "device_missing:${device}" >> "${warnings_file}"
+    warning_count=$((warning_count + 1))
+  fi
+  if [[ "${device_readable}" -ne 1 ]]; then
+    echo "device_not_readable:${device}" >> "${warnings_file}"
+    warning_count=$((warning_count + 1))
+  fi
+  if [[ "${modinfo_ok}" -ne 1 || "${runtime_srcversion_ok}" -ne 1 ]]; then
+    echo "module_identity_incomplete:modinfo_or_runtime_srcversion_missing" >> "${warnings_file}"
+    warning_count=$((warning_count + 1))
+  elif [[ "${srcversion_match}" -ne 1 ]]; then
+    echo "module_identity_mismatch:modinfo_srcversion!=runtime_srcversion" >> "${warnings_file}"
+    warning_count=$((warning_count + 1))
+  fi
+  if [[ "${diag_param_readable}" -ne 1 ]]; then
+    echo "diag_param_unreadable:${diag_param_path}" >> "${warnings_file}"
+    warning_count=$((warning_count + 1))
+  fi
+  if [[ "${diag_data_readable}" -ne 1 ]]; then
+    echo "diag_debugfs_unreadable:${diag_data_path}" >> "${warnings_file}"
+    warning_count=$((warning_count + 1))
+  fi
+  if [[ "${mode_hint}" == "solo" && "${holder_lines}" -gt 0 ]]; then
+    echo "unexpected_holders_for_solo_mode:${holder_lines}" >> "${warnings_file}"
+    warning_count=$((warning_count + 1))
+  fi
+
+  {
+    echo "timestamp_utc=$(date -u --iso-8601=seconds)"
+    echo "module=${module_name}"
+    echo "module_loaded=${module_loaded}"
+    echo "device=${device}"
+    echo "device_exists=${device_exists}"
+    echo "device_readable=${device_readable}"
+    echo "modinfo_path=${modinfo_path:-unavailable}"
+    echo "modinfo_srcversion=${modinfo_src:-unavailable}"
+    echo "runtime_srcversion_path=${srcversion_path}"
+    echo "runtime_srcversion=${runtime_src:-unavailable}"
+    echo "srcversion_match=${srcversion_match}"
+    echo "diag_param_path=${diag_param_path}"
+    echo "diag_param_readable=${diag_param_readable}"
+    echo "diag_data_path=${diag_data_path}"
+    echo "diag_data_readable=${diag_data_readable}"
+    echo "mode_hint=${mode_hint}"
+    echo "holders_detected=${holder_lines}"
+    echo "warnings_file=${warnings_file}"
+    echo "warning_count=${warning_count}"
+  } >> "${preflight_file}"
+
+  echo "${warning_count}"
+}
+
+detect_device_holders() {
+  local device="${1}"
+  local pids_file="${2}"
+  local details_file="${3}"
+
+  : > "${pids_file}"
+  : > "${details_file}"
+
+  if command -v lsof >/dev/null 2>&1; then
+    lsof -n -w "${device}" > "${details_file}" 2>&1 || true
+    lsof -n -w -t "${device}" 2>/dev/null | sort -u > "${pids_file}" || true
+  elif command -v fuser >/dev/null 2>&1; then
+    fuser -v "${device}" > "${details_file}" 2>&1 || true
+    fuser "${device}" 2>/dev/null | tr -cs '0-9\n' '\n' | sed '/^$/d' | sort -u > "${pids_file}" || true
+  fi
 }
 
 parse_pw_top_log() {
@@ -77,13 +283,21 @@ Options:
   -r  Target FPS (default: ${FPS})
   -o  Output base directory (default: ${OUTDIR_BASE})
   -g  Optional run tag (example: baseline, post-dkms-fix)
+  -c  Concurrent mode: auto|solo|shared (default: ${CONCURRENT_MODE})
+  -R  Save tested stream as raw YUYV dump in run directory
+  -M  Save tested stream as lossless MKV (FFV1) in run directory
+  -O  Directory for saved media files (raw/mkv). Default: run directory
 
 Environment:
   PRETEST_SECONDS  idle pw-top sampling duration before capture (default: DURATION)
+  CONCURRENT_MODE  same as -c
+  SAVE_RAW         0|1, same as -R
+  SAVE_MKV         0|1, same as -M
+  SAVE_DIR         media destination directory, same as -O
 USAGE
 }
 
-while getopts ":d:t:s:r:o:g:h" opt; do
+while getopts ":d:t:s:r:o:g:c:RMO:h" opt; do
   case "${opt}" in
     d) DEVICE="${OPTARG}" ;;
     t) DURATION="${OPTARG}" ;;
@@ -91,14 +305,32 @@ while getopts ":d:t:s:r:o:g:h" opt; do
     r) FPS="${OPTARG}" ;;
     o) OUTDIR_BASE="${OPTARG}" ;;
     g) RUN_TAG="${OPTARG}" ;;
+    c) CONCURRENT_MODE="${OPTARG}" ;;
+    R) SAVE_RAW=1 ;;
+    M) SAVE_MKV=1 ;;
+    O) SAVE_DIR="${OPTARG}" ;;
     h) usage; exit 0 ;;
     :) echo "Missing arg for -${OPTARG}" >&2; usage; exit 2 ;;
     \?) echo "Unknown option: -${OPTARG}" >&2; usage; exit 2 ;;
   esac
 done
 
+if [[ "${CONCURRENT_MODE}" != "auto" && "${CONCURRENT_MODE}" != "solo" && "${CONCURRENT_MODE}" != "shared" ]]; then
+  echo "Invalid concurrent mode: ${CONCURRENT_MODE} (expected auto|solo|shared)" >&2
+  exit 2
+fi
+
 if [[ -z "${PRETEST_SECONDS}" ]]; then
   PRETEST_SECONDS="${DURATION}"
+fi
+
+if [[ "${SAVE_RAW}" != "0" && "${SAVE_RAW}" != "1" ]]; then
+  echo "Invalid SAVE_RAW=${SAVE_RAW} (expected 0 or 1)" >&2
+  exit 2
+fi
+if [[ "${SAVE_MKV}" != "0" && "${SAVE_MKV}" != "1" ]]; then
+  echo "Invalid SAVE_MKV=${SAVE_MKV} (expected 0 or 1)" >&2
+  exit 2
 fi
 
 stamp="$(date -u +%Y%m%d-%H%M%S)"
@@ -114,9 +346,38 @@ mkdir -p "${outdir}"
 info_file="${outdir}/${run_id}-system.txt"
 summary_file="${outdir}/${run_id}-summary.txt"
 run_log="${outdir}/${run_id}-capture.log"
+save_dir_run="${outdir}"
+raw_capture_file="${save_dir_run}/${run_id}-capture.yuyv"
+mkv_capture_file="${save_dir_run}/${run_id}-capture.mkv"
 history_file="${OUTDIR_BASE}/history-v4.csv"
 diag_before_file="${outdir}/${run_id}-diag.before.txt"
 diag_after_file="${outdir}/${run_id}-diag.after.txt"
+diag_delta_file="${outdir}/${run_id}-diag.delta.txt"
+diag_status_file="${outdir}/${run_id}-diag.status.txt"
+preflight_file="${outdir}/${run_id}-preflight.txt"
+preflight_warnings_file="${outdir}/${run_id}-preflight.warnings.txt"
+holders_pre_pids_file="${outdir}/${run_id}-holders.pre.pids.txt"
+holders_pre_details_file="${outdir}/${run_id}-holders.pre.txt"
+diag_runtime_path="$(module_diag_path)"
+srcversion_runtime_path="$(module_srcversion_path)"
+diag_param_value=""
+runtime_srcversion=""
+modinfo_srcversion=""
+diag_file_readable=0
+diag_before_captured=0
+diag_after_captured=0
+detected_holder_count=0
+detected_holder_pids=""
+concurrent_client_mode="${CONCURRENT_MODE}"
+preflight_warning_count=0
+preflight_status="ok"
+
+if [[ -n "${SAVE_DIR}" ]]; then
+  save_dir_run="${SAVE_DIR}/${run_id}"
+  mkdir -p "${save_dir_run}"
+  raw_capture_file="${save_dir_run}/${run_id}-capture.yuyv"
+  mkv_capture_file="${save_dir_run}/${run_id}-capture.mkv"
+fi
 
 {
   echo "timestamp_utc=$(date -u --iso-8601=seconds)"
@@ -129,19 +390,77 @@ diag_after_file="${outdir}/${run_id}-diag.after.txt"
   echo "kernel=$(uname -r)"
   echo "arch=$(uname -m)"
   echo "hostname=$(hostname)"
+  echo "save_raw=${SAVE_RAW}"
+  echo "save_mkv=${SAVE_MKV}"
+  echo "save_dir=${SAVE_DIR:-run_dir_default}"
+  echo "save_dir_run=${save_dir_run}"
 } > "${info_file}"
 
 if command -v modinfo >/dev/null 2>&1; then
   modinfo "${MODULE}" > "${outdir}/${run_id}-modinfo.txt" 2>/dev/null || true
+  modinfo_srcversion="$(modinfo "${MODULE}" 2>/dev/null | awk -F': *' '/^srcversion/ {print $2; exit}')"
   modpath="$(modinfo -n "${MODULE}" 2>/dev/null || true)"
   if [[ -n "${modpath}" && -f "${modpath}" ]]; then
     sha256sum "${modpath}" > "${outdir}/${run_id}-module.sha256"
   fi
 fi
 
+detect_device_holders "${DEVICE}" "${holders_pre_pids_file}" "${holders_pre_details_file}"
+if [[ -s "${holders_pre_pids_file}" ]]; then
+  detected_holder_count="$(wc -l < "${holders_pre_pids_file}" | tr -d ' ')"
+  detected_holder_pids="$(paste -sd, "${holders_pre_pids_file}")"
+else
+  detected_holder_count=0
+  detected_holder_pids=""
+fi
+if [[ "${CONCURRENT_MODE}" == "auto" ]]; then
+  if [[ "${detected_holder_count}" -gt 0 ]]; then
+    concurrent_client_mode="shared"
+  else
+    concurrent_client_mode="solo"
+  fi
+fi
+
+if [[ -r "${srcversion_runtime_path}" ]]; then
+  runtime_srcversion="$(cat "${srcversion_runtime_path}" 2>/dev/null || true)"
+fi
+if [[ -r "${diag_runtime_path}" ]]; then
+  diag_param_value="$(cat "${diag_runtime_path}" 2>/dev/null || true)"
+fi
+
+if [[ -r "${DIAG_FILE}" ]]; then
+  diag_file_readable=1
+fi
 if [[ -r "${DIAG_FILE}" ]]; then
   cat "${DIAG_FILE}" > "${diag_before_file}" 2>/dev/null || true
+  if [[ -s "${diag_before_file}" ]]; then
+    diag_before_captured=1
+  fi
 fi
+
+preflight_warning_count="$(run_preflight "${preflight_file}" "${preflight_warnings_file}" "${MODULE}" "${DEVICE}" "${diag_runtime_path}" "${DIAG_FILE}" "${srcversion_runtime_path}" "${holders_pre_pids_file}" "${concurrent_client_mode}")"
+if [[ "${preflight_warning_count}" -gt 0 ]]; then
+  preflight_status="warn"
+fi
+
+{
+  echo "diag_file=${DIAG_FILE}"
+  echo "diag_file_readable=${diag_file_readable}"
+  echo "concurrent_client_mode=${concurrent_client_mode}"
+  echo "detected_holder_count=${detected_holder_count}"
+  echo "detected_holder_pids=${detected_holder_pids:-none}"
+  echo "holders_pre_file=${holders_pre_details_file}"
+  echo "diag_param_path=${diag_runtime_path}"
+  echo "diag_param_value=${diag_param_value:-unavailable}"
+  echo "runtime_srcversion_path=${srcversion_runtime_path}"
+  echo "runtime_srcversion=${runtime_srcversion:-unavailable}"
+  echo "modinfo_srcversion=${modinfo_srcversion:-unavailable}"
+  echo "diag_before_captured=${diag_before_captured}"
+  echo "preflight_file=${preflight_file}"
+  echo "preflight_warnings_file=${preflight_warnings_file}"
+  echo "preflight_status=${preflight_status}"
+  echo "preflight_warning_count=${preflight_warning_count}"
+} > "${diag_status_file}"
 
 if command -v lsmod >/dev/null 2>&1; then
   lsmod > "${outdir}/${run_id}-lsmod.txt"
@@ -193,7 +512,33 @@ fi
 start_local="$(date '+%Y-%m-%d %H:%M:%S')"
 start_epoch="$(date +%s)"
 
-if command -v v4l2-ctl >/dev/null 2>&1; then
+if [[ "${SAVE_RAW}" == "1" || "${SAVE_MKV}" == "1" ]]; then
+  if command -v ffmpeg >/dev/null 2>&1; then
+    backend="ffmpeg"
+    ffmpeg_args=(
+      -hide_banner -nostdin -loglevel info -stats
+      -f v4l2
+      -input_format yuyv422
+      -framerate "${FPS}"
+      -video_size "${SIZE}"
+      -t "${DURATION}"
+      -i "${DEVICE}"
+      -an
+    )
+    if [[ "${SAVE_RAW}" == "1" ]]; then
+      ffmpeg_args+=( -map 0:v:0 -c:v rawvideo -pix_fmt yuyv422 -f rawvideo "${raw_capture_file}" )
+    fi
+    if [[ "${SAVE_MKV}" == "1" ]]; then
+      ffmpeg_args+=( -map 0:v:0 -c:v ffv1 -level 3 -g 1 -threads 0 -f matroska "${mkv_capture_file}" )
+    fi
+    # Keep a sink equivalent to /dev/null benchmarking.
+    ffmpeg_args+=( -map 0:v:0 -c:v rawvideo -pix_fmt yuyv422 -f null - )
+    ffmpeg "${ffmpeg_args[@]}" > "${run_log}" 2>&1 || true
+  else
+    backend="none"
+    echo "SAVE_RAW/SAVE_MKV requested but ffmpeg not available." > "${run_log}"
+  fi
+elif command -v v4l2-ctl >/dev/null 2>&1; then
   backend="v4l2-ctl-seq"
   v4l2-ctl --verbose --device="${DEVICE}" \
     --set-fmt-video=width="${SIZE%x*}",height="${SIZE#*x}",pixelformat=YUYV \
@@ -224,6 +569,10 @@ if [[ -n "${pw_top_pid}" ]]; then
 fi
 
 end_epoch="$(date +%s)"
+
+# Keep post-processing resilient: optional collectors/parsers should not
+# prevent summary/history output.
+set +e
 
 actual_seconds="$((end_epoch - start_epoch))"
 [[ "${actual_seconds}" -lt 1 ]] && actual_seconds=1
@@ -274,7 +623,16 @@ dmesg --ctime > "${outdir}/${run_id}-dmesg.after.txt" 2>/dev/null || true
 dmesg --ctime --since "${start_local}" > "${outdir}/${run_id}-dmesg.since.txt" 2>/dev/null || true
 if [[ -r "${DIAG_FILE}" ]]; then
   cat "${DIAG_FILE}" > "${diag_after_file}" 2>/dev/null || true
+  if [[ -s "${diag_after_file}" ]]; then
+    diag_after_captured=1
+  fi
 fi
+if [[ "${diag_before_captured}" -eq 1 && "${diag_after_captured}" -eq 1 ]]; then
+  diag_delta_from_snapshots "${diag_before_file}" "${diag_after_file}" "${diag_delta_file}"
+fi
+{
+  echo "diag_after_captured=${diag_after_captured}"
+} >> "${diag_status_file}"
 if [[ -s "${outdir}/${run_id}-dmesg.after.txt" ]]; then
   grep -Ei "${MODULE}|v4l2|vb2|dma|timeout|drop|overrun|underrun|error|warn" \
     "${outdir}/${run_id}-dmesg.after.txt" > "${outdir}/${run_id}-dmesg.filtered.txt" || true
@@ -309,8 +667,10 @@ net_err_delta_over_idle=0
 net_capture_err_delta_over_idle=0
 if [[ -s "${pw_top_log}" ]]; then
   parse_pw_top_log "${pw_top_log}" "test" "${outdir}/${run_id}-pw-top-test-metrics.txt"
-  # shellcheck disable=SC1090
-  source "${outdir}/${run_id}-pw-top-test-metrics.txt"
+  if [[ -s "${outdir}/${run_id}-pw-top-test-metrics.txt" ]]; then
+    # shellcheck disable=SC1090
+    source "${outdir}/${run_id}-pw-top-test-metrics.txt"
+  fi
   test_err_rate_per_s="$(rate_per_sec "${test_err_delta_total}" "${actual_seconds}")"
   test_capture_err_rate_per_s="$(rate_per_sec "${test_capture_err_delta_total}" "${actual_seconds}")"
   net_err_rate_over_idle_per_s="$(awk -v t="${test_err_rate_per_s}" -v i="${idle_err_rate_per_s}" 'BEGIN { v=t-i; if (v<0) v=0; printf "%.3f", v }')"
@@ -338,6 +698,25 @@ fi
   echo "callbacks_suppressed_total=${callbacks_suppressed_total}"
   echo "uvcvideo_events=${uvcvideo_events}"
   echo "module_events=${module_events}"
+  echo "concurrent_client_mode=${concurrent_client_mode}"
+  echo "detected_holder_count=${detected_holder_count}"
+  echo "detected_holder_pids=${detected_holder_pids:-none}"
+  echo "diag_file=${DIAG_FILE}"
+  echo "diag_file_readable=${diag_file_readable}"
+  echo "diag_param_path=${diag_runtime_path}"
+  echo "diag_param_value=${diag_param_value:-unavailable}"
+  echo "runtime_srcversion=${runtime_srcversion:-unavailable}"
+  echo "modinfo_srcversion=${modinfo_srcversion:-unavailable}"
+  echo "diag_before_captured=${diag_before_captured}"
+  echo "diag_after_captured=${diag_after_captured}"
+  echo "save_raw=${SAVE_RAW}"
+  echo "save_mkv=${SAVE_MKV}"
+  echo "save_dir=${SAVE_DIR:-run_dir_default}"
+  echo "save_dir_run=${save_dir_run}"
+  echo "raw_capture_file=${raw_capture_file}"
+  echo "mkv_capture_file=${mkv_capture_file}"
+  echo "preflight_status=${preflight_status}"
+  echo "preflight_warning_count=${preflight_warning_count}"
   echo "idle_elapsed_seconds=${idle_elapsed_seconds}"
   echo "idle_nodes=${idle_nodes}"
   echo "idle_err_start_total=${idle_err_start_total}"
@@ -368,9 +747,9 @@ fi
 } > "${summary_file}"
 
 if [[ ! -f "${history_file}" ]]; then
-  echo "run_id,timestamp_utc,run_tag,backend,device,size,fps,duration,expected_frames,actual_frames,estimated_drop_vs_target_frames,source_seq_span_frames,source_seq_gap_frames,ffmpeg_counter_frames,retire_capture_urb_events,callbacks_suppressed_events,callbacks_suppressed_total,uvcvideo_events,module_events,idle_elapsed_seconds,idle_err_delta_total,idle_err_rate_per_s,idle_capture_err_delta_total,idle_capture_err_rate_per_s,test_err_delta_total,test_err_rate_per_s,test_capture_err_delta_total,test_capture_err_rate_per_s,net_err_rate_over_idle_per_s,net_capture_err_rate_over_idle_per_s,net_err_delta_over_idle,net_capture_err_delta_over_idle,elapsed_seconds,results_dir" > "${history_file}"
+  echo "run_id,timestamp_utc,run_tag,backend,device,size,fps,duration,expected_frames,actual_frames,estimated_drop_vs_target_frames,source_seq_span_frames,source_seq_gap_frames,ffmpeg_counter_frames,retire_capture_urb_events,callbacks_suppressed_events,callbacks_suppressed_total,uvcvideo_events,module_events,preflight_status,preflight_warning_count,idle_elapsed_seconds,idle_err_delta_total,idle_err_rate_per_s,idle_capture_err_delta_total,idle_capture_err_rate_per_s,test_err_delta_total,test_err_rate_per_s,test_capture_err_delta_total,test_capture_err_rate_per_s,net_err_rate_over_idle_per_s,net_capture_err_rate_over_idle_per_s,net_err_delta_over_idle,net_capture_err_delta_over_idle,elapsed_seconds,results_dir" > "${history_file}"
 fi
-echo "${run_id},$(date -u --iso-8601=seconds),${RUN_TAG:-none},${backend},${DEVICE},${SIZE},${FPS},${DURATION},${expected_frames},${actual_frames},${drop_estimate},${source_seq_span_frames:-},${source_seq_gap_frames:-},${ffmpeg_counter_frames:-},${retire_capture_urb_events},${callbacks_suppressed_events},${callbacks_suppressed_total},${uvcvideo_events},${module_events},${idle_elapsed_seconds},${idle_err_delta_total},${idle_err_rate_per_s},${idle_capture_err_delta_total},${idle_capture_err_rate_per_s},${test_err_delta_total},${test_err_rate_per_s},${test_capture_err_delta_total},${test_capture_err_rate_per_s},${net_err_rate_over_idle_per_s},${net_capture_err_rate_over_idle_per_s},${net_err_delta_over_idle},${net_capture_err_delta_over_idle},${actual_seconds},${outdir}" >> "${history_file}"
+echo "${run_id},$(date -u --iso-8601=seconds),${RUN_TAG:-none},${backend},${DEVICE},${SIZE},${FPS},${DURATION},${expected_frames},${actual_frames},${drop_estimate},${source_seq_span_frames:-},${source_seq_gap_frames:-},${ffmpeg_counter_frames:-},${retire_capture_urb_events},${callbacks_suppressed_events},${callbacks_suppressed_total},${uvcvideo_events},${module_events},${preflight_status},${preflight_warning_count},${idle_elapsed_seconds},${idle_err_delta_total},${idle_err_rate_per_s},${idle_capture_err_delta_total},${idle_capture_err_rate_per_s},${test_err_delta_total},${test_err_rate_per_s},${test_capture_err_delta_total},${test_capture_err_rate_per_s},${net_err_rate_over_idle_per_s},${net_capture_err_rate_over_idle_per_s},${net_err_delta_over_idle},${net_capture_err_delta_over_idle},${actual_seconds},${outdir}" >> "${history_file}"
 
 cat "${summary_file}"
 echo "logs=${run_log}"

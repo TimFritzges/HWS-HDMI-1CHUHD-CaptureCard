@@ -305,6 +305,7 @@ struct hws_vfh_ctx {
     struct list_head    buf_queue;   /* queued hwsvideo_buffer for this fh */
     spinlock_t          qlock;       /* protects buf_queue */
     bool                streaming;
+    u32                 seqnr;       /* per-consumer sequence counter */
     struct hws_video   *video;
     struct list_head    node;        /* link into video->consumers */
 };
@@ -322,6 +323,7 @@ struct hws_video{
 	/* B1: multi-consumer */
 	spinlock_t			consumers_lock;
 	struct mutex			ioctl_lock;
+	struct hws_vfh_ctx		*ioctl_owner;
 	struct list_head		consumers;
 	atomic_t			engine_users;
 	spinlock_t				slock;
