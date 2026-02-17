@@ -1,0 +1,24 @@
+pkgname=hws-uhdx1capture-dkms
+pkgver=1.0.0.230324
+pkgrel=1
+pkgdesc="DKMS package for HWS UHD X1 Capture Linux driver"
+arch=('x86_64' 'aarch64')
+url="https://github.com/lt-link/HWS-HDMI-1CHUHD-CaptureCard"
+license=('MIT')
+depends=('dkms')
+conflicts=('hws-uhdx1capture')
+# Pin this commit for deterministic rebuilds.
+_commit=9cbd23e58e00f9501a00de4f4da545f04d35f4f8
+source=("${pkgname}-${pkgver}.tar.gz::${url}/archive/${_commit}.tar.gz")
+sha256sums=('SKIP')
+
+package() {
+  local srcroot="${srcdir}/HWS-HDMI-1CHUHD-CaptureCard-${_commit}"
+  local dkms_dir="${pkgdir}/usr/src/HwsUHDX1Capture-${pkgver}"
+
+  install -d "${dkms_dir}"
+  cp -a "${srcroot}/src/." "${dkms_dir}/"
+
+  # Keep PACKAGE_VERSION in sync with the package version.
+  sed -i "s/^PACKAGE_VERSION=.*/PACKAGE_VERSION=\"${pkgver}\"/" "${dkms_dir}/dkms.conf"
+}

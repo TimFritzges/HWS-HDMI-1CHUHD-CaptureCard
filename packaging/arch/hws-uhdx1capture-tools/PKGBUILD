@@ -1,0 +1,30 @@
+pkgname=hws-uhdx1capture-tools
+pkgver=1.0.0.230324
+pkgrel=1
+pkgdesc="User-space helper scripts and docs for HWS UHD X1 Capture"
+arch=('any')
+url="https://github.com/lt-link/HWS-HDMI-1CHUHD-CaptureCard"
+license=('MIT')
+depends=('bash')
+# Pin this commit for deterministic rebuilds.
+_commit=9cbd23e58e00f9501a00de4f4da545f04d35f4f8
+source=("${pkgname}-${pkgver}.tar.gz::${url}/archive/${_commit}.tar.gz"
+        "bench.sh")
+sha256sums=('SKIP'
+            'SKIP')
+
+package() {
+  local srcroot="${srcdir}/HWS-HDMI-1CHUHD-CaptureCard-${_commit}"
+
+  install -d "${pkgdir}/usr/share/hws-uhdx1capture/play"
+  install -d "${pkgdir}/usr/share/hws-uhdx1capture/doc"
+  install -d "${pkgdir}/usr/share/hws-uhdx1capture/tools"
+  install -d "${pkgdir}/usr/bin"
+
+  cp -a "${srcroot}/play/." "${pkgdir}/usr/share/hws-uhdx1capture/play/"
+  cp -a "${srcroot}/doc/." "${pkgdir}/usr/share/hws-uhdx1capture/doc/"
+  install -m 0644 "${srcroot}/README.md" "${pkgdir}/usr/share/hws-uhdx1capture/README.md"
+  install -m 0755 "${srcdir}/bench.sh" "${pkgdir}/usr/share/hws-uhdx1capture/tools/bench.sh"
+
+  ln -sf /usr/share/hws-uhdx1capture/tools/bench.sh "${pkgdir}/usr/bin/hws-bench"
+}
