@@ -38,10 +38,50 @@ static int video_work_budget = 2;
 module_param_named(video_work_budget, video_work_budget, int, 0644);
 MODULE_PARM_DESC(video_work_budget, "Max queued buffers handled per video worker run (min 1)");
 
+static int audio_work_budget = 8;
+module_param_named(audio_work_budget, audio_work_budget, int, 0644);
+MODULE_PARM_DESC(audio_work_budget, "Max queued audio packets handled per audio worker run (min 1)");
+
+static int audio_period_bytes = 4096;
+module_param_named(audio_period_bytes, audio_period_bytes, int, 0644);
+MODULE_PARM_DESC(audio_period_bytes, "Requested ALSA period size in bytes (default 4096 = 1024 frames @ 48kHz stereo s16)");
+
+static int audio_periods = 8;
+module_param_named(audio_periods, audio_periods, int, 0644);
+MODULE_PARM_DESC(audio_periods, "Requested ALSA period count (default 8)");
+
+enum {
+	HWS_FPS_POLICY_SOURCE_TRUTH = 1,
+	HWS_FPS_POLICY_USERSPACE_CONVERT = 2,
+	HWS_FPS_POLICY_DRIVER_CONVERT_EXPERIMENTAL = 3,
+	HWS_FPS_POLICY_AUTO_PROFILE = 4,
+};
+
+static int fps_policy_mode = HWS_FPS_POLICY_AUTO_PROFILE;
+module_param_named(fps_policy_mode, fps_policy_mode, int, 0644);
+MODULE_PARM_DESC(fps_policy_mode, "FPS policy: 1=source-truth, 2=userspace-convert, 3=driver-convert (experimental), 4=auto-profile");
+
+static int fps_policy_allow_experimental;
+module_param_named(fps_policy_allow_experimental, fps_policy_allow_experimental, int, 0644);
+MODULE_PARM_DESC(fps_policy_allow_experimental, "Allow experimental FPS policy mode 3 (0=off, 1=on)");
+
 static inline bool hws_diag_enabled(void)
 {
 	return diag_enable != 0;
 }
+
+struct hws_audio_diag_stats {
+	atomic64_t work_runs;
+	atomic64_t buffers_found;
+	atomic64_t delivered_bytes;
+	atomic64_t delivered_frames;
+	atomic64_t period_elapsed_calls;
+	atomic64_t oversized_packets;
+	atomic64_t dropped_no_substream;
+	atomic64_t dropped_bad_runtime;
+	atomic64_t dropped_ring_not_ready;
+	atomic64_t delivery_errors;
+};
 
 struct hws_diag_stats {
 	atomic64_t work_runs;
@@ -56,10 +96,18 @@ struct hws_diag_stats {
 	atomic64_t miss_frame_fallbacks;
 	atomic64_t memcopy_ns_total;
 	atomic64_t scaler_ns_total;
+	atomic64_t fresh_frame_runs;
+	atomic64_t nofresh_frame_runs;
+	atomic64_t source_interval_ns_total;
+	atomic64_t source_interval_ns_max;
+	atomic64_t source_interval_samples;
 };
 
 static struct hws_diag_stats hws_diag[MAX_VID_CHANNELS];
+static struct hws_audio_diag_stats hws_audio_diag[MAX_VID_CHANNELS];
 static struct dentry *hws_diag_root;
+static u64 hws_diag_last_fresh_ns[MAX_VID_CHANNELS];
+static u64 hws_source_interval_ns_avg[MAX_VID_CHANNELS];
 
 static inline void hws_diag_reset(void)
 {
@@ -78,6 +126,23 @@ static inline void hws_diag_reset(void)
 		atomic64_set(&hws_diag[i].miss_frame_fallbacks, 0);
 		atomic64_set(&hws_diag[i].memcopy_ns_total, 0);
 		atomic64_set(&hws_diag[i].scaler_ns_total, 0);
+		atomic64_set(&hws_diag[i].fresh_frame_runs, 0);
+		atomic64_set(&hws_diag[i].nofresh_frame_runs, 0);
+		atomic64_set(&hws_diag[i].source_interval_ns_total, 0);
+		atomic64_set(&hws_diag[i].source_interval_ns_max, 0);
+		atomic64_set(&hws_diag[i].source_interval_samples, 0);
+		hws_diag_last_fresh_ns[i] = 0;
+		hws_source_interval_ns_avg[i] = 0;
+		atomic64_set(&hws_audio_diag[i].work_runs, 0);
+		atomic64_set(&hws_audio_diag[i].buffers_found, 0);
+		atomic64_set(&hws_audio_diag[i].delivered_bytes, 0);
+		atomic64_set(&hws_audio_diag[i].delivered_frames, 0);
+		atomic64_set(&hws_audio_diag[i].period_elapsed_calls, 0);
+		atomic64_set(&hws_audio_diag[i].oversized_packets, 0);
+		atomic64_set(&hws_audio_diag[i].dropped_no_substream, 0);
+		atomic64_set(&hws_audio_diag[i].dropped_bad_runtime, 0);
+		atomic64_set(&hws_audio_diag[i].dropped_ring_not_ready, 0);
+		atomic64_set(&hws_audio_diag[i].delivery_errors, 0);
 	}
 }
 
@@ -98,10 +163,10 @@ static int hws_diag_show(struct seq_file *m, void *unused)
 {
 	int i;
 
-	seq_puts(m, "ch work_runs work_ns_total work_ns_max buf_processed buf_done buf_error copy_frames scaler_frames novideo_frames miss_fallbacks memcopy_ns_total scaler_ns_total\n");
+	seq_puts(m, "ch work_runs work_ns_total work_ns_max buf_processed buf_done buf_error copy_frames scaler_frames novideo_frames miss_fallbacks memcopy_ns_total scaler_ns_total fresh_runs nofresh_runs src_interval_ns_total src_interval_ns_max src_interval_samples\n");
 	for (i = 0; i < MAX_VID_CHANNELS; i++) {
 		seq_printf(m,
-			"%d %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld\n",
+			"%d %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld\n",
 			i,
 			(long long)atomic64_read(&hws_diag[i].work_runs),
 			(long long)atomic64_read(&hws_diag[i].work_ns_total),
@@ -114,7 +179,12 @@ static int hws_diag_show(struct seq_file *m, void *unused)
 			(long long)atomic64_read(&hws_diag[i].novideo_frames),
 			(long long)atomic64_read(&hws_diag[i].miss_frame_fallbacks),
 			(long long)atomic64_read(&hws_diag[i].memcopy_ns_total),
-			(long long)atomic64_read(&hws_diag[i].scaler_ns_total));
+			(long long)atomic64_read(&hws_diag[i].scaler_ns_total),
+			(long long)atomic64_read(&hws_diag[i].fresh_frame_runs),
+			(long long)atomic64_read(&hws_diag[i].nofresh_frame_runs),
+			(long long)atomic64_read(&hws_diag[i].source_interval_ns_total),
+			(long long)atomic64_read(&hws_diag[i].source_interval_ns_max),
+			(long long)atomic64_read(&hws_diag[i].source_interval_samples));
 	}
 
 	return 0;
@@ -124,6 +194,42 @@ static int hws_diag_open(struct inode *inode, struct file *file)
 {
 	return single_open(file, hws_diag_show, inode->i_private);
 }
+
+static int hws_audio_diag_show(struct seq_file *m, void *unused)
+{
+	int i;
+
+	seq_puts(m, "ch work_runs buffers_found delivered_bytes delivered_frames period_elapsed oversized_packets drop_no_substream drop_bad_runtime drop_ring_not_ready delivery_errors\n");
+	for (i = 0; i < MAX_VID_CHANNELS; i++) {
+		seq_printf(m, "%d %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld\n",
+			i,
+			(long long)atomic64_read(&hws_audio_diag[i].work_runs),
+			(long long)atomic64_read(&hws_audio_diag[i].buffers_found),
+			(long long)atomic64_read(&hws_audio_diag[i].delivered_bytes),
+			(long long)atomic64_read(&hws_audio_diag[i].delivered_frames),
+			(long long)atomic64_read(&hws_audio_diag[i].period_elapsed_calls),
+			(long long)atomic64_read(&hws_audio_diag[i].oversized_packets),
+			(long long)atomic64_read(&hws_audio_diag[i].dropped_no_substream),
+			(long long)atomic64_read(&hws_audio_diag[i].dropped_bad_runtime),
+			(long long)atomic64_read(&hws_audio_diag[i].dropped_ring_not_ready),
+			(long long)atomic64_read(&hws_audio_diag[i].delivery_errors));
+	}
+
+	return 0;
+}
+
+static int hws_audio_diag_open(struct inode *inode, struct file *file)
+{
+	return single_open(file, hws_audio_diag_show, inode->i_private);
+}
+
+static const struct file_operations hws_audio_diag_fops = {
+	.owner = THIS_MODULE,
+	.open = hws_audio_diag_open,
+	.read = seq_read,
+	.llseek = seq_lseek,
+	.release = single_release,
+};
 
 static const struct file_operations hws_diag_fops = {
 	.owner = THIS_MODULE,
@@ -145,6 +251,7 @@ static void hws_diag_init_debugfs(void)
 	}
 
 	debugfs_create_file("video_diag", 0444, hws_diag_root, NULL, &hws_diag_fops);
+	debugfs_create_file("audio_diag", 0444, hws_diag_root, NULL, &hws_audio_diag_fops);
 }
 
 static void hws_diag_remove_debugfs(void)
@@ -323,15 +430,122 @@ static const int framegrabber_support_refreshrate[]= {
 };
 #define NUM_FRAMERATE_CONTROLS (ARRAY_SIZE(framegrabber_support_refreshrate))
 
-//-------------------------------------------
-static int  v4l2_model_get_support_framerate(int index)
-{
-	if(index <0 ||index >=NUM_FRAMERATE_CONTROLS)
-		return -1;
+#define HWS_NS_PER_SEC 1000000000ULL
 
-	return (framegrabber_support_refreshrate[index]);
+static int hws_nearest_supported_fps(int fps)
+{
+	int i;
+	int best = framegrabber_support_refreshrate[0];
+	int best_diff = abs(fps - best);
+
+	for (i = 1; i < NUM_FRAMERATE_CONTROLS; i++) {
+		int cur = framegrabber_support_refreshrate[i];
+		int diff = abs(fps - cur);
+		if (diff < best_diff) {
+			best = cur;
+			best_diff = diff;
+		}
+	}
+	return best;
 }
 
+static int hws_effective_source_fps(struct hws_video *videodev)
+{
+	u64 avg_ns = READ_ONCE(hws_source_interval_ns_avg[videodev->index]);
+	int fps;
+
+	if (!avg_ns)
+		return 0;
+
+	fps = (int)DIV_ROUND_CLOSEST_ULL(HWS_NS_PER_SEC, avg_ns);
+	if (fps <= 0)
+		return 0;
+
+	return hws_nearest_supported_fps(fps);
+}
+static const int hws_common_fps[] = { 25, 30, 50, 60, 100 };
+#define HWS_COMMON_FPS_COUNT ARRAY_SIZE(hws_common_fps)
+
+static bool hws_is_common_fps(int fps)
+{
+	int i;
+
+	for (i = 0; i < HWS_COMMON_FPS_COUNT; i++) {
+		if (hws_common_fps[i] == fps)
+			return true;
+	}
+	return false;
+}
+
+static int hws_nearest_common_fps(int fps)
+{
+	int i;
+	int best = hws_common_fps[0];
+	int best_diff = abs(fps - best);
+
+	for (i = 1; i < HWS_COMMON_FPS_COUNT; i++) {
+		int cur = hws_common_fps[i];
+		int diff = abs(fps - cur);
+		if (diff < best_diff) {
+			best = cur;
+			best_diff = diff;
+		}
+	}
+	return best;
+}
+
+static int hws_effective_policy_mode(void)
+{
+	int mode = fps_policy_mode;
+
+	if (mode < HWS_FPS_POLICY_SOURCE_TRUTH || mode > HWS_FPS_POLICY_AUTO_PROFILE)
+		mode = HWS_FPS_POLICY_AUTO_PROFILE;
+
+	if (mode == HWS_FPS_POLICY_DRIVER_CONVERT_EXPERIMENTAL && !fps_policy_allow_experimental) {
+		pr_warn_ratelimited("hws: fps_policy_mode=3 blocked (experimental disabled), falling back to mode 4\n");
+		mode = HWS_FPS_POLICY_AUTO_PROFILE;
+	}
+
+	return mode;
+}
+
+static int hws_policy_select_fps(struct hws_video *videodev, int fallback_fps)
+{
+	int src_fps = hws_effective_source_fps(videodev);
+	int req_fps = videodev->current_out_framerate;
+	int fps;
+
+	switch (hws_effective_policy_mode()) {
+	case HWS_FPS_POLICY_SOURCE_TRUTH:
+		fps = (src_fps > 0) ? src_fps : req_fps;
+		if (fps <= 0)
+			fps = fallback_fps;
+		return hws_nearest_common_fps(fps);
+
+	case HWS_FPS_POLICY_USERSPACE_CONVERT:
+	case HWS_FPS_POLICY_DRIVER_CONVERT_EXPERIMENTAL:
+		fps = req_fps;
+		if (fps <= 0)
+			fps = (src_fps > 0) ? src_fps : fallback_fps;
+		if (!hws_is_common_fps(fps))
+			fps = hws_nearest_common_fps(fps);
+		return fps;
+
+	case HWS_FPS_POLICY_AUTO_PROFILE:
+	default:
+		if (src_fps > 0) {
+			fps = src_fps;
+			if (req_fps > 0 && hws_is_common_fps(req_fps) && req_fps < src_fps)
+				fps = req_fps;
+		} else {
+			fps = (req_fps > 0) ? req_fps : fallback_fps;
+		}
+		if (!hws_is_common_fps(fps))
+			fps = hws_nearest_common_fps(fps);
+		return fps;
+	}
+}
+//-------------------------------------------
 static int v4l2_get_suport_VideoFormatIndex(struct v4l2_format *fmt) 
 {
 	struct v4l2_pix_format *pix = &fmt->fmt.pix;
@@ -389,9 +603,9 @@ static int hws_vidioc_querycap(struct file *file, void *priv, struct v4l2_capabi
 	int vi_index;
 	vi_index = videodev->index+1+dev->m_Device_PortID*dev->m_nCurreMaxVideoChl;
 	//printk( "%s\n", __func__);
-	strcpy(cap->driver, KBUILD_MODNAME);
-	sprintf(cap->card, "%s %d",HWS_VIDEO_NAME,vi_index);
-	strcpy(cap->bus_info, "HWS");
+	strscpy(cap->driver, KBUILD_MODNAME, sizeof(cap->driver));
+	scnprintf(cap->card, sizeof(cap->card), "%s %d", HWS_VIDEO_NAME, vi_index);
+	strscpy(cap->bus_info, "HWS", sizeof(cap->bus_info));
 	cap->device_caps =	V4L2_CAP_VIDEO_CAPTURE |V4L2_CAP_STREAMING;
 	cap->capabilities = cap->device_caps | V4L2_CAP_DEVICE_CAPS;
 	//printk( "%s(IN END  )\n", __func__);
@@ -427,7 +641,7 @@ static int hws_vidioc_enum_fmt_vid_cap(struct file *file, void *priv_fh,struct v
 		    //printk("%s..pixfmt=%d.\n",__func__,f->index);
 		    f->index = index;
 		    f->type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-		    memcpy(f->description, pixfmt->name, strlen(pixfmt->name));
+		    strscpy(f->description, pixfmt->name, sizeof(f->description));
 		    f->pixelformat=pixfmt->fourcc;
 		}
 	}
@@ -581,24 +795,28 @@ static int hws_vidioc_s_std(struct file *file, void *priv,v4l2_std_id tvnorms)
 	return 0;
 }
 
-static int hws_vidioc_g_parm(struct file *file,void *fh, struct v4l2_streamparm *setfps)
+static int hws_vidioc_g_parm(struct file *file, void *fh, struct v4l2_streamparm *setfps)
 {
 	struct hws_video *videodev = video_drvdata(file);
-	v4l2_model_timing_t *p_SupportmodeTiming;
-	
-	//printk( "%s(%d) Frame Rate =%d \n", __func__, videodev->index,io_frame_rate);
+	v4l2_model_timing_t *mode;
+	int fallback_fps;
+	int fps;
+
 	if (setfps->type != V4L2_BUF_TYPE_VIDEO_CAPTURE)
-	{
-		printk("%s..\n",__func__);
-	    return -EINVAL;
-	}
-	p_SupportmodeTiming = v4l2_model_get_support_videoformat(videodev->current_out_size_index);
-	if(p_SupportmodeTiming ==NULL) return -EINVAL;
-    setfps->type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-    setfps->parm.capture.timeperframe.numerator=1000;
-    setfps->parm.capture.timeperframe.denominator=p_SupportmodeTiming->refresh_rate*1000;
-	//printk( "%s fps =%d \n", __func__, p_SupportmodeTiming->refresh_rate);
-	return 0;	
+		return -EINVAL;
+
+	mode = v4l2_model_get_support_videoformat(videodev->current_out_size_index);
+	fallback_fps = mode ? mode->refresh_rate : 60;
+	if (fallback_fps <= 0)
+		fallback_fps = 60;
+
+	fps = hws_policy_select_fps(videodev, fallback_fps);
+
+	setfps->type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+	setfps->parm.capture.timeperframe.numerator = 1;
+	setfps->parm.capture.timeperframe.denominator = fps;
+	setfps->parm.capture.readbuffers = 0;
+	return 0;
 }
 static int hws_vidioc_enum_framesizes(struct file *file, void *fh, struct v4l2_frmsizeenum *fsize)
 {
@@ -606,8 +824,7 @@ static int hws_vidioc_enum_framesizes(struct file *file, void *fh, struct v4l2_f
 	const framegrabber_pixfmt_t *pixfmt;
 	v4l2_model_timing_t *p_SupportmodeTiming;
 	int width=0,height=0;
-	int frameRate;
-	//printk( "%s(%d)-FrameIndex=[%d]\n", __func__,videodev->index,fsize->index);
+		//printk( "%s(%d)-FrameIndex=[%d]\n", __func__,videodev->index,fsize->index);
 	//----------------------------
 	pixfmt=framegrabber_g_support_pixelfmt_by_fourcc(fsize->pixel_format);
 	if(pixfmt==NULL)
@@ -623,8 +840,7 @@ static int hws_vidioc_enum_framesizes(struct file *file, void *fh, struct v4l2_f
 	}
 	width = p_SupportmodeTiming->frame_size.width;
 	height = p_SupportmodeTiming->frame_size.height;
-	frameRate = p_SupportmodeTiming->refresh_rate;
-
+	
 	//printk("%s...supportframesize[%d] width=%d height=%d Framerate=%d..\n",__func__,fsize->index,width,height,frameRate); //12
 	if((width ==0) || (height ==0))
 	{
@@ -660,7 +876,7 @@ static int hws_vidioc_enum_input(struct file *file, void *priv,struct v4l2_input
 		return   -EINVAL;
 	}
 	i->type = V4L2_INPUT_TYPE_CAMERA;
-	strcpy(i->name, KBUILD_MODNAME);
+	strscpy(i->name, KBUILD_MODNAME, sizeof(i->name));
 	i->std = V4L2_STD_NTSC_M;
 	i->capabilities = 0;
 	i->status=0;
@@ -775,6 +991,8 @@ static int hws_open(struct file *file)
     INIT_LIST_HEAD(&ctx->buf_queue);
     spin_lock_init(&ctx->qlock);
     ctx->streaming = false;
+    WRITE_ONCE(videodev->next_frame_ts_ns, 0);
+	videodev->output_rate_accum = 0;
     ctx->seqnr = 0;
 
     /* v4l2 file-handle */
@@ -1096,7 +1314,18 @@ static int hws_vidioc_g_ctrl(struct file *file, void *fh,struct v4l2_control *a)
 		    //printk("%s...hue(%d)\n",__func__,bchs_select);
             ctrl->value = videodev->m_Curr_Hue;
 			ret = 0;
-			break; // 			
+			break;
+
+		case V4L2_CID_MIN_BUFFERS_FOR_CAPTURE:
+			ctrl->value = 3;
+			ret = 0;
+			break;
+
+		case V4L2_CID_MIN_BUFFERS_FOR_OUTPUT:
+			ctrl->value = 0;
+			ret = 0;
+			break;
+
 		default:
 		    ctrl->value =0;
 			if (hws_diag_enabled())
@@ -1407,75 +1636,87 @@ static int hws_vidioc_streamoff(struct file *file, void *priv, enum v4l2_buf_typ
 }
 #endif 
 static int hws_vidioc_enum_frameintervals(struct file *file, void *fh,
-                   struct v4l2_frmivalenum *fival)
-{
-	//struct hws_video *videodev = video_drvdata(file);
-	int Index;
-	int FrameRate;
-	v4l2_model_timing_t * pModeTiming;
-	Index = fival->index;
-	//printk( "%s(CH-%d) FrameIndex =%d \n", __func__,videodev->index,Index);
-	if(Index <0 ||Index >=NUM_FRAMERATE_CONTROLS)
-	{
-		return   -EINVAL;
-	}
-
-	FrameRate = v4l2_model_get_support_framerate(Index);
-	if(FrameRate == -1) return -EINVAL;
-	pModeTiming = Get_input_framesizeIndex(fival->width,fival->height);
-	if(pModeTiming == NULL) return -EINVAL;
-	#if 1
-  	fival->type = V4L2_FRMIVAL_TYPE_DISCRETE;
-	fival->discrete.numerator=1 ;
-	fival->discrete.denominator=FrameRate;
-   #else
-     fival->type = V4L2_FRMIVAL_TYPE_DISCRETE;
-    if (fival->width == 720 && fival->height == 576) {
-        /* just show  25/50 */
-        if (fival->index == 0) {
-            fival->discrete.numerator = 1;
-            fival->discrete.denominator = 25;
-            return 0;
-        } else if (fival->index == 1) {
-            fival->discrete.numerator = 1;
-            fival->discrete.denominator = 50;
-            return 0;
-        }
-        return -EINVAL;
-    } else {
-        /* ohter  30/60 */
-        if (fival->index == 0) {
-            fival->discrete.numerator = 1;
-            fival->discrete.denominator = 30;
-            return 0;
-        } else if (fival->index == 1) {
-            fival->discrete.numerator = 1;
-            fival->discrete.denominator = 60;
-            return 0;
-        }
-        return -EINVAL;
-    }
-   #endif
- 
-	//printk( "%s FrameIndex=%d W=%d H=%d  FrameRate=%d \n", __func__,Index,fival->width,fival->height,FrameRate);
-    return 0;
-}
-static int hws_vidioc_s_parm(struct file *file, void *fh,struct v4l2_streamparm *a)
+			   struct v4l2_frmivalenum *fival)
 {
 	struct hws_video *videodev = video_drvdata(file);
+	const framegrabber_pixfmt_t *pixfmt;
+	v4l2_model_timing_t *mode;
+	int fps;
+	int src_fps;
+	int policy_mode = hws_effective_policy_mode();
+
+	pixfmt = framegrabber_g_support_pixelfmt_by_fourcc(fival->pixel_format);
+	if (!pixfmt)
+		return -EINVAL;
+
+	mode = Get_input_framesizeIndex(fival->width, fival->height);
+	if (!mode)
+		return -EINVAL;
+
+	src_fps = hws_effective_source_fps(videodev);
+	if (policy_mode == HWS_FPS_POLICY_SOURCE_TRUTH) {
+		if (fival->index > 0)
+			return -EINVAL;
+		fps = hws_policy_select_fps(videodev, mode->refresh_rate);
+	} else if (policy_mode == HWS_FPS_POLICY_AUTO_PROFILE) {
+		if (fival->index >= HWS_COMMON_FPS_COUNT)
+			return -EINVAL;
+		fps = hws_common_fps[fival->index];
+		if (src_fps > 0 && fps > src_fps)
+			return -EINVAL;
+	} else {
+		if (fival->index >= HWS_COMMON_FPS_COUNT)
+			return -EINVAL;
+		fps = hws_common_fps[fival->index];
+	}
+
+	fival->type = V4L2_FRMIVAL_TYPE_DISCRETE;
+	fival->discrete.numerator = 1;
+	fival->discrete.denominator = fps;
+	return 0;
+}
+static int hws_vidioc_s_parm(struct file *file, void *fh, struct v4l2_streamparm *a)
+{
+	struct hws_video *videodev = video_drvdata(file);
+	v4l2_model_timing_t *mode;
 	int io_frame_rate;
-	int in_frame_rate;
-	//int io_widht;
-	//int io_hight;
-	//int io_index; 
-	v4l2_model_timing_t *p_SupportmodeTiming;
-	io_frame_rate = a->parm.capture.timeperframe.denominator/a->parm.capture.timeperframe.numerator;
-	//io_index = a->parm.capture.timeperframe.index;
-	//printk( "%s(CH-%d) io_index =%d \n", __func__,videodev->index,io_index);
-	p_SupportmodeTiming = v4l2_model_get_support_videoformat(videodev->current_out_size_index);
-	if(p_SupportmodeTiming ==NULL) return -EINVAL;
-	in_frame_rate = p_SupportmodeTiming->refresh_rate;
-	//printk( "%s(ch-%d)io_frame_rate =%d  in_frame_rate =%d \n", __func__,videodev->index,io_frame_rate,in_frame_rate);
+	int src_fps;
+	int policy_mode = hws_effective_policy_mode();
+
+	if (a->type != V4L2_BUF_TYPE_VIDEO_CAPTURE)
+		return -EINVAL;
+
+	if (a->parm.capture.timeperframe.numerator <= 0 ||
+	    a->parm.capture.timeperframe.denominator <= 0)
+		return -EINVAL;
+
+	io_frame_rate = a->parm.capture.timeperframe.denominator /
+			a->parm.capture.timeperframe.numerator;
+	if (io_frame_rate <= 0)
+		return -EINVAL;
+
+	if (!hws_is_common_fps(io_frame_rate))
+		io_frame_rate = hws_nearest_common_fps(io_frame_rate);
+
+	src_fps = hws_effective_source_fps(videodev);
+	if (policy_mode == HWS_FPS_POLICY_SOURCE_TRUTH && src_fps > 0) {
+		if (abs(io_frame_rate - src_fps) > 1)
+			return -EINVAL;
+		io_frame_rate = src_fps;
+	} else if (policy_mode == HWS_FPS_POLICY_SOURCE_TRUTH) {
+		mode = v4l2_model_get_support_videoformat(videodev->current_out_size_index);
+		if (mode)
+			io_frame_rate = hws_nearest_common_fps(mode->refresh_rate);
+	} else if (policy_mode == HWS_FPS_POLICY_AUTO_PROFILE && src_fps > 0) {
+		if (io_frame_rate > src_fps)
+			io_frame_rate = src_fps;
+	}
+
+	videodev->current_out_framerate = io_frame_rate;
+	a->parm.capture.timeperframe.numerator = 1;
+	a->parm.capture.timeperframe.denominator = io_frame_rate;
+	a->parm.capture.readbuffers = 0;
+
 	return 0;
 }
 
@@ -1741,6 +1982,10 @@ static int hws_start_streaming(struct vb2_queue *q, unsigned int count)
 	}
 	#endif 
 	videodev->seqnr = 0;
+	WRITE_ONCE(videodev->next_frame_ts_ns, 0);
+	videodev->output_rate_accum = 0;
+	hws_diag_last_fresh_ns[videodev->index] = 0;
+	hws_source_interval_ns_avg[videodev->index] = 0;
 	mdelay(100);
 	//---------------
 	//if(videodev->fileindex==1)
@@ -1779,6 +2024,10 @@ static void hws_stop_streaming(struct vb2_queue *q)
 	//}
 	#if 1
 	//-----------------------------------
+	WRITE_ONCE(videodev->next_frame_ts_ns, 0);
+	videodev->output_rate_accum = 0;
+	hws_diag_last_fresh_ns[videodev->index] = 0;
+	hws_source_interval_ns_avg[videodev->index] = 0;
 	videodev->startstreamIndex --;
 	if(videodev->startstreamIndex<0) videodev->startstreamIndex=0;
 	if(videodev->startstreamIndex == 0)
@@ -1880,6 +2129,10 @@ static int hws_start_streaming_multi(struct vb2_queue *q, unsigned int count)
 
     ctx->streaming = true;
     ctx->seqnr = 0;
+    WRITE_ONCE(videodev->next_frame_ts_ns, 0);
+	videodev->output_rate_accum = 0;
+    hws_diag_last_fresh_ns[videodev->index] = 0;
+	hws_source_interval_ns_avg[videodev->index] = 0;
 
     /* Start hardware engine only once, on first streamer */
     if (atomic_inc_return(&videodev->engine_users) == 1) {
@@ -1897,6 +2150,10 @@ static void hws_stop_streaming_multi(struct vb2_queue *q)
     unsigned long flags;
 
     ctx->streaming = false;
+    WRITE_ONCE(videodev->next_frame_ts_ns, 0);
+	videodev->output_rate_accum = 0;
+    hws_diag_last_fresh_ns[videodev->index] = 0;
+	hws_source_interval_ns_avg[videodev->index] = 0;
 
     /*
      * Serialize with worker-side dequeue so buffers from this ctx are not
@@ -1969,111 +2226,184 @@ for(y=1;y<h;y++)
 //---------------------------------------------------
 static int _deliver_samples(struct hws_audio *drv, void *aud_data, u32 aud_len)
 {
-    struct snd_pcm_substream *substream = drv->substream;
-    int elapsed = 0;
-    unsigned int frames = aud_len / (2 * drv->channels);
-    int copy_bytes = 0;
-    unsigned long flags;
+	struct snd_pcm_substream *substream = READ_ONCE(drv->substream);
+	struct snd_pcm_runtime *runtime;
+	int ch = drv->index;
+	unsigned long flags;
+	u8 *src;
+	u8 *dst;
+	unsigned int frame_bytes;
+	unsigned int frames;
+	unsigned int ring_size;
+	unsigned int wpos;
+	unsigned int period_size;
+	unsigned int period_used;
+	unsigned int wrapped_frames = 0;
+	bool diag = hws_diag_enabled();
+	int elapsed = 0;
 
-    if (frames == 0)
-        return 0;
+	if (ch < 0 || ch >= MAX_VID_CHANNELS)
+		diag = false;
 
-    if (drv->ring_wpos_byframes + frames > drv->ring_size_byframes) {
-        copy_bytes = (drv->ring_size_byframes - drv->ring_wpos_byframes) * 2 * drv->channels;
-        memcpy(substream->runtime->dma_area + drv->ring_wpos_byframes * 2 * drv->channels,
-                aud_data, copy_bytes);
-        memcpy(substream->runtime->dma_area, aud_data + copy_bytes, aud_len - copy_bytes);
-    } else {
-        memcpy(substream->runtime->dma_area + drv->ring_wpos_byframes * 2 * drv->channels,
-                aud_data, aud_len);
-    }
+	if (!substream) {
+		if (diag)
+			atomic64_inc(&hws_audio_diag[ch].dropped_no_substream);
+		return -ENODEV;
+	}
 
-    spin_lock_irqsave(&drv->ring_lock, flags);
-    drv->ring_wpos_byframes += frames;
-    drv->ring_wpos_byframes %= drv->ring_size_byframes;
-    /* check if a period available */
-    elapsed = (drv->period_used_byframes + frames) / drv->period_size_byframes;
-    drv->period_used_byframes += frames;
-    drv->period_used_byframes %= drv->period_size_byframes;
-    spin_unlock_irqrestore(&drv->ring_lock, flags);
+	runtime = substream->runtime;
+	if (!runtime || !runtime->dma_area || drv->channels <= 0) {
+		if (diag)
+			atomic64_inc(&hws_audio_diag[ch].dropped_bad_runtime);
+		return -ENODEV;
+	}
 
-    if (elapsed && substream) {
-        /* snd_pcm_period_elapsed will call SNDRV_PCM_TRIGGER_STOP in somecase */
-        snd_pcm_period_elapsed(drv->substream);
-    }
+	frame_bytes = 2 * drv->channels;
+	if (frame_bytes == 0)
+		return -EINVAL;
 
-    return frames * 2 * drv->channels;
+	frames = aud_len / frame_bytes;
+	if (frames == 0)
+		return 0;
+
+	src = (u8 *)aud_data;
+	dst = (u8 *)runtime->dma_area;
+
+	spin_lock_irqsave(&drv->ring_lock, flags);
+	ring_size = drv->ring_size_byframes;
+	wpos = drv->ring_wpos_byframes;
+	period_size = drv->period_size_byframes;
+	period_used = drv->period_used_byframes;
+	spin_unlock_irqrestore(&drv->ring_lock, flags);
+
+	if (ring_size == 0 || period_size == 0) {
+		if (diag)
+			atomic64_inc(&hws_audio_diag[ch].dropped_ring_not_ready);
+		return -EAGAIN;
+	}
+
+	/* Keep newest data if a single packet exceeds ring capacity. */
+	if (frames > ring_size) {
+		unsigned int drop = frames - ring_size;
+		if (diag)
+			atomic64_inc(&hws_audio_diag[ch].oversized_packets);
+		src += drop * frame_bytes;
+		frames = ring_size;
+		aud_len = frames * frame_bytes;
+	}
+
+	if (wpos + frames > ring_size) {
+		wrapped_frames = ring_size - wpos;
+		memcpy(dst + wpos * frame_bytes, src, wrapped_frames * frame_bytes);
+		memcpy(dst, src + wrapped_frames * frame_bytes, aud_len - wrapped_frames * frame_bytes);
+	} else {
+		memcpy(dst + wpos * frame_bytes, src, aud_len);
+	}
+
+	spin_lock_irqsave(&drv->ring_lock, flags);
+	drv->ring_wpos_byframes = (wpos + frames) % ring_size;
+	elapsed = (period_used + frames) / period_size;
+	drv->period_used_byframes = (period_used + frames) % period_size;
+	spin_unlock_irqrestore(&drv->ring_lock, flags);
+
+	if (elapsed && READ_ONCE(drv->substream) == substream) {
+		/* snd_pcm_period_elapsed can trigger STOP in some cases */
+		snd_pcm_period_elapsed(substream);
+		if (diag)
+			atomic64_add(elapsed, &hws_audio_diag[ch].period_elapsed_calls);
+	}
+
+	if (diag) {
+		atomic64_add(frames * frame_bytes, &hws_audio_diag[ch].delivered_bytes);
+		atomic64_add(frames, &hws_audio_diag[ch].delivered_frames);
+	}
+
+	return frames * frame_bytes;
 }
 
 static void audio_data_process(struct work_struct *p_work)
 {
 	struct hws_audio *drv = container_of(p_work, struct hws_audio, audiowork);
-	//struct snd_pcm_substream *substream = drv->substream;
 	struct hws_pcie_dev *pdx = drv->dev;
-	int nIndex;
-	int i;
-	int delived = 0;
-	//unsigned int frames;
-	BYTE *bBuf = NULL;
-	//int copysize =0;
-	//int rev_size=0;
 	int dwAudioCh;
-	int aud_len;
+	unsigned int budget;
+	unsigned int processed = 0;
 	unsigned long flags;
-	//int avail = 0;
+	bool diag = hws_diag_enabled();
+
 	dwAudioCh = drv->index;
-	nIndex = -1;
-	//printk("audio_data_process %d\n",dwAudioCh);
-	spin_lock_irqsave(&pdx->audiolock[dwAudioCh], flags);
-	for( i = pdx->m_nRDAudioIndex[dwAudioCh];i<MAX_AUDIO_QUEUE;i++)
-	{
-		if(pdx->m_AudioInfo[dwAudioCh].pStatusInfo[i].byLock== MEM_LOCK)
-		{
-			nIndex =i;
-			bBuf = pdx->m_AudioInfo[dwAudioCh].m_pAudioBufData[i];
-			aud_len = pdx->m_AudioInfo[dwAudioCh].pStatusInfo[i].dwLength;
+	if (dwAudioCh < 0 || dwAudioCh >= MAX_VID_CHANNELS)
+		diag = false;
+	if (diag)
+		atomic64_inc(&hws_audio_diag[dwAudioCh].work_runs);
+
+	if (!READ_ONCE(pdx->m_bAudioRun[dwAudioCh]))
+		return;
+
+	budget = (audio_work_budget > 0) ? (unsigned int)audio_work_budget : 1U;
+	while (processed < budget) {
+		int nIndex = -1;
+		int i;
+		int delivered = 0;
+		BYTE *bBuf = NULL;
+		int aud_len = 0;
+
+		spin_lock_irqsave(&pdx->audiolock[dwAudioCh], flags);
+		for (i = pdx->m_nRDAudioIndex[dwAudioCh]; i < MAX_AUDIO_QUEUE; i++) {
+			if (pdx->m_AudioInfo[dwAudioCh].pStatusInfo[i].byLock == MEM_LOCK) {
+				nIndex = i;
+				bBuf = pdx->m_AudioInfo[dwAudioCh].m_pAudioBufData[i];
+				aud_len = pdx->m_AudioInfo[dwAudioCh].pStatusInfo[i].dwLength;
+				break;
+			}
+		}
+
+		if (nIndex == -1) {
+			for (i = 0; i < pdx->m_nRDAudioIndex[dwAudioCh]; i++) {
+				if (pdx->m_AudioInfo[dwAudioCh].pStatusInfo[i].byLock == MEM_LOCK) {
+					nIndex = i;
+					bBuf = pdx->m_AudioInfo[dwAudioCh].m_pAudioBufData[i];
+					aud_len = pdx->m_AudioInfo[dwAudioCh].pStatusInfo[i].dwLength;
+					break;
+				}
+			}
+		}
+
+		if (nIndex != -1) {
+			if (diag)
+				atomic64_inc(&hws_audio_diag[dwAudioCh].buffers_found);
+			pdx->m_nRDAudioIndex[dwAudioCh] = nIndex + 1;
+			if (pdx->m_nRDAudioIndex[dwAudioCh] >= MAX_AUDIO_QUEUE)
+				pdx->m_nRDAudioIndex[dwAudioCh] = 0;
+		}
+		spin_unlock_irqrestore(&pdx->audiolock[dwAudioCh], flags);
+
+		if (nIndex == -1 || !bBuf)
+			break;
+
+		if (!READ_ONCE(pdx->m_bAudioRun[dwAudioCh])) {
+			spin_lock_irqsave(&pdx->audiolock[dwAudioCh], flags);
+			pdx->m_AudioInfo[dwAudioCh].pStatusInfo[nIndex].byLock = MEM_UNLOCK;
+			spin_unlock_irqrestore(&pdx->audiolock[dwAudioCh], flags);
 			break;
 		}
-	}
-	if(nIndex == -1)
-	{
-		for( i = 0 ;i<pdx->m_nRDAudioIndex[dwAudioCh];i++)
-		{
-				if(pdx->m_AudioInfo[dwAudioCh].pStatusInfo[i].byLock== MEM_LOCK)
-				{
-						nIndex =i;
-						bBuf = pdx->m_AudioInfo[dwAudioCh].m_pAudioBufData[i];
-						aud_len = pdx->m_AudioInfo[dwAudioCh].pStatusInfo[i].dwLength;
-						break;
-				}
-				
+
+		/* Do expensive copy/callback path outside device audio lock. */
+		delivered = _deliver_samples(drv, bBuf, aud_len);
+		if (delivered < 0) {
+			if (diag) {
+				atomic64_inc(&hws_audio_diag[dwAudioCh].delivery_errors);
+				pr_info_ratelimited("hws: audio delivery skipped ch=%d err=%d\n", dwAudioCh, delivered);
+			}
 		}
-	}
-	if((nIndex != -1)&&(bBuf))
-	{
-		//--- send data -------------
-		 delived = _deliver_samples(drv,bBuf, aud_len);
-		#if 0
-		 avail = aud_len - delived;
-		 if(avail)
-		 {
-		 	printk("Sample Rate is wrong  =%d \n",avail);
-		 }
-		#endif 
-		//----------------------------------------------
-		//spin_lock_irqsave(&pdx->audiolock[dwAudioCh], flags);
+
+		spin_lock_irqsave(&pdx->audiolock[dwAudioCh], flags);
 		pdx->m_AudioInfo[dwAudioCh].pStatusInfo[nIndex].byLock = MEM_UNLOCK;
-		//spin_unlock_irqrestore(&pdx->audiolock[dwAudioCh], flags);
-		nIndex ++;
-		if(nIndex >=MAX_AUDIO_QUEUE)
-		{
-			nIndex =0;
-		}
-		pdx->m_nRDAudioIndex[dwAudioCh] = nIndex;
+		spin_unlock_irqrestore(&pdx->audiolock[dwAudioCh], flags);
+		processed++;
 	}
-	spin_unlock_irqrestore(&pdx->audiolock[dwAudioCh], flags);
-	
 }
+
 //-------------------------------
 static void FHD_To_800X600_Scaler(BYTE *pSrc,BYTE *pOut,int in_w,int in_h,int out_w,int out_h)
 {
@@ -2503,12 +2833,12 @@ void HD_To_FHD_Scaler(BYTE *pSrc,BYTE *pOut,int in_w,int in_h,int out_w,int out_
 		 //BYTE*pDestBuf;
 		 DWORD *pSrcData;
 		 DWORD *pDestData;
-		 int    out_w_size;
+		 int out_w_size;
 		 //BYTE*pSrcTmp;
 		 BYTE*pDestTmp;
-		 out_w_size = out_w*2;
 		 pDestData = (DWORD *) pOut;
 		 pSrcData = (DWORD *) pSrc;
+		 out_w_size = out_w*2;
 		 for(y=0;y<out_h;y++)
 		 {
 			
@@ -3217,10 +3547,8 @@ static  void V2560X1440_To_FHD_Scaler(BYTE *pSrc,BYTE *pOut,int in_w,int in_h,in
 		 BYTE*pDestBuf;
 		 DWORD *pSrcData;
 		 DWORD *pDestData;
-		 int    out_w_size;
 		 BYTE*pSrcTmp;
 		 BYTE*pDestTmp;
-		 out_w_size = out_w*2;
 		 pDestData = (DWORD *) pOut;
 		 pSrcData = (DWORD *) pSrc;
 		 pSrcBuf = pSrc;
@@ -3639,7 +3967,7 @@ static struct hwsvideo_buffer *hws_pop_any_buffer(struct hws_video *videodev)
     return buf;
 }
 
-static bool hws_has_pending_buffers(struct hws_video *videodev)
+static bool __maybe_unused hws_has_pending_buffers(struct hws_video *videodev)
 {
     struct hws_vfh_ctx *ctx;
     unsigned long flags;
@@ -3661,8 +3989,51 @@ static bool hws_has_pending_buffers(struct hws_video *videodev)
         spin_unlock_irqrestore(&ctx->qlock, qflags);
     }
     spin_unlock_irqrestore(&videodev->consumers_lock, flags);
-
     return pending;
+}
+
+static unsigned int hws_pending_consumer_count(struct hws_video *videodev)
+{
+    struct hws_vfh_ctx *ctx;
+    unsigned long flags;
+    unsigned int count = 0;
+
+    spin_lock_irqsave(&videodev->consumers_lock, flags);
+    list_for_each_entry(ctx, &videodev->consumers, node) {
+        unsigned long qflags;
+
+        if (!ctx->streaming)
+            continue;
+
+        spin_lock_irqsave(&ctx->qlock, qflags);
+        if (!list_empty(&ctx->buf_queue))
+            count++;
+        spin_unlock_irqrestore(&ctx->qlock, qflags);
+    }
+    spin_unlock_irqrestore(&videodev->consumers_lock, flags);
+
+    return count;
+}
+
+static u64 hws_next_frame_ts_ns(struct hws_video *videodev, u64 now_ns)
+{
+	u64 prev = READ_ONCE(videodev->next_frame_ts_ns);
+	u64 interval_ns;
+	int fps = hws_policy_select_fps(videodev, 60);
+
+	if (fps <= 0)
+		fps = 60;
+	interval_ns = DIV_ROUND_CLOSEST_ULL(HWS_NS_PER_SEC, (u64)fps);
+	if (interval_ns == 0)
+		interval_ns = 16666667ULL;
+
+	if (!prev || now_ns > prev + interval_ns * 4)
+		prev = now_ns;
+	else
+		prev += interval_ns;
+
+	WRITE_ONCE(videodev->next_frame_ts_ns, prev);
+	return prev;
 }
 
 static void video_data_process(struct work_struct *p_work)
@@ -3699,6 +4070,15 @@ static void video_data_process(struct work_struct *p_work)
 	unsigned int budget;
 	unsigned int processed_in_run = 0;
 	bool budget_exhausted = false;
+	unsigned int per_frame_budget = 1;
+	u64 frame_ts_ns = 0;
+	bool had_fresh_frame = false;
+	bool no_fresh_frame = false;
+	u64 source_interval_ns = 0;
+	unsigned int output_frames_target = 1;
+	int source_fps = 0;
+	int target_fps = 0;
+	int policy_mode = HWS_FPS_POLICY_AUTO_PROFILE;
 
 	bBuf[0] = NULL;
 	bBuf[1] = NULL;
@@ -3737,21 +4117,23 @@ static void video_data_process(struct work_struct *p_work)
 			nCopySize[3] = pdx->m_VideoInfo[nCh].m_VideoBufferSize[3];
 			interlace = pdx->m_VideoInfo[nCh].pStatusInfo[nVindex].dwinterlace;
 		}
-		if (nVindex == -1) {
+		if (nVindex == -1)
 			miss_freme = 1;
-			if (pdx->m_nRDVideoIndex[nCh] == 0)
-				nVindex = MAX_VIDEO_QUEUE - 1;
-			else
-				nVindex = pdx->m_nRDVideoIndex[nCh] - 1;
-			bBuf[0] = pdx->m_VideoInfo[nCh].m_pVideoBufData[nVindex];
-			bBuf[1] = pdx->m_VideoInfo[nCh].m_pVideoBufData1[nVindex];
-			bBuf[2] = pdx->m_VideoInfo[nCh].m_pVideoBufData2[nVindex];
-			bBuf[3] = pdx->m_VideoInfo[nCh].m_pVideoBufData3[nVindex];
-			nCopySize[0] = pdx->m_VideoInfo[nCh].m_VideoBufferSize[0];
-			nCopySize[1] = pdx->m_VideoInfo[nCh].m_VideoBufferSize[1];
-			nCopySize[2] = pdx->m_VideoInfo[nCh].m_VideoBufferSize[2];
-			nCopySize[3] = pdx->m_VideoInfo[nCh].m_VideoBufferSize[3];
-			interlace = pdx->m_VideoInfo[nCh].pStatusInfo[nVindex].dwinterlace;
+	}
+	if (curr_no_video == 0) {
+		if (nVindex >= 0) {
+			u64 now_ns = ktime_get_ns();
+			had_fresh_frame = true;
+			if (hws_diag_last_fresh_ns[nCh] != 0 && now_ns > hws_diag_last_fresh_ns[nCh])
+				source_interval_ns = now_ns - hws_diag_last_fresh_ns[nCh];
+			hws_diag_last_fresh_ns[nCh] = now_ns;
+			if (source_interval_ns > 0) {
+				u64 prev_avg = READ_ONCE(hws_source_interval_ns_avg[nCh]);
+				u64 new_avg = prev_avg ? ((prev_avg * 7) + source_interval_ns) / 8 : source_interval_ns;
+				WRITE_ONCE(hws_source_interval_ns_avg[nCh], new_avg);
+			}
+		} else {
+			no_fresh_frame = true;
 		}
 	} else {
 		for (i = 0; i < MAX_VIDEO_QUEUE; i++) {
@@ -3765,13 +4147,53 @@ static void video_data_process(struct work_struct *p_work)
 	out_height = videodev->curren_out_height;
 	out_size = out_width * out_height * 2;
 	needs_scaler = (in_vsize != out_size);
+	frame_ts_ns = 0;
+	per_frame_budget = hws_pending_consumer_count(videodev);
+	if (per_frame_budget == 0)
+		per_frame_budget = 1;
+	if (per_frame_budget > budget)
+		per_frame_budget = budget;
+
+	source_fps = hws_effective_source_fps(videodev);
+	target_fps = videodev->current_out_framerate;
+	if (target_fps <= 0)
+		target_fps = 60;
+	policy_mode = hws_effective_policy_mode();
+	if (policy_mode == HWS_FPS_POLICY_DRIVER_CONVERT_EXPERIMENTAL && had_fresh_frame && source_fps > 0) {
+		videodev->output_rate_accum += target_fps;
+		output_frames_target = videodev->output_rate_accum / source_fps;
+		videodev->output_rate_accum %= source_fps;
+		if (target_fps >= source_fps) {
+			if (output_frames_target == 0)
+				output_frames_target = 1;
+			if (output_frames_target > 4)
+				output_frames_target = 4;
+		} else {
+			if (output_frames_target > 1)
+				output_frames_target = 1;
+		}
+	} else {
+		output_frames_target = 1;
+		if (policy_mode != HWS_FPS_POLICY_DRIVER_CONVERT_EXPERIMENTAL)
+			videodev->output_rate_accum = 0;
+	}
+
+	if (per_frame_budget * output_frames_target > budget)
+		per_frame_budget = budget;
+	else
+		per_frame_budget *= output_frames_target;
+
+	if (curr_no_video == 0 && nVindex < 0)
+		goto out_finish;
 
 	for (;;) {
 		struct hwsvideo_buffer *buf;
 		int copy_ret = 0;
 		u64 copy_start;
+		unsigned int dst_capacity;
+		unsigned int required_size;
 
-		if (processed_in_run >= budget) {
+		if (processed_in_run >= per_frame_budget) {
 			budget_exhausted = true;
 			break;
 		}
@@ -3783,10 +4205,25 @@ static void video_data_process(struct work_struct *p_work)
 		processed_in_run++;
 		buf_processed++;
 
-		buf->vb.vb2_buf.timestamp = ktime_get_ns();
+		frame_ts_ns = hws_next_frame_ts_ns(videodev, ktime_get_ns());
+		buf->vb.vb2_buf.timestamp = frame_ts_ns;
 		buf->vb.field = V4L2_FIELD_NONE;
 
 		if (!buf->mem) {
+			vb2_buffer_done(&buf->vb.vb2_buf, VB2_BUF_STATE_ERROR);
+			buf_error++;
+			continue;
+		}
+
+		dst_capacity = vb2_plane_size(&buf->vb.vb2_buf, 0);
+		required_size = (curr_no_video == 0 && !needs_scaler) ?
+			(unsigned int)in_vsize : (unsigned int)out_size;
+		if (dst_capacity < required_size) {
+			if (diag_on) {
+				pr_warn_ratelimited(
+					"hws: vb2 dst too small ch=%d cap=%u need=%u no_video=%d scaler=%d\n",
+					nCh, dst_capacity, required_size, curr_no_video, needs_scaler);
+			}
 			vb2_buffer_done(&buf->vb.vb2_buf, VB2_BUF_STATE_ERROR);
 			buf_error++;
 			continue;
@@ -3847,6 +4284,7 @@ static void video_data_process(struct work_struct *p_work)
 	}
 	spin_unlock_irqrestore(&pdx->videoslock[nCh], devflags);
 
+out_finish:
 	if (diag_on) {
 		work_elapsed_ns = ktime_get_ns() - work_start_ns;
 		atomic64_inc(&hws_diag[nCh].work_runs);
@@ -3862,11 +4300,18 @@ static void video_data_process(struct work_struct *p_work)
 			atomic64_inc(&hws_diag[nCh].miss_frame_fallbacks);
 		atomic64_add(memcopy_ns, &hws_diag[nCh].memcopy_ns_total);
 		atomic64_add(scaler_ns, &hws_diag[nCh].scaler_ns_total);
+		if (had_fresh_frame)
+			atomic64_inc(&hws_diag[nCh].fresh_frame_runs);
+		if (no_fresh_frame)
+			atomic64_inc(&hws_diag[nCh].nofresh_frame_runs);
+		if (source_interval_ns > 0) {
+			atomic64_add(source_interval_ns, &hws_diag[nCh].source_interval_ns_total);
+			hws_diag_update_max(&hws_diag[nCh].source_interval_ns_max, source_interval_ns);
+			atomic64_inc(&hws_diag[nCh].source_interval_samples);
+		}
 	}
 
-	if (budget_exhausted && hws_has_pending_buffers(videodev))
-		queue_work(pdx->wq, &videodev->videowork);
-
+	(void)budget_exhausted;
 	(void)miss_freme;
 }
 
@@ -3951,7 +4396,7 @@ static int hws_video_register(struct hws_pcie_dev *dev)
 		vdev->v4l2_dev = &(dev->video[i].v4l2_dev);
 		vdev->lock = &(dev->video[i].video_lock);
 		vdev->fops = &hws_fops;
-		strcpy(vdev->name,KBUILD_MODNAME);
+		strscpy(vdev->name, KBUILD_MODNAME, sizeof(vdev->name));
 		vdev->release = video_device_release_empty;
 		vdev->vfl_dir = VFL_DIR_RX;
 		vdev->ioctl_ops = &hws_ioctl_fops;
@@ -4018,7 +4463,7 @@ fail:
 }
 
 /* HDMI 0x39[3:0] - CS_DATA[27:24] 0 for reserved values*/
-static const int cs_data_fs[] = {
+static const int cs_data_fs[] __maybe_unused = {
 	44100,
 	0,
 	48000,
@@ -4049,11 +4494,11 @@ static struct snd_pcm_hardware audio_pcm_hardware = {
     .rate_max 			=	48000,
     .channels_min 		=	2,
     .channels_max 		=	2,
-    .buffer_bytes_max 	=	64*1024,
-    .period_bytes_min 	=	512,
-    .period_bytes_max 	=	16*1024,
+    .buffer_bytes_max 	=	512*1024,
+    .period_bytes_min 	=	1024,
+    .period_bytes_max 	=	64*1024,
     .periods_min 		=	2,
-    .periods_max 		=	255,
+    .periods_max 		=	64,
 };
 #else
 static struct snd_pcm_hardware audio_pcm_hardware ={
@@ -4075,21 +4520,62 @@ static int hws_pcie_audio_open(struct snd_pcm_substream *substream)
 {
 	struct hws_audio *drv = snd_pcm_substream_chip(substream);
 	struct snd_pcm_runtime *runtime = substream->runtime;
+	unsigned int req_period_bytes;
+	unsigned int req_periods;
+	unsigned int req_period_max;
+	unsigned int req_buffer_max;
 
 	
     drv->sample_rate_out        = 48000;
     drv->channels               = 2;
 	//printk(KERN_INFO "%s() index:%x\n",__func__,drv->index);
     runtime->hw = audio_pcm_hardware;
-    drv->substream = substream;
+	req_period_bytes = (audio_period_bytes > 0) ? (unsigned int)audio_period_bytes : 4096U;
+	if (req_period_bytes < 1024U)
+		req_period_bytes = 1024U;
+	req_period_bytes &= ~3U;
+	if (req_period_bytes == 0)
+		req_period_bytes = 1024U;
+	req_periods = (audio_periods > 0) ? (unsigned int)audio_periods : 8U;
+	req_period_max = req_period_bytes * 4U;
+	if (req_period_max < req_period_bytes)
+		req_period_max = req_period_bytes;
+	req_buffer_max = req_period_bytes * req_periods;
+	if (req_buffer_max < req_period_bytes * 2U)
+		req_buffer_max = req_period_bytes * 2U;
+	if (req_buffer_max > 512U * 1024U)
+		req_buffer_max = 512U * 1024U;
+	if (req_period_max > req_buffer_max)
+		req_period_max = req_buffer_max;
+	if (req_periods > 64U)
+		req_periods = 64U;
+	if (req_periods < 2U)
+		req_periods = 2U;
+
+	runtime->hw.period_bytes_min = req_period_bytes;
+	runtime->hw.period_bytes_max = req_period_max;
+	runtime->hw.buffer_bytes_max = req_buffer_max;
+	runtime->hw.periods_min = 2U;
+	runtime->hw.periods_max = req_periods;
+	snd_pcm_hw_constraint_integer(runtime, SNDRV_PCM_HW_PARAM_PERIODS);
+    WRITE_ONCE(drv->substream, substream);
 	//snd_pcm_hw_constraint_minmax(runtime,SNDRV_PCM_HW_PARAM_RATE,setrate,setrate);
 	return 0;
 }
 
 static int hws_pcie_audio_close(struct snd_pcm_substream *substream)
 {
-//	struct hws_audio *chip = snd_pcm_substream_chip(substream);
-	//printk(KERN_INFO "%s() \n",__func__);
+	struct hws_audio *drv = snd_pcm_substream_chip(substream);
+	unsigned long flags;
+
+	spin_lock_irqsave(&drv->ring_lock, flags);
+	drv->ring_wpos_byframes = 0;
+	drv->period_used_byframes = 0;
+	drv->ring_size_byframes = 0;
+	drv->period_size_byframes = 0;
+	spin_unlock_irqrestore(&drv->ring_lock, flags);
+	cancel_work_sync(&drv->audiowork);
+	WRITE_ONCE(drv->substream, NULL);
 	return 0;
 } 
 static int hws_pcie_audio_hw_params(struct snd_pcm_substream *substream, struct snd_pcm_hw_params *hw_params)
@@ -4128,6 +4614,7 @@ static int hws_pcie_audio_trigger(struct snd_pcm_substream *substream, int cmd)
 {
 	struct hws_audio *chip = snd_pcm_substream_chip(substream);
 	struct hws_pcie_dev *dev= chip->dev;
+	unsigned long flags;
 	switch(cmd){
 		case SNDRV_PCM_TRIGGER_START:
 			//HWS_PCIE_READ(HWS_DMA_BASE(chip->index), HWS_DMA_STATUS);
@@ -4135,8 +4622,10 @@ static int hws_pcie_audio_trigger(struct snd_pcm_substream *substream, int cmd)
 			//HWS_PCIE_WRITE(HWS_INT_BASE, HWS_DMA_MASK(chip->index), 0x00000001); 
 			//HWS_PCIE_WRITE(HWS_DMA_BASE(chip->index), HWS_DMA_START, 0x00000001);
 			//printk(KERN_INFO "SNDRV_PCM_TRIGGER_START index:%x\n",chip->index);	
-	 		chip->ring_wpos_byframes = 0;
-        	chip->period_used_byframes = 0;
+	 					spin_lock_irqsave(&chip->ring_lock, flags);
+			chip->ring_wpos_byframes = 0;
+			chip->period_used_byframes = 0;
+			spin_unlock_irqrestore(&chip->ring_lock, flags);
 			StartAudioCapture(dev,chip->index);
 			break;
 		case SNDRV_PCM_TRIGGER_STOP:
@@ -4145,6 +4634,12 @@ static int hws_pcie_audio_trigger(struct snd_pcm_substream *substream, int cmd)
 			//HWS_PCIE_WRITE(HWS_DMA_BASE(chip->index), HWS_DMA_START, 0x00000000);
 			//printk(KERN_INFO "SNDRV_PCM_TRIGGER_STOP index:%x\n",chip->index);
 			StopAudioCapture(dev,chip->index);
+			/* Do not sleep in trigger path: can run under atomic constraints. */
+			cancel_work(&chip->audiowork);
+			spin_lock_irqsave(&chip->ring_lock, flags);
+			chip->ring_wpos_byframes = 0;
+			chip->period_used_byframes = 0;
+			spin_unlock_irqrestore(&chip->ring_lock, flags);
 			break;
 		default:
 			return -EINVAL;
@@ -4161,10 +4656,10 @@ static snd_pcm_uframes_t hws_pcie_audio_pointer(struct snd_pcm_substream *substr
 	struct hws_audio *drv = snd_pcm_substream_chip(substream);
 	//struct snd_pcm_runtime *runtime = substream->runtime;
 	snd_pcm_uframes_t pos;
-	int dwAudioCh;
 	unsigned long flags;
-	dwAudioCh = drv->index;
-	//printk(KERN_INFO "%s() index:%x\n",__func__,dwAudioCh);
+	//printk(KERN_INFO "%s() index:%x\n", __func__, drv->index);
+	if (!READ_ONCE(drv->substream))
+		return 0;
 	spin_lock_irqsave(&drv->ring_lock,flags);  //spin_lock
     pos = drv->ring_wpos_byframes;
     spin_unlock_irqrestore(&drv->ring_lock,flags); //spin_unlock
@@ -4193,7 +4688,7 @@ static int hws_audio_register(struct hws_pcie_dev *dev)
 	//printk("hws_audio_register Start\n");
 	ai_index = dev->m_Device_PortID*dev->m_nCurreMaxVideoChl+1;
 	for(i=0;i<dev->m_nCurreMaxVideoChl;i++){
-		sprintf(audioname,"%s %d",HWS_AUDOI_NAME,i+ai_index);
+		scnprintf(audioname, sizeof(audioname), "%s %d", HWS_AUDOI_NAME, i + ai_index);
 		//printk("%s\n",audioname);
 		ret = snd_card_new(&dev->pdev->dev, -1, audioname, THIS_MODULE,	sizeof(struct hws_audio), &card);
 	   // ret = snd_card_new(&dev->pdev->dev, audio_index[i], audio_id[i], THIS_MODULE,	sizeof(struct hws_audio), &card);
@@ -4201,9 +4696,9 @@ static int hws_audio_register(struct hws_pcie_dev *dev)
 			printk(KERN_ERR "%s() ERROR: snd_card_new failed <%d>\n",__func__, ret);
 			goto fail0;
 		}
-		strcpy(card->driver, KBUILD_MODNAME);
-		sprintf(card->shortname, "%s",audioname);
-		sprintf(card->longname, "%s",card->shortname);
+		strscpy(card->driver, KBUILD_MODNAME, sizeof(card->driver));
+		strscpy(card->shortname, audioname, sizeof(card->shortname));
+		strscpy(card->longname, card->shortname, sizeof(card->longname));
 
 		ret = snd_pcm_new(card,audioname,0,0,1,&pcm);
 		if (ret < 0){
@@ -4213,7 +4708,7 @@ static int hws_audio_register(struct hws_pcie_dev *dev)
 		dev->audio[i].index=i;
 		dev->audio[i].dev=dev;
 		pcm->private_data = &dev->audio[i];	
-		strcpy(pcm->name,audioname);
+		strscpy(pcm->name, audioname, sizeof(pcm->name));
 		snd_pcm_set_ops(pcm,SNDRV_PCM_STREAM_CAPTURE,&hws_pcie_pcm_ops);
 		//snd_pcm_lib_preallocate_pages_for_all(pcm, SNDRV_DMA_TYPE_DEV,snd_dma_pci_data(dev->pdev), HWS_AUDIO_CELL_SIZE*4, HWS_AUDIO_CELL_SIZE*4);
 		 snd_pcm_lib_preallocate_pages_for_all(
@@ -5842,8 +6337,8 @@ static void SetDMAAddress(struct hws_pcie_dev *pdx)
 	//u32 RDAvalon = 0;
 	//u32 m_AddreeSpace = 0;
 	int i = 0;
-	u32 m_ReadTmp;
-	u32 m_ReadTmp2;
+	u32 m_ReadTmp __maybe_unused;
+	u32 m_ReadTmp2 __maybe_unused;
 	//u32 m_ReadTmp3;
 	//u32 m_ReadTmp4;
 	DWORD halfframeLength=0;

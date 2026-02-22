@@ -344,6 +344,8 @@ struct hws_video{
 	int current_out_framerate;
 	int current_out_pixfmt;
 	int current_out_size_index;
+	u64 next_frame_ts_ns;
+	u32 output_rate_accum;
 };
 	
 struct hws_audio{
