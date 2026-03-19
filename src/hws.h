@@ -371,6 +371,8 @@ struct hws_audio{
 	u32                         sample_rate_out;
     u16                         channels;
     u16                         bits_per_sample;
+    unsigned int                period_bytes_choices[4];
+    struct snd_pcm_hw_constraint_list period_bytes_constraint;
 };
 	
 

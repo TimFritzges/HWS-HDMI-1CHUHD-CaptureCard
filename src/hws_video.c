@@ -317,6 +317,51 @@ static unsigned long hws_audio_fallback_delay_jiffies(struct hws_audio *drv, u32
 	return delay;
 }
 
+static unsigned int hws_audio_init_period_constraints(struct hws_audio *drv,
+						      unsigned int min_period_bytes)
+{
+	unsigned int packet_bytes;
+	unsigned int frame_bytes;
+	unsigned int bytes;
+	unsigned int count = 0;
+
+	if (!drv)
+		return 0;
+
+	packet_bytes = hws_audio_effective_packet_bytes(drv, 0);
+	frame_bytes = hws_audio_frame_bytes(drv);
+	if (!packet_bytes || !frame_bytes)
+		return 0;
+
+	if (min_period_bytes < 1024U)
+		min_period_bytes = 1024U;
+	min_period_bytes -= min_period_bytes % frame_bytes;
+	if (!min_period_bytes)
+		min_period_bytes = frame_bytes;
+
+	for (bytes = min_period_bytes;
+	     bytes <= packet_bytes && count < ARRAY_SIZE(drv->period_bytes_choices);
+	     bytes <<= 1) {
+		if ((packet_bytes % bytes) != 0)
+			continue;
+		drv->period_bytes_choices[count++] = bytes;
+	}
+
+	if (!count) {
+		bytes = packet_bytes - (packet_bytes % frame_bytes);
+		if (bytes) {
+			drv->period_bytes_choices[0] = bytes;
+			count = 1;
+		}
+	}
+
+	drv->period_bytes_constraint.count = count;
+	drv->period_bytes_constraint.list = drv->period_bytes_choices;
+	drv->period_bytes_constraint.mask = 0;
+
+	return count;
+}
+
 static bool hws_audio_stream_active(struct hws_audio *drv)
 {
 	struct hws_pcie_dev *pdx;
@@ -4777,6 +4822,7 @@ static int hws_pcie_audio_open(struct snd_pcm_substream *substream)
 	unsigned int req_periods;
 	unsigned int req_period_max;
 	unsigned int req_buffer_max;
+	unsigned int req_period_count;
 
 	
     drv->sample_rate_out        = 48000;
@@ -4790,12 +4836,20 @@ static int hws_pcie_audio_open(struct snd_pcm_substream *substream)
 	if (req_period_bytes == 0)
 		req_period_bytes = 1024U;
 	req_periods = (audio_periods > 0) ? (unsigned int)audio_periods : 8U;
-	req_period_max = req_period_bytes * 4U;
+	req_period_count = hws_audio_init_period_constraints(drv, req_period_bytes);
+	if (req_period_count > 0) {
+		req_period_bytes = drv->period_bytes_choices[0];
+		req_period_max = drv->period_bytes_choices[req_period_count - 1];
+	} else {
+		req_period_max = req_period_bytes;
+	}
+	if (req_period_count == 0)
+		req_period_max = req_period_bytes * 4U;
 	if (req_period_max < req_period_bytes)
 		req_period_max = req_period_bytes;
-	req_buffer_max = req_period_bytes * req_periods;
-	if (req_buffer_max < req_period_bytes * 2U)
-		req_buffer_max = req_period_bytes * 2U;
+	req_buffer_max = req_period_max * req_periods;
+	if (req_buffer_max < req_period_max * 2U)
+		req_buffer_max = req_period_max * 2U;
 	if (req_buffer_max > 512U * 1024U)
 		req_buffer_max = 512U * 1024U;
 	if (req_period_max > req_buffer_max)
@@ -4810,6 +4864,9 @@ static int hws_pcie_audio_open(struct snd_pcm_substream *substream)
 	runtime->hw.buffer_bytes_max = req_buffer_max;
 	runtime->hw.periods_min = 2U;
 	runtime->hw.periods_max = req_periods;
+	if (req_period_count > 0)
+		snd_pcm_hw_constraint_list(runtime, 0, SNDRV_PCM_HW_PARAM_PERIOD_BYTES,
+					 &drv->period_bytes_constraint);
 	snd_pcm_hw_constraint_integer(runtime, SNDRV_PCM_HW_PARAM_PERIODS);
     WRITE_ONCE(drv->substream, substream);
 	WRITE_ONCE(drv->last_irq_ns, 0);
