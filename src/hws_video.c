@@ -822,7 +822,8 @@ static int hws_vidioc_enum_fmt_vid_cap(struct file *file, void *priv_fh,struct v
 	
 	if(f->type != V4L2_BUF_TYPE_VIDEO_CAPTURE)
 	{
-		printk("%s.\n",__func__);
+		if (hws_diag_enabled())
+			pr_info_ratelimited("hws: %s invalid buf type=%u\n", __func__, f->type);
 		return -EINVAL;
 	}
 	if(videodev)
@@ -916,7 +917,9 @@ static int hws_vidioc_try_fmt_vid_cap(struct file *file, void *fh, struct v4l2_f
         pix->pixelformat = V4L2_PIX_FMT_YUYV;
         fmt = framegrabber_g_support_pixelfmt_by_fourcc(pix->pixelformat);
         if (!fmt) {
-            printk("%s.. format not support (even fallback)\n", __func__);
+            if (hws_diag_enabled())
+                pr_info_ratelimited("hws: %s unsupported format fourcc=0x%x\n",
+                                    __func__, pix->pixelformat);
             return -EINVAL;
         }
 	}
@@ -929,7 +932,9 @@ static int hws_vidioc_try_fmt_vid_cap(struct file *file, void *fh, struct v4l2_f
 	pModeTiming = Get_input_framesizeIndex(pix->width,pix->height);
 	if(!pModeTiming)
 	{
-		printk("%s.. format2 not support  %dX%d\n",__func__,pix->width,pix->height);
+		if (hws_diag_enabled())
+			pr_info_ratelimited("hws: %s unsupported size %ux%u, falling back\n",
+					    __func__, pix->width, pix->height);
 		pModeTiming = v4l2_model_get_support_videoformat(videodev->current_out_size_index);
 		if(pModeTiming ==NULL) return -EINVAL;
 		pix->field = V4L2_FIELD_NONE;
@@ -5788,7 +5793,7 @@ static void StopAudioCapture(struct hws_pcie_dev *pdx,int index)
 	pdx->m_bAudioStop[index] = 1;
 	pdx->m_nAudioBufferIndex[index] =0;
 	pdx->m_AudioInfo[index].dwisRuning =0;
-	cancel_delayed_work_sync(&pdx->audio[index].silence_work);
+	cancel_delayed_work(&pdx->audio[index].silence_work);
 	WRITE_ONCE(pdx->audio[index].last_irq_ns, 0);
 	WRITE_ONCE(pdx->audio[index].last_copy_ns, 0);
 	WRITE_ONCE(pdx->audio[index].last_progress_ns, 0);
@@ -6160,7 +6165,6 @@ static int SetAudioQuene( struct hws_pcie_dev *pdx,int dwAudioCh)
 	//printk("SetAudioQuene =%d",dwAudioCh);
 	if (dwAudioCh < 0 || dwAudioCh >= MAX_VID_CHANNELS)
 		return -EINVAL;
-	WRITE_ONCE(pdx->audio[dwAudioCh].last_irq_ns, ktime_get_ns());
 
 	if(!pdx->m_bACapStarted[dwAudioCh])
 	{
@@ -6556,13 +6560,11 @@ static irqreturn_t irqhandler(int irq, void  *info)
 	
 				Int_Value +=  0x100;
 				//printk("OnInterrupt Audio  %x\n", 0);
-				if(pdx->m_nAudioBusy[0] ==0 )
-				{
-					tmp = (READ_REGISTER_ULONG(pdx,(CVBS_IN_BASE + (40+0) * PCIE_BARADDROFSIZE)))&0x01;
-					pdx->m_nAudioBufferIndex[0] = tmp;
-					pdx->audio_data[0]= pdx->m_nAudioBufferIndex[0];
-					tasklet_schedule(&pdx->dpc_audio_tasklet[0]); 
-				}
+				tmp = (READ_REGISTER_ULONG(pdx,(CVBS_IN_BASE + (40+0) * PCIE_BARADDROFSIZE)))&0x01;
+				pdx->m_nAudioBufferIndex[0] = tmp;
+				pdx->audio_data[0]= pdx->m_nAudioBufferIndex[0];
+				WRITE_ONCE(pdx->audio[0].last_irq_ns, ktime_get_ns());
+				tasklet_schedule(&pdx->dpc_audio_tasklet[0]); 
 			}
 			#if 0
 			if((IntState &0x200) == 0x200) // Audio ch1 done
