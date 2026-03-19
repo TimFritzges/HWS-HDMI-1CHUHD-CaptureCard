@@ -353,6 +353,7 @@ struct hws_audio{
 	struct snd_card 		*card;	
 	struct snd_pcm_substream *substream;
 	struct work_struct		audiowork;
+	struct delayed_work		silence_work;
 	int						pos;
 	int						index;
 	int                         ring_offsize;
@@ -364,6 +365,9 @@ struct hws_audio{
     uint32_t                    ring_size_byframes;
     uint32_t                    period_size_byframes;
     uint32_t                    period_used_byframes;
+    u64                         last_irq_ns;
+    u64                         last_copy_ns;
+    u64                         last_progress_ns;
 	u32                         sample_rate_out;
     u16                         channels;
     u16                         bits_per_sample;

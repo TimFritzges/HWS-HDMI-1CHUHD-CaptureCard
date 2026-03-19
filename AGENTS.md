@@ -87,3 +87,23 @@ Notes:
   - `modinfo HwsUHDX1Capture | rg -n "srcversion|filename"`
   - `/usr/bin/cat /sys/module/HwsUHDX1Capture/srcversion`
   - These must match.
+
+## New diagnostics abilities (2026-03-07)
+- New module param:
+  - `audio_trace_enable` (0/1) enables trace hooks for audio drop/silence paths.
+- Runtime toggle commands:
+  - `echo 1 | sudo tee /sys/module/HwsUHDX1Capture/parameters/diag_enable`
+  - `echo 0 | sudo tee /sys/module/HwsUHDX1Capture/parameters/diag_enable`
+  - `echo 1 | sudo tee /sys/module/HwsUHDX1Capture/parameters/audio_trace_enable`
+  - `echo 0 | sudo tee /sys/module/HwsUHDX1Capture/parameters/audio_trace_enable`
+- Audio diagnostics now expose root-cause counters in debugfs:
+  - `sudo /usr/bin/cat /sys/kernel/debug/hwsuhdx1/audio_diag`
+  - Includes `no_video_silence_injects`, `fallback_silence_injects`, `no_free_queue_slots`,
+    `memcopy_failures`, `bad_packet_sizes`, `workqueue_requeues`, `stream_not_running`,
+    `timer_silence_injects`, `timer_runs`.
+- Audio diagnostics now expose timing and queue pressure metrics:
+  - Latency chains: `irq_to_copy_*`, `copy_to_deliver_*`, `irq_to_deliver_*`.
+  - Queue pressure: `queue_free_slots_min/max/total/samples`.
+- Trace lines when `audio_trace_enable=1`:
+  - `hws_audio_drop ... reason=bad_packet|no_free_queue|memcopy_fail|stream_not_running`
+  - `hws_audio_silence ... reason=no_video|fallback|timer`

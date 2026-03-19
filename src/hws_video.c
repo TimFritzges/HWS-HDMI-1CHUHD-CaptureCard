@@ -18,6 +18,7 @@
 #include <linux/debugfs.h>
 #include <linux/seq_file.h>
 #include <linux/sched.h>
+#include <linux/ktime.h>
 #include "hws.h"
 #include "hws_reg.h"
 #include "hws_compat.h"
@@ -50,6 +51,10 @@ static int audio_periods = 8;
 module_param_named(audio_periods, audio_periods, int, 0644);
 MODULE_PARM_DESC(audio_periods, "Requested ALSA period count (default 8)");
 
+static int audio_trace_enable;
+module_param_named(audio_trace_enable, audio_trace_enable, int, 0644);
+MODULE_PARM_DESC(audio_trace_enable, "Enable trace hooks for audio drop/silence events (0=off, 1=on)");
+
 enum {
 	HWS_FPS_POLICY_SOURCE_TRUTH = 1,
 	HWS_FPS_POLICY_USERSPACE_CONVERT = 2,
@@ -70,6 +75,11 @@ static inline bool hws_diag_enabled(void)
 	return diag_enable != 0;
 }
 
+static inline bool hws_audio_trace_enabled(void)
+{
+	return audio_trace_enable != 0;
+}
+
 struct hws_audio_diag_stats {
 	atomic64_t work_runs;
 	atomic64_t buffers_found;
@@ -80,6 +90,28 @@ struct hws_audio_diag_stats {
 	atomic64_t dropped_no_substream;
 	atomic64_t dropped_bad_runtime;
 	atomic64_t dropped_ring_not_ready;
+	atomic64_t no_video_silence_injects;
+	atomic64_t fallback_silence_injects;
+	atomic64_t timer_silence_injects;
+	atomic64_t no_free_queue_slots;
+	atomic64_t memcopy_failures;
+	atomic64_t bad_packet_sizes;
+	atomic64_t workqueue_requeues;
+	atomic64_t stream_not_running;
+	atomic64_t timer_runs;
+	atomic64_t irq_to_copy_ns_total;
+	atomic64_t irq_to_copy_ns_max;
+	atomic64_t irq_to_copy_samples;
+	atomic64_t copy_to_deliver_ns_total;
+	atomic64_t copy_to_deliver_ns_max;
+	atomic64_t copy_to_deliver_samples;
+	atomic64_t irq_to_deliver_ns_total;
+	atomic64_t irq_to_deliver_ns_max;
+	atomic64_t irq_to_deliver_samples;
+	atomic64_t queue_free_slots_min;
+	atomic64_t queue_free_slots_max;
+	atomic64_t queue_free_slots_total;
+	atomic64_t queue_free_slots_samples;
 	atomic64_t delivery_errors;
 };
 
@@ -142,6 +174,28 @@ static inline void hws_diag_reset(void)
 		atomic64_set(&hws_audio_diag[i].dropped_no_substream, 0);
 		atomic64_set(&hws_audio_diag[i].dropped_bad_runtime, 0);
 		atomic64_set(&hws_audio_diag[i].dropped_ring_not_ready, 0);
+		atomic64_set(&hws_audio_diag[i].no_video_silence_injects, 0);
+		atomic64_set(&hws_audio_diag[i].fallback_silence_injects, 0);
+		atomic64_set(&hws_audio_diag[i].timer_silence_injects, 0);
+		atomic64_set(&hws_audio_diag[i].no_free_queue_slots, 0);
+		atomic64_set(&hws_audio_diag[i].memcopy_failures, 0);
+		atomic64_set(&hws_audio_diag[i].bad_packet_sizes, 0);
+		atomic64_set(&hws_audio_diag[i].workqueue_requeues, 0);
+		atomic64_set(&hws_audio_diag[i].stream_not_running, 0);
+		atomic64_set(&hws_audio_diag[i].timer_runs, 0);
+		atomic64_set(&hws_audio_diag[i].irq_to_copy_ns_total, 0);
+		atomic64_set(&hws_audio_diag[i].irq_to_copy_ns_max, 0);
+		atomic64_set(&hws_audio_diag[i].irq_to_copy_samples, 0);
+		atomic64_set(&hws_audio_diag[i].copy_to_deliver_ns_total, 0);
+		atomic64_set(&hws_audio_diag[i].copy_to_deliver_ns_max, 0);
+		atomic64_set(&hws_audio_diag[i].copy_to_deliver_samples, 0);
+		atomic64_set(&hws_audio_diag[i].irq_to_deliver_ns_total, 0);
+		atomic64_set(&hws_audio_diag[i].irq_to_deliver_ns_max, 0);
+		atomic64_set(&hws_audio_diag[i].irq_to_deliver_samples, 0);
+		atomic64_set(&hws_audio_diag[i].queue_free_slots_min, MAX_AUDIO_QUEUE);
+		atomic64_set(&hws_audio_diag[i].queue_free_slots_max, 0);
+		atomic64_set(&hws_audio_diag[i].queue_free_slots_total, 0);
+		atomic64_set(&hws_audio_diag[i].queue_free_slots_samples, 0);
 		atomic64_set(&hws_audio_diag[i].delivery_errors, 0);
 	}
 }
@@ -158,6 +212,132 @@ static inline void hws_diag_update_max(atomic64_t *slot, u64 value)
 			return;
 	}
 }
+
+
+static inline void hws_diag_update_min(atomic64_t *slot, u64 value)
+{
+	u64 old;
+
+	for (;;) {
+		old = atomic64_read(slot);
+		if (value >= old)
+			return;
+		if (atomic64_cmpxchg(slot, old, value) == old)
+			return;
+	}
+}
+
+static inline void hws_audio_diag_record_latency(int ch, atomic64_t *total,
+					 atomic64_t *max, atomic64_t *samples, u64 value_ns)
+{
+	if (ch < 0 || ch >= MAX_VID_CHANNELS)
+		return;
+	atomic64_add((s64)value_ns, total);
+	hws_diag_update_max(max, value_ns);
+	atomic64_inc(samples);
+}
+
+static inline void hws_audio_diag_record_queue_free(int ch, u32 free_slots)
+{
+	if (ch < 0 || ch >= MAX_VID_CHANNELS)
+		return;
+	hws_diag_update_min(&hws_audio_diag[ch].queue_free_slots_min, free_slots);
+	hws_diag_update_max(&hws_audio_diag[ch].queue_free_slots_max, free_slots);
+	atomic64_add((s64)free_slots, &hws_audio_diag[ch].queue_free_slots_total);
+	atomic64_inc(&hws_audio_diag[ch].queue_free_slots_samples);
+}
+
+static inline u32 hws_audio_frame_bytes(const struct hws_audio *drv)
+{
+	if (!drv || drv->channels == 0)
+		return 0;
+	return 2U * (u32)drv->channels;
+}
+
+static u32 hws_audio_effective_packet_bytes(struct hws_audio *drv, u32 requested_bytes)
+{
+	u32 frame_bytes;
+	u32 packet_bytes;
+
+	if (!drv)
+		return 0;
+
+	frame_bytes = hws_audio_frame_bytes(drv);
+	packet_bytes = requested_bytes;
+	if (!packet_bytes && drv->dev)
+		packet_bytes = READ_ONCE(drv->dev->m_dwAudioPTKSize);
+	if (!packet_bytes && frame_bytes)
+		packet_bytes = READ_ONCE(drv->period_size_byframes) * frame_bytes;
+	if (!frame_bytes || !packet_bytes)
+		return 0;
+
+	packet_bytes -= packet_bytes % frame_bytes;
+	return packet_bytes;
+}
+
+static u64 hws_audio_packet_duration_ns(struct hws_audio *drv, u32 packet_bytes)
+{
+	u32 frame_bytes;
+	u32 sample_rate;
+	u64 frames;
+
+	if (!drv)
+		return 0;
+
+	frame_bytes = hws_audio_frame_bytes(drv);
+	sample_rate = READ_ONCE(drv->sample_rate_out);
+	packet_bytes = hws_audio_effective_packet_bytes(drv, packet_bytes);
+	if (!frame_bytes || !sample_rate || !packet_bytes)
+		return 0;
+
+	frames = packet_bytes / frame_bytes;
+	if (!frames)
+		return 0;
+
+	return div_u64(frames * NSEC_PER_SEC, sample_rate);
+}
+
+static unsigned long hws_audio_fallback_delay_jiffies(struct hws_audio *drv, u32 packet_bytes)
+{
+	u64 packet_ns;
+	u64 delay_ns;
+	u64 delay_us;
+	unsigned long delay;
+
+	packet_ns = hws_audio_packet_duration_ns(drv, packet_bytes);
+	if (!packet_ns)
+		return 1;
+
+	delay_ns = max_t(u64, packet_ns / 2, NSEC_PER_MSEC);
+	delay_us = div_u64(delay_ns + NSEC_PER_USEC - 1, NSEC_PER_USEC);
+	delay = usecs_to_jiffies((unsigned int)delay_us);
+	if (!delay)
+		delay = 1;
+
+	return delay;
+}
+
+static bool hws_audio_stream_active(struct hws_audio *drv)
+{
+	struct hws_pcie_dev *pdx;
+	int ch;
+
+	if (!drv || !READ_ONCE(drv->substream))
+		return false;
+
+	pdx = drv->dev;
+	ch = drv->index;
+	if (!pdx || ch < 0 || ch >= MAX_VID_CHANNELS)
+		return false;
+
+	return READ_ONCE(pdx->m_bAudioRun[ch]) && READ_ONCE(pdx->m_bACapStarted[ch]);
+}
+
+enum hws_audio_silence_reason {
+	HWS_AUDIO_SILENCE_NO_VIDEO = 0,
+	HWS_AUDIO_SILENCE_FALLBACK,
+	HWS_AUDIO_SILENCE_TIMER,
+};
 
 static int hws_diag_show(struct seq_file *m, void *unused)
 {
@@ -199,9 +379,9 @@ static int hws_audio_diag_show(struct seq_file *m, void *unused)
 {
 	int i;
 
-	seq_puts(m, "ch work_runs buffers_found delivered_bytes delivered_frames period_elapsed oversized_packets drop_no_substream drop_bad_runtime drop_ring_not_ready delivery_errors\n");
+	seq_puts(m, "ch work_runs buffers_found delivered_bytes delivered_frames period_elapsed oversized_packets drop_no_substream drop_bad_runtime drop_ring_not_ready no_video_silence_injects fallback_silence_injects timer_silence_injects no_free_queue_slots memcopy_failures bad_packet_sizes workqueue_requeues stream_not_running timer_runs irq_to_copy_ns_total irq_to_copy_ns_max irq_to_copy_samples copy_to_deliver_ns_total copy_to_deliver_ns_max copy_to_deliver_samples irq_to_deliver_ns_total irq_to_deliver_ns_max irq_to_deliver_samples queue_free_slots_min queue_free_slots_max queue_free_slots_total queue_free_slots_samples delivery_errors\n");
 	for (i = 0; i < MAX_VID_CHANNELS; i++) {
-		seq_printf(m, "%d %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld\n",
+		seq_printf(m, "%d %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld\n",
 			i,
 			(long long)atomic64_read(&hws_audio_diag[i].work_runs),
 			(long long)atomic64_read(&hws_audio_diag[i].buffers_found),
@@ -212,6 +392,28 @@ static int hws_audio_diag_show(struct seq_file *m, void *unused)
 			(long long)atomic64_read(&hws_audio_diag[i].dropped_no_substream),
 			(long long)atomic64_read(&hws_audio_diag[i].dropped_bad_runtime),
 			(long long)atomic64_read(&hws_audio_diag[i].dropped_ring_not_ready),
+			(long long)atomic64_read(&hws_audio_diag[i].no_video_silence_injects),
+			(long long)atomic64_read(&hws_audio_diag[i].fallback_silence_injects),
+			(long long)atomic64_read(&hws_audio_diag[i].timer_silence_injects),
+			(long long)atomic64_read(&hws_audio_diag[i].no_free_queue_slots),
+			(long long)atomic64_read(&hws_audio_diag[i].memcopy_failures),
+			(long long)atomic64_read(&hws_audio_diag[i].bad_packet_sizes),
+			(long long)atomic64_read(&hws_audio_diag[i].workqueue_requeues),
+			(long long)atomic64_read(&hws_audio_diag[i].stream_not_running),
+			(long long)atomic64_read(&hws_audio_diag[i].timer_runs),
+			(long long)atomic64_read(&hws_audio_diag[i].irq_to_copy_ns_total),
+			(long long)atomic64_read(&hws_audio_diag[i].irq_to_copy_ns_max),
+			(long long)atomic64_read(&hws_audio_diag[i].irq_to_copy_samples),
+			(long long)atomic64_read(&hws_audio_diag[i].copy_to_deliver_ns_total),
+			(long long)atomic64_read(&hws_audio_diag[i].copy_to_deliver_ns_max),
+			(long long)atomic64_read(&hws_audio_diag[i].copy_to_deliver_samples),
+			(long long)atomic64_read(&hws_audio_diag[i].irq_to_deliver_ns_total),
+			(long long)atomic64_read(&hws_audio_diag[i].irq_to_deliver_ns_max),
+			(long long)atomic64_read(&hws_audio_diag[i].irq_to_deliver_samples),
+			(long long)atomic64_read(&hws_audio_diag[i].queue_free_slots_min),
+			(long long)atomic64_read(&hws_audio_diag[i].queue_free_slots_max),
+			(long long)atomic64_read(&hws_audio_diag[i].queue_free_slots_total),
+			(long long)atomic64_read(&hws_audio_diag[i].queue_free_slots_samples),
 			(long long)atomic64_read(&hws_audio_diag[i].delivery_errors));
 	}
 
@@ -1085,11 +1287,11 @@ static int hws_release(struct file *file)
 }
 
 //-------------------
-static const struct v4l2_queryctrl g_no_ctrl = {
+static const struct v4l2_queryctrl __maybe_unused g_no_ctrl = {
 	.name  = "42",
 	.flags = V4L2_CTRL_FLAG_DISABLED,
 };
-static struct v4l2_queryctrl g_hws_ctrls[] = 
+static const struct v4l2_queryctrl __maybe_unused g_hws_ctrls[] =
 {
 	#if 1
 	{
@@ -1165,7 +1367,7 @@ static struct v4l2_queryctrl g_hws_ctrls[] =
 
 #define ARRAY_SIZE_OF_CTRL		(sizeof(g_hws_ctrls)/sizeof(g_hws_ctrls[0]))
 
-static struct v4l2_queryctrl *find_ctrlByIndex(unsigned int index)
+static const struct v4l2_queryctrl __maybe_unused *find_ctrlByIndex(unsigned int index)
 {
 	//scan supported queryctrl table
 	if(index>=ARRAY_SIZE_OF_CTRL)
@@ -1178,7 +1380,7 @@ static struct v4l2_queryctrl *find_ctrlByIndex(unsigned int index)
 	}
 }
 
-static struct v4l2_queryctrl *find_ctrl(unsigned int id)
+static const struct v4l2_queryctrl __maybe_unused *find_ctrl(unsigned int id)
 {
 	int i;
 	//scan supported queryctrl table
@@ -1188,10 +1390,74 @@ static struct v4l2_queryctrl *find_ctrl(unsigned int id)
 
 	return 0;
 }
+
+static const struct v4l2_queryctrl __maybe_unused *find_next_ctrl(unsigned int id)
+{
+	int i;
+
+	for (i = 0; i < ARRAY_SIZE_OF_CTRL; i++) {
+		if (g_hws_ctrls[i].id > id)
+			return &g_hws_ctrls[i];
+	}
+
+	return NULL;
+}
+
+static int hws_ctrl_get_value(struct hws_video *videodev, u32 id, s32 *value)
+{
+	if (!videodev || !value)
+		return -EINVAL;
+
+	switch (id) {
+	case V4L2_CID_BRIGHTNESS:
+		*value = videodev->m_Curr_Brightness;
+		return 0;
+	case V4L2_CID_CONTRAST:
+		*value = videodev->m_Curr_Contrast;
+		return 0;
+	case V4L2_CID_SATURATION:
+		*value = videodev->m_Curr_Saturation;
+		return 0;
+	case V4L2_CID_HUE:
+		*value = videodev->m_Curr_Hue;
+		return 0;
+	case V4L2_CID_MIN_BUFFERS_FOR_CAPTURE:
+		*value = 3;
+		return 0;
+	case V4L2_CID_MIN_BUFFERS_FOR_OUTPUT:
+		*value = 0;
+		return 0;
+	default:
+		return -EINVAL;
+	}
+}
+
+static int hws_ctrl_set_value(struct hws_video *videodev, u32 id, s32 value)
+{
+	if (!videodev)
+		return -EINVAL;
+
+	switch (id) {
+	case V4L2_CID_BRIGHTNESS:
+		videodev->m_Curr_Brightness = value;
+		return 0;
+	case V4L2_CID_CONTRAST:
+		videodev->m_Curr_Contrast = value;
+		return 0;
+	case V4L2_CID_HUE:
+		videodev->m_Curr_Hue = value;
+		return 0;
+	case V4L2_CID_SATURATION:
+		videodev->m_Curr_Saturation = value;
+		return 0;
+	default:
+		return -EINVAL;
+	}
+}
 //-----------------------------
 
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6,13,0)
-static struct v4l2_query_ext_ctrl g_hws_ext_ctrls[] = {
+static const struct v4l2_query_ext_ctrl g_hws_ext_ctrls[] = {
     {
         .id = V4L2_CID_BRIGHTNESS,
         .type = V4L2_CTRL_TYPE_INTEGER,
@@ -1246,7 +1512,7 @@ static struct v4l2_query_ext_ctrl g_hws_ext_ctrls[] = {
     },
 };
 #define ARRAY_SIZE_OF_EXT_CTRL (sizeof(g_hws_ext_ctrls) / sizeof(g_hws_ext_ctrls[0]))
-static struct v4l2_query_ext_ctrl *find_ext_ctrl(unsigned int id)
+static const struct v4l2_query_ext_ctrl *find_ext_ctrl(unsigned int id)
 {
     int i;
     for (i = 0; i < ARRAY_SIZE_OF_EXT_CTRL; i++) {
@@ -1257,13 +1523,16 @@ static struct v4l2_query_ext_ctrl *find_ext_ctrl(unsigned int id)
     return NULL;
 }
 
-//
-static struct v4l2_query_ext_ctrl *find_ext_ctrlByIndex(int index)
+static const struct v4l2_query_ext_ctrl *find_next_ext_ctrl(unsigned int id)
 {
-    if (index >= 0 && index < ARRAY_SIZE_OF_EXT_CTRL) {
-        return &g_hws_ext_ctrls[index];
-    }
-    return NULL;
+	int i;
+
+	for (i = 0; i < ARRAY_SIZE_OF_EXT_CTRL; i++) {
+		if (g_hws_ext_ctrls[i].id > id)
+			return &g_hws_ext_ctrls[i];
+	}
+
+	return NULL;
 }
 //-------------------------
 #endif
@@ -1272,68 +1541,19 @@ static int hws_vidioc_g_ctrl(struct file *file, void *fh,struct v4l2_control *a)
 {
 	struct hws_video *videodev = video_drvdata(file);
 	struct v4l2_control *ctrl = a;
-	//struct v4l2_queryctrl *found_ctrl = find_ctrl(ctrl->id);
 	int ret = -EINVAL;
-	//int bchs_select=0;
 	if(ctrl ==NULL)
 	{
 		if (hws_diag_enabled())
 			pr_info_ratelimited("hws: %s ch=%d ctrl is NULL\n", __func__, videodev->index);
 		return ret;
 	}
-	//printk( "%s(ch-%d)\n", __func__,videodev->index);
-	switch( ctrl->id ) {
-		case V4L2_CID_BRIGHTNESS: //0x00980900
-			
-		    //bchs_select = V4L2_BCHS_TYPE_BRIGHTNESS;
-		    //adv7619_get_bchs(v4l2m_context->adv7619_handle,&BCHSinfo,bchs_select);
-            ctrl->value = videodev->m_Curr_Brightness;
-            //printk("%s...brightness(%d)\n",__func__,ctrl->value);
-			ret = 0;
-			break;
-
-		case V4L2_CID_CONTRAST:
-	
-			//bchs_select = V4L2_BCHS_TYPE_CONTRAST;
-		    //printk("%s...contrast(%d)\n",__func__,bchs_select);
-            ctrl->value = videodev->m_Curr_Contrast;
-			ret = 0;
-			break;
-
-		case V4L2_CID_SATURATION:
-			
-			//bchs_select = V4L2_BCHS_TYPE_SATURATION;
-		    //printk("%s...saturation(%d)\n",__func__,bchs_select);
-            ctrl->value = videodev->m_Curr_Saturation;
-			ret = 0;
-			break;
-
-		case V4L2_CID_HUE:
-		
-			//bchs_select = V4L2_BCHS_TYPE_HUE;
-		    //printk("%s...hue(%d)\n",__func__,bchs_select);
-            ctrl->value = videodev->m_Curr_Hue;
-			ret = 0;
-			break;
-
-		case V4L2_CID_MIN_BUFFERS_FOR_CAPTURE:
-			ctrl->value = 3;
-			ret = 0;
-			break;
-
-		case V4L2_CID_MIN_BUFFERS_FOR_OUTPUT:
-			ctrl->value = 0;
-			ret = 0;
-			break;
-
-		default:
-		    ctrl->value =0;
-			if (hws_diag_enabled())
-				pr_info_ratelimited("hws: g_ctrl unsupported id=0x%x\n", ctrl->id);
-		    break;	
-		
+	ret = hws_ctrl_get_value(videodev, ctrl->id, &ctrl->value);
+	if (ret < 0) {
+		ctrl->value = 0;
+		if (hws_diag_enabled())
+			pr_info_ratelimited("hws: g_ctrl unsupported id=0x%x\n", ctrl->id);
 	}
-	//printk("%s...ctrl->value(%d)=%x\n",__func__,bchs_select,ctrl->value);
 	return ret;
 
 }
@@ -1341,40 +1561,26 @@ static int hws_vidioc_g_ctrl(struct file *file, void *fh,struct v4l2_control *a)
 static int hws_v4l2_g_ext_ctrls(struct file *file, void *fh,struct v4l2_ext_controls  *cs)//
 {
 	struct hws_video *videodev = video_drvdata(file);
-    int i;
+	int i;
 	if(cs ==NULL)
 	{
 		if (hws_diag_enabled())
-		pr_info_ratelimited("hws: %s ch=%d ext ctrls are NULL\n", __func__, videodev->index);
+			pr_info_ratelimited("hws: %s ch=%d ext ctrls are NULL\n", __func__, videodev->index);
 		return -EINVAL;
 	}
-	//printk( "%s(ch-%d)-%d\n", __func__,videodev->index,cs->count);
-	return  -ERANGE;
-    for (i = 0; i < cs->count; i++) {
-        struct v4l2_ext_control *c = &cs->controls[i];
-        
-        switch (c->id) {
-            case V4L2_CID_BRIGHTNESS:
-                c->value = videodev->m_Curr_Brightness;
-                break;
-            case V4L2_CID_CONTRAST:
-                c->value = videodev->m_Curr_Contrast;
-                break;
-            case V4L2_CID_SATURATION:
-                c->value = videodev->m_Curr_Saturation;
-                break;
-            case V4L2_CID_HUE:
-                c->value = videodev->m_Curr_Hue;
-                break;
-            default:
-                // 设置错误索引并返回
-                cs->error_idx = i;
-                if (hws_diag_enabled())
-					pr_info_ratelimited("hws: g_ext_ctrls unsupported id=0x%x\n", c->id);
-                return -EINVAL;
-        }
-    }
-    return 0;
+	cs->error_idx = cs->count;
+	for (i = 0; i < cs->count; i++) {
+		struct v4l2_ext_control *c = &cs->controls[i];
+		int ret = hws_ctrl_get_value(videodev, c->id, &c->value);
+
+		if (ret < 0) {
+			cs->error_idx = i;
+			if (hws_diag_enabled())
+				pr_info_ratelimited("hws: g_ext_ctrls unsupported id=0x%x\n", c->id);
+			return ret;
+		}
+	}
+	return 0;
 
 }
 #endif 
@@ -1383,7 +1589,7 @@ static int hws_vidioc_s_ctrl(struct file *file, void *fh,struct v4l2_control *a)
 {
 	struct hws_video *videodev = video_drvdata(file);
 	struct v4l2_control *ctrl = a;
-	struct v4l2_queryctrl *found_ctrl;
+	const struct v4l2_queryctrl *found_ctrl;
 	int ret = -EINVAL;
 	if(ctrl ==NULL)
 	{
@@ -1396,29 +1602,10 @@ static int hws_vidioc_s_ctrl(struct file *file, void *fh,struct v4l2_control *a)
 	if( found_ctrl ) {
 		switch( found_ctrl->type ) {
 		case V4L2_CTRL_TYPE_INTEGER:
-			if( ctrl->value >= found_ctrl->minimum 
-				|| ctrl->value <= found_ctrl->maximum ) {
-					//printk( "%s(ch-%d ctrl->value =%X )\n", __func__,videodev->index,ctrl->value);
-					switch( ctrl->id ) {
-	                case V4L2_CID_BRIGHTNESS:
-						videodev->m_Curr_Brightness = ctrl->value;               
-		            break;
-	                case V4L2_CID_CONTRAST:
-						videodev->m_Curr_Contrast = ctrl->value;					
-		            break;
-	                case V4L2_CID_HUE:
-						videodev->m_Curr_Hue = ctrl->value;                    
-		            break;
-	                case V4L2_CID_SATURATION:
-						videodev->m_Curr_Saturation = ctrl->value;
-                    break;
-
-	                default:
-		            break;
-	            }
-				//printk( "%s(Name:%s value =%X )\n", __func__,found_ctrl->name,ctrl->value);
-				ret = 0;
-			} 
+			if (ctrl->value >= found_ctrl->minimum &&
+			    ctrl->value <= found_ctrl->maximum) {
+				ret = hws_ctrl_set_value(videodev, ctrl->id, ctrl->value);
+			}
 			else 
 			{
 				//error
@@ -1444,173 +1631,93 @@ static int hws_vidioc_s_ctrl(struct file *file, void *fh,struct v4l2_control *a)
 static int hws_v4l2_s_ext_ctrls(struct file *file, void *fh,struct v4l2_ext_controls  *cs)
 {
 	struct hws_video *videodev = video_drvdata(file);
-    int i;
+	int i;
 	if(cs ==NULL)
 	{
 		if (hws_diag_enabled())
-		pr_info_ratelimited("hws: %s ch=%d ext ctrls are NULL\n", __func__, videodev->index);
+			pr_info_ratelimited("hws: %s ch=%d ext ctrls are NULL\n", __func__, videodev->index);
 		return -EINVAL;
 	}
-	printk( "%s(ch-%d)-%d\n", __func__,videodev->index,cs->count);
-	return  -ERANGE;
-    for (i = 0; i < cs->count; i++) {
-        struct v4l2_ext_control *c = &cs->controls[i];
-        struct v4l2_query_ext_ctrl *found_ctrl;
-        
-        found_ctrl = find_ext_ctrl(c->id);
-        if (!found_ctrl) {
-            cs->error_idx = i;
-            printk("Control not found: 0x%x\n", c->id);
-            return -EINVAL;
-        }
-        
-        // 检查值范围
-        if (c->value < found_ctrl->minimum || c->value > found_ctrl->maximum) {
-            cs->error_idx = i;
-            printk("Value out of range for control 0x%x (%lld-%lld)\n",
-                   c->id, found_ctrl->minimum, found_ctrl->maximum);
-            return -ERANGE;
-        }
-        
-        // 根据ID设置值
-        switch (c->id) {
-            case V4L2_CID_BRIGHTNESS:
-                videodev->m_Curr_Brightness = c->value;
-                break;
-            case V4L2_CID_CONTRAST:
-                videodev->m_Curr_Contrast = c->value;
-                break;
-            case V4L2_CID_HUE:
-                videodev->m_Curr_Hue = c->value;
-                break;
-            case V4L2_CID_SATURATION:
-                videodev->m_Curr_Saturation = c->value;
-                break;
-            default:
-                cs->error_idx = i;
-                return -EINVAL;
-        }
-    }
-    return 0;
+	cs->error_idx = cs->count;
+	for (i = 0; i < cs->count; i++) {
+		struct v4l2_ext_control *c = &cs->controls[i];
+		const struct v4l2_query_ext_ctrl *found_ctrl;
+		int ret;
+
+		found_ctrl = find_ext_ctrl(c->id);
+		if (!found_ctrl) {
+			cs->error_idx = i;
+			if (hws_diag_enabled())
+				pr_info_ratelimited("hws: s_ext_ctrls unsupported id=0x%x\n", c->id);
+			return -EINVAL;
+		}
+
+		if (c->value < found_ctrl->minimum || c->value > found_ctrl->maximum) {
+			cs->error_idx = i;
+			if (hws_diag_enabled())
+				pr_info_ratelimited("hws: s_ext_ctrls out of range id=0x%x value=%d range=%lld..%lld\n",
+						    c->id, c->value,
+						    found_ctrl->minimum, found_ctrl->maximum);
+			return -ERANGE;
+		}
+
+		ret = hws_ctrl_set_value(videodev, c->id, c->value);
+		if (ret < 0) {
+			cs->error_idx = i;
+			if (hws_diag_enabled())
+				pr_info_ratelimited("hws: s_ext_ctrls unsupported id=0x%x\n", c->id);
+			return ret;
+		}
+	}
+	return 0;
 
 }
 #endif
 #if LINUX_VERSION_CODE < KERNEL_VERSION(6,13,0)
 static int hws_vidioc_queryctrl(struct file *file, void *fh,struct v4l2_queryctrl *a)
 {
-	struct hws_video *videodev = video_drvdata(file);
-	struct v4l2_queryctrl *found_ctrl;
+	const struct v4l2_queryctrl *found_ctrl;
 	unsigned int id;
 	unsigned int mask_id;
-	int ret = -EINVAL;
-	//printk( "%s(ch-%d)\n", __func__,videodev->index);
-	//printk( "%s(ctrl-id=0x%X[0x%X] )\n", __func__,a->id,(a->id)&(~V4L2_CTRL_FLAG_NEXT_CTRL));
-	//-----------------------------------------------
-	id = a->id&(~V4L2_CTRL_FLAG_NEXT_CTRL);
-	mask_id =  a->id&V4L2_CTRL_FLAG_NEXT_CTRL;
-	if(mask_id == V4L2_CTRL_FLAG_NEXT_CTRL)
-	{
-		if(id ==0)
-		{
-			 videodev->queryIndex =0;
-			 found_ctrl = find_ctrlByIndex(videodev->queryIndex);
-			 *a = *found_ctrl;
-			 //a->id = a->id|V4L2_CTRL_FLAG_NEXT_CTRL;
-			 //printk("queryctrl[1] Get [%s][0x%X]\n",found_ctrl->name,a->id);
-			 ret = 0;
-		}
-		else
-		{
-				videodev->queryIndex++; 
-				found_ctrl = find_ctrlByIndex(videodev->queryIndex);
-				 if(found_ctrl!= NULL)
-				 {
-					*a = *found_ctrl;
-					//a->id = a->id|V4L2_CTRL_FLAG_NEXT_CTRL;
-					 //printk("queryctrl[2] Get [%s][0x%X]\n",found_ctrl->name,a->id);
-					ret = 0;
-				 }
-				 else
-				 {
-					*a	= g_no_ctrl;
-					ret = -EINVAL;
-				 }
 
-		}
-
-		
+	id = a->id & (~V4L2_CTRL_FLAG_NEXT_CTRL);
+	mask_id = a->id & V4L2_CTRL_FLAG_NEXT_CTRL;
+	found_ctrl = (mask_id == V4L2_CTRL_FLAG_NEXT_CTRL) ?
+		find_next_ctrl(id) : find_ctrl(id);
+	if (found_ctrl == NULL) {
+		*a = g_no_ctrl;
+		return -EINVAL;
 	}
-	else
-	{
-		found_ctrl = find_ctrl(id);
-		if(NULL != found_ctrl)
-		{
-				*a = *found_ctrl;
-				 //printk("queryctrl[3] Get [%s][0x%X]\n",found_ctrl->name,a->id);
-				ret = 0;
-		}
-		else
-		{
-				*a	= g_no_ctrl;
-				ret = -EINVAL;
-		}
 
-
-	}
-	return ret;
+	*a = *found_ctrl;
+	return 0;
 
 }
 #else
 static int hws_v4l2_query_ext_ctrl(struct file *file, void *fh, struct v4l2_query_ext_ctrl *qc)
 {
 	struct hws_video *videodev = video_drvdata(file);
-	struct v4l2_query_ext_ctrl *found_ctrl;
+	const struct v4l2_query_ext_ctrl *found_ctrl;
 	unsigned int id;
 	unsigned int mask_id;
-	int ret = -EINVAL;
 
 	if (qc == NULL) {
 		if (hws_diag_enabled())
 			pr_info_ratelimited("hws: %s ch=%d ext ctrls are NULL\n", __func__, videodev->index);
-		return ret;
+		return -EINVAL;
 	}
 
 	id = qc->id & (~V4L2_CTRL_FLAG_NEXT_CTRL);
 	mask_id = qc->id & V4L2_CTRL_FLAG_NEXT_CTRL;
-
-	if (mask_id == V4L2_CTRL_FLAG_NEXT_CTRL) {
-		if (id == 0) {
-			videodev->queryIndex = 0;
-			found_ctrl = find_ext_ctrlByIndex(videodev->queryIndex);
-			if (found_ctrl) {
-				memcpy(qc, found_ctrl, sizeof(*qc));
-				qc->id = found_ctrl->id;
-				ret = 0;
-			}
-		} else {
-			videodev->queryIndex++;
-			found_ctrl = find_ext_ctrlByIndex(videodev->queryIndex);
-			if (found_ctrl) {
-				memcpy(qc, found_ctrl, sizeof(*qc));
-				qc->id = found_ctrl->id;
-				ret = 0;
-			} else {
-				memset(qc, 0, sizeof(*qc));
-				ret = -EINVAL;
-			}
-		}
-	} else {
-		found_ctrl = find_ext_ctrl(id);
-		if (found_ctrl) {
-			memcpy(qc, found_ctrl, sizeof(*qc));
-			ret = 0;
-		} else {
-			memset(qc, 0, sizeof(*qc));
-			ret = -EINVAL;
-		}
+	found_ctrl = (mask_id == V4L2_CTRL_FLAG_NEXT_CTRL) ?
+		find_next_ext_ctrl(id) : find_ext_ctrl(id);
+	if (found_ctrl == NULL) {
+		memset(qc, 0, sizeof(*qc));
+		return -EINVAL;
 	}
 
-	return ret;
+	memcpy(qc, found_ctrl, sizeof(*qc));
+	return 0;
 }
 #endif 
 #if 0
@@ -1986,7 +2093,7 @@ static int hws_start_streaming(struct vb2_queue *q, unsigned int count)
 	videodev->output_rate_accum = 0;
 	hws_diag_last_fresh_ns[videodev->index] = 0;
 	hws_source_interval_ns_avg[videodev->index] = 0;
-	mdelay(100);
+	msleep(100);
 	//---------------
 	//if(videodev->fileindex==1)
 	//{
@@ -2241,6 +2348,11 @@ static int _deliver_samples(struct hws_audio *drv, void *aud_data, u32 aud_len)
 	unsigned int wrapped_frames = 0;
 	bool diag = hws_diag_enabled();
 	int elapsed = 0;
+	u64 now_ns = ktime_get_ns();
+	u64 last_irq_ns = READ_ONCE(drv->last_irq_ns);
+	u64 last_copy_ns = READ_ONCE(drv->last_copy_ns);
+	u64 packet_ns = 0;
+	u64 max_latency_window_ns = 0;
 
 	if (ch < 0 || ch >= MAX_VID_CHANNELS)
 		diag = false;
@@ -2262,9 +2374,17 @@ static int _deliver_samples(struct hws_audio *drv, void *aud_data, u32 aud_len)
 	if (frame_bytes == 0)
 		return -EINVAL;
 
+	if (aud_len < frame_bytes || (aud_len % frame_bytes) != 0) {
+		if (diag)
+			atomic64_inc(&hws_audio_diag[ch].bad_packet_sizes);
+	}
+
 	frames = aud_len / frame_bytes;
 	if (frames == 0)
 		return 0;
+	packet_ns = hws_audio_packet_duration_ns(drv, aud_len);
+	if (packet_ns)
+		max_latency_window_ns = packet_ns * 4;
 
 	src = (u8 *)aud_data;
 	dst = (u8 *)runtime->dma_area;
@@ -2316,9 +2436,131 @@ static int _deliver_samples(struct hws_audio *drv, void *aud_data, u32 aud_len)
 	if (diag) {
 		atomic64_add(frames * frame_bytes, &hws_audio_diag[ch].delivered_bytes);
 		atomic64_add(frames, &hws_audio_diag[ch].delivered_frames);
+		if (last_copy_ns && now_ns >= last_copy_ns &&
+		    (!max_latency_window_ns || now_ns - last_copy_ns <= max_latency_window_ns))
+			hws_audio_diag_record_latency(ch, &hws_audio_diag[ch].copy_to_deliver_ns_total,
+						 &hws_audio_diag[ch].copy_to_deliver_ns_max,
+						 &hws_audio_diag[ch].copy_to_deliver_samples,
+						 now_ns - last_copy_ns);
+		if (last_irq_ns && now_ns >= last_irq_ns &&
+		    (!max_latency_window_ns || now_ns - last_irq_ns <= max_latency_window_ns))
+			hws_audio_diag_record_latency(ch, &hws_audio_diag[ch].irq_to_deliver_ns_total,
+						 &hws_audio_diag[ch].irq_to_deliver_ns_max,
+						 &hws_audio_diag[ch].irq_to_deliver_samples,
+						 now_ns - last_irq_ns);
 	}
+	WRITE_ONCE(drv->last_progress_ns, now_ns);
 
 	return frames * frame_bytes;
+}
+
+
+static const char *hws_audio_silence_reason_name(enum hws_audio_silence_reason reason)
+{
+	switch (reason) {
+	case HWS_AUDIO_SILENCE_NO_VIDEO:
+		return "no_video";
+	case HWS_AUDIO_SILENCE_TIMER:
+		return "timer";
+	case HWS_AUDIO_SILENCE_FALLBACK:
+	default:
+		return "fallback";
+	}
+}
+
+static void hws_inject_silence_packet(struct hws_pcie_dev *pdx, int dwAudioCh,
+			      unsigned int packet_bytes, enum hws_audio_silence_reason reason)
+{
+	unsigned int frame_bytes;
+	unsigned int remain;
+	static const u8 silence_chunk[512] = { 0 };
+
+	if (dwAudioCh < 0 || dwAudioCh >= MAX_VID_CHANNELS)
+		return;
+
+	frame_bytes = (pdx->audio[dwAudioCh].channels > 0) ?
+		(2U * (unsigned int)pdx->audio[dwAudioCh].channels) : 0U;
+	if (frame_bytes == 0U)
+		return;
+
+	remain = packet_bytes;
+	remain -= remain % frame_bytes;
+	while (remain > 0U) {
+		unsigned int chunk = remain;
+		int delivered;
+
+		if (chunk > sizeof(silence_chunk))
+			chunk = sizeof(silence_chunk);
+		chunk -= chunk % frame_bytes;
+		if (chunk == 0U)
+			break;
+
+		delivered = _deliver_samples(&pdx->audio[dwAudioCh], (void *)silence_chunk, chunk);
+		if (delivered < 0) {
+			if (hws_diag_enabled())
+				atomic64_inc(&hws_audio_diag[dwAudioCh].delivery_errors);
+			break;
+		}
+		remain -= chunk;
+	}
+
+	if (hws_diag_enabled()) {
+		if (reason == HWS_AUDIO_SILENCE_NO_VIDEO)
+			atomic64_inc(&hws_audio_diag[dwAudioCh].no_video_silence_injects);
+		else if (reason == HWS_AUDIO_SILENCE_TIMER)
+			atomic64_inc(&hws_audio_diag[dwAudioCh].timer_silence_injects);
+		else
+			atomic64_inc(&hws_audio_diag[dwAudioCh].fallback_silence_injects);
+	}
+	if (hws_audio_trace_enabled())
+		trace_printk("hws_audio_silence ch=%d bytes=%u reason=%s\n",
+			     dwAudioCh, packet_bytes, hws_audio_silence_reason_name(reason));
+}
+
+static void hws_audio_silence_fallback_work(struct work_struct *work)
+{
+	struct delayed_work *dwork = to_delayed_work(work);
+	struct hws_audio *drv = container_of(dwork, struct hws_audio, silence_work);
+	struct hws_pcie_dev *pdx = drv->dev;
+	int ch = drv->index;
+	bool diag = hws_diag_enabled();
+	u32 packet_bytes;
+	u64 packet_ns;
+	u64 now_ns;
+	u64 last_progress_ns;
+	u64 last_irq_ns;
+
+	if (diag && ch >= 0 && ch < MAX_VID_CHANNELS)
+		atomic64_inc(&hws_audio_diag[ch].timer_runs);
+
+	if (!hws_audio_stream_active(drv))
+		return;
+
+	packet_bytes = hws_audio_effective_packet_bytes(drv, 0);
+	packet_ns = hws_audio_packet_duration_ns(drv, packet_bytes);
+	if (!packet_bytes || !packet_ns)
+		goto reschedule;
+
+	now_ns = ktime_get_ns();
+	last_progress_ns = READ_ONCE(drv->last_progress_ns);
+	last_irq_ns = READ_ONCE(drv->last_irq_ns);
+
+	if (!last_progress_ns) {
+		WRITE_ONCE(drv->last_progress_ns, now_ns);
+		goto reschedule;
+	}
+
+	if (now_ns > last_progress_ns && now_ns - last_progress_ns >= packet_ns) {
+		if (!last_irq_ns || now_ns - last_irq_ns >= packet_ns) {
+			WRITE_ONCE(drv->last_copy_ns, 0);
+			hws_inject_silence_packet(pdx, ch, packet_bytes, HWS_AUDIO_SILENCE_TIMER);
+		}
+	}
+
+reschedule:
+	if (hws_audio_stream_active(drv))
+		queue_delayed_work(pdx->auwq, &drv->silence_work,
+				   hws_audio_fallback_delay_jiffies(drv, packet_bytes));
 }
 
 static void audio_data_process(struct work_struct *p_work)
@@ -4559,6 +4801,9 @@ static int hws_pcie_audio_open(struct snd_pcm_substream *substream)
 	runtime->hw.periods_max = req_periods;
 	snd_pcm_hw_constraint_integer(runtime, SNDRV_PCM_HW_PARAM_PERIODS);
     WRITE_ONCE(drv->substream, substream);
+	WRITE_ONCE(drv->last_irq_ns, 0);
+	WRITE_ONCE(drv->last_copy_ns, 0);
+	WRITE_ONCE(drv->last_progress_ns, 0);
 	//snd_pcm_hw_constraint_minmax(runtime,SNDRV_PCM_HW_PARAM_RATE,setrate,setrate);
 	return 0;
 }
@@ -4574,7 +4819,11 @@ static int hws_pcie_audio_close(struct snd_pcm_substream *substream)
 	drv->ring_size_byframes = 0;
 	drv->period_size_byframes = 0;
 	spin_unlock_irqrestore(&drv->ring_lock, flags);
+	cancel_delayed_work_sync(&drv->silence_work);
 	cancel_work_sync(&drv->audiowork);
+	WRITE_ONCE(drv->last_irq_ns, 0);
+	WRITE_ONCE(drv->last_copy_ns, 0);
+	WRITE_ONCE(drv->last_progress_ns, 0);
 	WRITE_ONCE(drv->substream, NULL);
 	return 0;
 } 
@@ -4606,6 +4855,9 @@ static int hws_pcie_audio_prepare(struct snd_pcm_substream *substream)
     drv->period_used_byframes = 0;
 	drv->ring_offsize =0;
 	drv->ring_over_size =0;
+	WRITE_ONCE(drv->last_irq_ns, 0);
+	WRITE_ONCE(drv->last_copy_ns, 0);
+	WRITE_ONCE(drv->last_progress_ns, 0);
     spin_unlock_irqrestore(&drv->ring_lock, flags);
 	
 	return 0;
@@ -4626,7 +4878,13 @@ static int hws_pcie_audio_trigger(struct snd_pcm_substream *substream, int cmd)
 			chip->ring_wpos_byframes = 0;
 			chip->period_used_byframes = 0;
 			spin_unlock_irqrestore(&chip->ring_lock, flags);
+			WRITE_ONCE(chip->last_irq_ns, 0);
+			WRITE_ONCE(chip->last_copy_ns, 0);
+			WRITE_ONCE(chip->last_progress_ns, ktime_get_ns());
+			cancel_delayed_work(&chip->silence_work);
 			StartAudioCapture(dev,chip->index);
+			queue_delayed_work(dev->auwq, &chip->silence_work,
+					   hws_audio_fallback_delay_jiffies(chip, 0));
 			break;
 		case SNDRV_PCM_TRIGGER_STOP:
 			//stop dma
@@ -4635,11 +4893,15 @@ static int hws_pcie_audio_trigger(struct snd_pcm_substream *substream, int cmd)
 			//printk(KERN_INFO "SNDRV_PCM_TRIGGER_STOP index:%x\n",chip->index);
 			StopAudioCapture(dev,chip->index);
 			/* Do not sleep in trigger path: can run under atomic constraints. */
+			cancel_delayed_work(&chip->silence_work);
 			cancel_work(&chip->audiowork);
 			spin_lock_irqsave(&chip->ring_lock, flags);
 			chip->ring_wpos_byframes = 0;
 			chip->period_used_byframes = 0;
 			spin_unlock_irqrestore(&chip->ring_lock, flags);
+			WRITE_ONCE(chip->last_irq_ns, 0);
+			WRITE_ONCE(chip->last_copy_ns, 0);
+			WRITE_ONCE(chip->last_progress_ns, 0);
 			break;
 		default:
 			return -EINVAL;
@@ -4732,6 +4994,7 @@ static int hws_audio_register(struct hws_pcie_dev *dev)
 		//-----------------
 		spin_lock_init(&dev->audio[i].ring_lock);
 		INIT_WORK(&dev->audio[i].audiowork,audio_data_process);
+		INIT_DELAYED_WORK(&dev->audio[i].silence_work, hws_audio_silence_fallback_work);
 		ret = snd_card_register(card);
 		if ( ret < 0) {
 			printk(KERN_ERR "%s() ERROR: snd_card_register failed\n",__func__);
@@ -4787,13 +5050,13 @@ static u32 READ_REGISTER_ULONG (struct hws_pcie_dev *pdx,u32 RegisterOffset)
 static int Check_Busy(struct hws_pcie_dev *pdx)
 {
 	u32  statusreg;
-	u32 TimeOut = 0;
+	u32 timeout_loops = 0;
+	const u32 max_timeout_loops = 200;
 	//DbgPrint(("Check Busy in !!!\n"));
 	//WRITE_REGISTER_ULONG((u32)(0x4000), 0x10);
 	while (1)
 	{
 		statusreg = READ_REGISTER_ULONG(pdx,(u32)(CVBS_IN_BASE));
-		printk("[MV] Check_Busy!!! statusreg =%X\n", statusreg);
 		if (statusreg == 0xFFFFFFFF)
 		{
 			break;
@@ -4802,7 +5065,12 @@ static int Check_Busy(struct hws_pcie_dev *pdx)
 		{
 			break;
 		}
-		TimeOut++;
+		timeout_loops++;
+		if (timeout_loops >= max_timeout_loops) {
+			pr_warn_ratelimited("hws: DSP busy wait timed out status=0x%x\n",
+					    statusreg);
+			return -ETIMEDOUT;
+		}
 		msleep(10);
 	}
 	//WRITE_REGISTER_ULONG((u32)(0x4000), 0x10);
@@ -4818,13 +5086,13 @@ static void StopDsp(struct hws_pcie_dev *pdx)
 	//int j, i;
 	u32  statusreg;
 	statusreg = READ_REGISTER_ULONG(pdx,(u32)(CVBS_IN_BASE));
-	printk("[MV] Busy!!! statusreg =%X\n", statusreg);
 	if (statusreg == 0xFFFFFFFF)
 	{
 			return;
 	}
 	WRITE_REGISTER_ULONG(pdx,(u32)(CVBS_IN_BASE), 0x10);
-	Check_Busy(pdx);
+	if (Check_Busy(pdx) < 0)
+		pr_warn_ratelimited("hws: StopDsp did not reach idle state\n");
 	WRITE_REGISTER_ULONG(pdx,( CVBS_IN_BASE + (2 * PCIE_BARADDROFSIZE)), 0x00);
 		
 	
@@ -5358,6 +5626,8 @@ static void hws_remove(struct pci_dev *pdev)
 	
 	if(dev->auwq)
 	{
+		for (i = 0; i < dev->m_nCurreMaxVideoChl; i++)
+			cancel_delayed_work_sync(&dev->audio[i].silence_work);
 		destroy_workqueue(dev->auwq);
 	}
 	dev->wq=NULL;
@@ -5432,6 +5702,9 @@ static int  StartAudioCapture(struct hws_pcie_dev *pdx,int index)
 	pdx->m_nAudioBufferIndex[index] =0; 
 	pdx->audio_data[index]=0;
 	pdx->m_nRDAudioIndex[index] =0;
+	WRITE_ONCE(pdx->audio[index].last_irq_ns, 0);
+	WRITE_ONCE(pdx->audio[index].last_copy_ns, 0);
+	WRITE_ONCE(pdx->audio[index].last_progress_ns, ktime_get_ns());
 	for(j=0; j<MAX_AUDIO_QUEUE;j++)
 	{
 		pdx->m_AudioInfo[index].pStatusInfo[j].byLock = MEM_UNLOCK;
@@ -5515,6 +5788,10 @@ static void StopAudioCapture(struct hws_pcie_dev *pdx,int index)
 	pdx->m_bAudioStop[index] = 1;
 	pdx->m_nAudioBufferIndex[index] =0;
 	pdx->m_AudioInfo[index].dwisRuning =0;
+	cancel_delayed_work_sync(&pdx->audio[index].silence_work);
+	WRITE_ONCE(pdx->audio[index].last_irq_ns, 0);
+	WRITE_ONCE(pdx->audio[index].last_copy_ns, 0);
+	WRITE_ONCE(pdx->audio[index].last_progress_ns, 0);
 	#if 0
 	while(1)
 	{
@@ -5751,11 +6028,25 @@ static int SetQuene(struct hws_pcie_dev  *pdx,int nDecoder)
 static int MemCopyAudioToSteam( struct hws_pcie_dev  *pdx,int dwAudioCh)
 {
 	int i=0;
+	bool diag = hws_diag_enabled();
 	BYTE *bBuf = NULL;
 	BYTE *pSrcBuf= NULL;
 	int nIndex = -1;
 	unsigned long flags;
+	u32 free_slots = 0;
+	u64 now_ns = ktime_get_ns();
+	u64 last_irq_ns;
 	//int status =-1;
+	if (dwAudioCh < 0 || dwAudioCh >= MAX_VID_CHANNELS)
+		return -EINVAL;
+
+	if (pdx->m_dwAudioPTKSize <= 0 || pdx->m_dwAudioPTKSize > MAX_AUDIO_CAP_SIZE) {
+		if (diag)
+			atomic64_inc(&hws_audio_diag[dwAudioCh].bad_packet_sizes);
+		if (hws_audio_trace_enabled())
+			trace_printk("hws_audio_drop ch=%d reason=bad_packet ptk=%u\n", dwAudioCh, pdx->m_dwAudioPTKSize);
+		return -EINVAL;
+	}
 	//printk("MemCopyAudioToSteam =%d",dwAudioCh);
 	if(pdx->m_nAudioBufferIndex[dwAudioCh]== 0)
 	{
@@ -5794,6 +6085,15 @@ static int MemCopyAudioToSteam( struct hws_pcie_dev  *pdx,int dwAudioCh)
 				}
 			}
 			
+			if (diag) {
+				free_slots = 0;
+				for (i = 0; i < MAX_AUDIO_QUEUE; i++) {
+					if (pdx->m_AudioInfo[dwAudioCh].pStatusInfo[i].byLock == MEM_UNLOCK)
+						free_slots++;
+				}
+				hws_audio_diag_record_queue_free(dwAudioCh, free_slots);
+			}
+
 			if((nIndex!= -1)&& bBuf)
 			{
 
@@ -5814,18 +6114,40 @@ static int MemCopyAudioToSteam( struct hws_pcie_dev  *pdx,int dwAudioCh)
 					//printk("Set Audio Event %d\n",dwAudioCh);
 					//pdx->audio[dwAudioCh].pos = pdx->m_dwAudioPTKSize;
 					 //snd_pcm_period_elapsed(pdx->audio[dwAudioCh].substream);	
-					 queue_work(pdx->auwq,&pdx->audio[dwAudioCh].audiowork);
+					 last_irq_ns = READ_ONCE(pdx->audio[dwAudioCh].last_irq_ns);
+					 if (diag && last_irq_ns && now_ns >= last_irq_ns)
+						hws_audio_diag_record_latency(dwAudioCh, &hws_audio_diag[dwAudioCh].irq_to_copy_ns_total,
+									 &hws_audio_diag[dwAudioCh].irq_to_copy_ns_max,
+									 &hws_audio_diag[dwAudioCh].irq_to_copy_samples,
+									 now_ns - last_irq_ns);
+					 WRITE_ONCE(pdx->audio[dwAudioCh].last_copy_ns, now_ns);
+					 if (!queue_work(pdx->auwq,&pdx->audio[dwAudioCh].audiowork)) {
+					if (diag)
+						atomic64_inc(&hws_audio_diag[dwAudioCh].workqueue_requeues);
+				 }
 					//pdx->m_AudioInfo[dwAudioCh].pStatusInfo[nIndex].byLock = MEM_UNLOCK;		
 				
 			}
 			else
 			{
-				if (hws_diag_enabled())
+				if (diag) {
+					atomic64_inc(&hws_audio_diag[dwAudioCh].no_free_queue_slots);
+					atomic64_inc(&hws_audio_diag[dwAudioCh].memcopy_failures);
+				}
 				pr_info_ratelimited("hws: no audio buffer ch=%d\n", dwAudioCh);
+				if (hws_audio_trace_enabled())
+					trace_printk("hws_audio_drop ch=%d reason=no_free_queue ptk=%u\n", dwAudioCh, pdx->m_dwAudioPTKSize);
+				return -ENOSPC;
 
 			}
 	}
-   return 0;
+	if (diag) {
+		atomic64_inc(&hws_audio_diag[dwAudioCh].memcopy_failures);
+		atomic64_inc(&hws_audio_diag[dwAudioCh].stream_not_running);
+	}
+	if (hws_audio_trace_enabled())
+		trace_printk("hws_audio_drop ch=%d reason=stream_not_running\n", dwAudioCh);
+	return -EAGAIN;
 }
 
 static int SetAudioQuene( struct hws_pcie_dev *pdx,int dwAudioCh)
@@ -5836,9 +6158,31 @@ static int SetAudioQuene( struct hws_pcie_dev *pdx,int dwAudioCh)
 	//BYTE *pSrcBuf= NULL;
 	//int nIndex = -1;
 	//printk("SetAudioQuene =%d",dwAudioCh);
+	if (dwAudioCh < 0 || dwAudioCh >= MAX_VID_CHANNELS)
+		return -EINVAL;
+	WRITE_ONCE(pdx->audio[dwAudioCh].last_irq_ns, ktime_get_ns());
+
 	if(!pdx->m_bACapStarted[dwAudioCh])
 	{
 		  return -1 ;
+	}
+	if (READ_ONCE(pdx->m_curr_No_Video[dwAudioCh])) {
+		int i;
+		unsigned long flags;
+
+		spin_lock_irqsave(&pdx->audiolock[dwAudioCh], flags);
+		for (i = 0; i < MAX_AUDIO_QUEUE; i++) {
+			if (pdx->m_AudioInfo[dwAudioCh].pStatusInfo[i].byLock == MEM_LOCK)
+				pdx->m_AudioInfo[dwAudioCh].pStatusInfo[i].byLock = MEM_UNLOCK;
+		}
+		pdx->m_nRDAudioIndex[dwAudioCh] = 0;
+		spin_unlock_irqrestore(&pdx->audiolock[dwAudioCh], flags);
+
+		hws_inject_silence_packet(pdx, dwAudioCh, pdx->m_dwAudioPTKSize,
+					  HWS_AUDIO_SILENCE_NO_VIDEO);
+
+		pdx->m_nAudioBusy[dwAudioCh] = 0;
+		return 0;
 	}
 	if(!pdx->m_bAudioRun[dwAudioCh])
 	{
@@ -5854,7 +6198,15 @@ static int SetAudioQuene( struct hws_pcie_dev *pdx,int dwAudioCh)
 	pdx->m_nAudioBusy[dwAudioCh]  = 1;
 
 	status = MemCopyAudioToSteam(pdx,dwAudioCh);
-
+	if (status < 0) {
+		/* Keep PCM timing continuous on unstable/missing capture packets. */
+		if (hws_audio_trace_enabled())
+			trace_printk("hws_audio_drop ch=%d reason=memcopy_fail err=%d ptk=%u\n",
+				     dwAudioCh, status, pdx->m_dwAudioPTKSize);
+		hws_inject_silence_packet(pdx, dwAudioCh, pdx->m_dwAudioPTKSize,
+					  HWS_AUDIO_SILENCE_FALLBACK);
+		status = 0;
+	}
 
 	pdx->m_nAudioBusy[dwAudioCh] = 0;	
 
@@ -6283,7 +6635,10 @@ static struct hws_pcie_dev *alloc_dev_instance(struct pci_dev *pdev)
 	//int i;
 	struct hws_pcie_dev *lro;
 
-	BUG_ON(!pdev);
+	if (!pdev) {
+		pr_err("hws: alloc_dev_instance called with NULL pdev\n");
+		return NULL;
+	}
 
 	/* allocate zeroed device book keeping structure */
 	lro = kzalloc(sizeof(struct hws_pcie_dev), GFP_KERNEL);
