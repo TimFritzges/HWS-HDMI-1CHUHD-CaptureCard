@@ -4816,6 +4816,7 @@ static int hws_pcie_audio_open(struct snd_pcm_substream *substream)
 {
 	struct hws_audio *drv = snd_pcm_substream_chip(substream);
 	struct snd_pcm_runtime *runtime = substream->runtime;
+	int ret;
 	unsigned int req_period_bytes;
 	unsigned int req_periods;
 	unsigned int req_period_max;
@@ -4868,12 +4869,19 @@ static int hws_pcie_audio_open(struct snd_pcm_substream *substream)
 	runtime->hw.buffer_bytes_max = req_buffer_max;
 	runtime->hw.periods_min = 2U;
 	runtime->hw.periods_max = req_periods;
-	if (req_period_count > 0)
-		snd_pcm_hw_constraint_list(runtime, 0, SNDRV_PCM_HW_PARAM_PERIOD_BYTES,
-					 &drv->period_bytes_constraint);
-	snd_pcm_hw_constraint_integer(runtime, SNDRV_PCM_HW_PARAM_PERIODS);
-	snd_pcm_hw_constraint_minmax(runtime, SNDRV_PCM_HW_PARAM_BUFFER_BYTES,
-				      req_buffer_min, req_buffer_max);
+	if (req_period_count > 0) {
+		ret = snd_pcm_hw_constraint_list(runtime, 0, SNDRV_PCM_HW_PARAM_PERIOD_BYTES,
+						 &drv->period_bytes_constraint);
+		if (ret < 0)
+			return ret;
+	}
+	ret = snd_pcm_hw_constraint_integer(runtime, SNDRV_PCM_HW_PARAM_PERIODS);
+	if (ret < 0)
+		return ret;
+	ret = snd_pcm_hw_constraint_minmax(runtime, SNDRV_PCM_HW_PARAM_BUFFER_BYTES,
+					   req_buffer_min, req_buffer_max);
+	if (ret < 0)
+		return ret;
 	WRITE_ONCE(drv->substream, substream);
 	WRITE_ONCE(drv->last_irq_ns, 0);
 	WRITE_ONCE(drv->last_copy_ns, 0);
