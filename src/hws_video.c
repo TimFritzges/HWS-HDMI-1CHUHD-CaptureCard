@@ -364,6 +364,17 @@ static unsigned int hws_audio_init_period_constraints(struct hws_audio *drv,
 
 static int _deliver_samples(struct hws_audio *drv, void *aud_data, u32 aud_len);
 
+static void hws_audio_publish_timer_init(struct hrtimer *timer,
+					 enum hrtimer_restart (*fn)(struct hrtimer *))
+{
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6,14,0)
+	hrtimer_setup(timer, fn, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
+#else
+	hrtimer_init(timer, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
+	timer->function = fn;
+#endif
+}
+
 static bool hws_audio_stream_active(struct hws_audio *drv)
 {
 	struct hws_pcie_dev *pdx;
@@ -5239,8 +5250,8 @@ static int hws_audio_register(struct hws_pcie_dev *dev)
 			spin_lock_init(&dev->audio[i].ring_lock);
 			dev->audio[i].publish_chunk_bytes = 0;
 			dev->audio[i].publish_interval = ns_to_ktime(0);
-			hrtimer_setup(&dev->audio[i].publish_timer, hws_audio_publish_timer_fn,
-				      CLOCK_MONOTONIC, HRTIMER_MODE_REL);
+			hws_audio_publish_timer_init(&dev->audio[i].publish_timer,
+						     hws_audio_publish_timer_fn);
 			INIT_WORK(&dev->audio[i].audiowork,audio_data_process);
 			INIT_DELAYED_WORK(&dev->audio[i].silence_work, hws_audio_silence_fallback_work);
 			ret = snd_card_register(card);
