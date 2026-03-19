@@ -43,9 +43,9 @@ static int audio_work_budget = 8;
 module_param_named(audio_work_budget, audio_work_budget, int, 0644);
 MODULE_PARM_DESC(audio_work_budget, "Max queued audio packets handled per audio worker run (min 1)");
 
-static int audio_period_bytes = 4096;
+static int audio_period_bytes = 1024;
 module_param_named(audio_period_bytes, audio_period_bytes, int, 0644);
-MODULE_PARM_DESC(audio_period_bytes, "Requested ALSA period size in bytes (default 4096 = 1024 frames @ 48kHz stereo s16)");
+MODULE_PARM_DESC(audio_period_bytes, "Requested ALSA period size in bytes (default 1024 = 256 frames @ 48kHz stereo s16)");
 
 static int audio_periods = 8;
 module_param_named(audio_periods, audio_periods, int, 0644);
@@ -2432,8 +2432,14 @@ static int _deliver_samples(struct hws_audio *drv, void *aud_data, u32 aud_len)
 	spin_unlock_irqrestore(&drv->ring_lock, flags);
 
 	if (elapsed && READ_ONCE(drv->substream) == substream) {
-		/* snd_pcm_period_elapsed can trigger STOP in some cases */
-		snd_pcm_period_elapsed(substream);
+		unsigned int i;
+
+		/*
+		 * A single DMA packet can cover multiple ALSA periods. Report each
+		 * elapsed period so low-quantum userspace does not undercount wakeups.
+		 */
+		for (i = 0; i < elapsed; i++)
+			snd_pcm_period_elapsed(substream);
 		if (diag)
 			atomic64_add(elapsed, &hws_audio_diag[ch].period_elapsed_calls);
 	}
@@ -4777,7 +4783,7 @@ static int hws_pcie_audio_open(struct snd_pcm_substream *substream)
     drv->channels               = 2;
 	//printk(KERN_INFO "%s() index:%x\n",__func__,drv->index);
     runtime->hw = audio_pcm_hardware;
-	req_period_bytes = (audio_period_bytes > 0) ? (unsigned int)audio_period_bytes : 4096U;
+	req_period_bytes = (audio_period_bytes > 0) ? (unsigned int)audio_period_bytes : 1024U;
 	if (req_period_bytes < 1024U)
 		req_period_bytes = 1024U;
 	req_period_bytes &= ~3U;
@@ -6037,11 +6043,11 @@ static int MemCopyAudioToSteam( struct hws_pcie_dev  *pdx,int dwAudioCh)
 	BYTE *bBuf = NULL;
 	BYTE *pSrcBuf= NULL;
 	int nIndex = -1;
+	int status = 0;
 	unsigned long flags;
 	u32 free_slots = 0;
 	u64 now_ns = ktime_get_ns();
 	u64 last_irq_ns;
-	//int status =-1;
 	if (dwAudioCh < 0 || dwAudioCh >= MAX_VID_CHANNELS)
 		return -EINVAL;
 
@@ -6145,6 +6151,7 @@ static int MemCopyAudioToSteam( struct hws_pcie_dev  *pdx,int dwAudioCh)
 				return -ENOSPC;
 
 			}
+			return status;
 	}
 	if (diag) {
 		atomic64_inc(&hws_audio_diag[dwAudioCh].memcopy_failures);
