@@ -24,6 +24,7 @@
 
 #include <linux/kernel.h>
 #include <linux/timer.h>
+#include <linux/hrtimer.h>
 #include <linux/jiffies.h>
 #include <linux/sched.h>
 #include <linux/timer.h>
@@ -360,8 +361,16 @@ struct hws_audio{
 	int                         ring_over_size;
 	void                        *resampled_buf;
 	u32                         resampled_buf_size;
+	u32                         staged_rpos_bytes;
+	u32                         staged_wpos_bytes;
+	u32                         staged_fill_bytes;
+	u32                         publish_chunk_bytes;
+	ktime_t                     publish_interval;
+	struct hrtimer              publish_timer;
+	bool                        publish_timer_armed;
+	u8                          publish_scratch[MAX_DMA_AUDIO_PK_SIZE];
 	spinlock_t                  ring_lock;
-    uint32_t                    ring_wpos_byframes;
+	    uint32_t                    ring_wpos_byframes;
     uint32_t                    ring_size_byframes;
     uint32_t                    period_size_byframes;
     uint32_t                    period_used_byframes;

@@ -362,6 +362,8 @@ static unsigned int hws_audio_init_period_constraints(struct hws_audio *drv,
 	return count;
 }
 
+static int _deliver_samples(struct hws_audio *drv, void *aud_data, u32 aud_len);
+
 static bool hws_audio_stream_active(struct hws_audio *drv)
 {
 	struct hws_pcie_dev *pdx;
@@ -376,6 +378,151 @@ static bool hws_audio_stream_active(struct hws_audio *drv)
 		return false;
 
 	return READ_ONCE(pdx->m_bAudioRun[ch]) && READ_ONCE(pdx->m_bACapStarted[ch]);
+}
+
+static void hws_audio_reset_stage(struct hws_audio *drv)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(&drv->ring_lock, flags);
+	drv->staged_rpos_bytes = 0;
+	drv->staged_wpos_bytes = 0;
+	drv->staged_fill_bytes = 0;
+	drv->publish_timer_armed = false;
+	spin_unlock_irqrestore(&drv->ring_lock, flags);
+}
+
+static int hws_audio_stage_bytes(struct hws_audio *drv, const u8 *src, u32 aud_len)
+{
+	unsigned long flags;
+	u32 first;
+	u8 *stage;
+
+	if (!drv || !src || !aud_len || !drv->resampled_buf || !drv->resampled_buf_size)
+		return -EINVAL;
+	if (aud_len > drv->resampled_buf_size)
+		return -ENOSPC;
+
+	stage = drv->resampled_buf;
+	spin_lock_irqsave(&drv->ring_lock, flags);
+	if (drv->staged_fill_bytes > drv->resampled_buf_size - aud_len) {
+		spin_unlock_irqrestore(&drv->ring_lock, flags);
+		return -ENOSPC;
+	}
+
+	first = min(aud_len, drv->resampled_buf_size - drv->staged_wpos_bytes);
+	memcpy(stage + drv->staged_wpos_bytes, src, first);
+	if (first < aud_len)
+		memcpy(stage, src + first, aud_len - first);
+
+	drv->staged_wpos_bytes = (drv->staged_wpos_bytes + aud_len) % drv->resampled_buf_size;
+	drv->staged_fill_bytes += aud_len;
+	spin_unlock_irqrestore(&drv->ring_lock, flags);
+
+	return 0;
+}
+
+static int hws_audio_publish_one_period(struct hws_audio *drv)
+{
+	unsigned long flags;
+	u32 aud_len;
+	u32 first;
+	u8 *stage;
+
+	if (!drv || !drv->resampled_buf)
+		return -EINVAL;
+
+	aud_len = READ_ONCE(drv->publish_chunk_bytes);
+	if (!aud_len)
+		return -EINVAL;
+
+	stage = drv->resampled_buf;
+	spin_lock_irqsave(&drv->ring_lock, flags);
+	if (drv->staged_fill_bytes < aud_len) {
+		spin_unlock_irqrestore(&drv->ring_lock, flags);
+		return 0;
+	}
+
+	first = min(aud_len, drv->resampled_buf_size - drv->staged_rpos_bytes);
+	memcpy(drv->publish_scratch, stage + drv->staged_rpos_bytes, first);
+	if (first < aud_len)
+		memcpy(drv->publish_scratch + first, stage, aud_len - first);
+
+	drv->staged_rpos_bytes = (drv->staged_rpos_bytes + aud_len) % drv->resampled_buf_size;
+	drv->staged_fill_bytes -= aud_len;
+	spin_unlock_irqrestore(&drv->ring_lock, flags);
+
+	return _deliver_samples(drv, drv->publish_scratch, aud_len);
+}
+
+static void hws_audio_arm_publish_timer(struct hws_audio *drv)
+{
+	unsigned long flags;
+	bool have_more = false;
+
+	if (!drv || !READ_ONCE(drv->publish_chunk_bytes))
+		return;
+	if (!hws_audio_stream_active(drv))
+		return;
+
+	spin_lock_irqsave(&drv->ring_lock, flags);
+	if (drv->publish_timer_armed) {
+		spin_unlock_irqrestore(&drv->ring_lock, flags);
+		return;
+	}
+	drv->publish_timer_armed = true;
+	spin_unlock_irqrestore(&drv->ring_lock, flags);
+
+	if (hws_audio_publish_one_period(drv) < 0) {
+		spin_lock_irqsave(&drv->ring_lock, flags);
+		drv->publish_timer_armed = false;
+		spin_unlock_irqrestore(&drv->ring_lock, flags);
+		return;
+	}
+
+	spin_lock_irqsave(&drv->ring_lock, flags);
+	if (drv->staged_fill_bytes >= drv->publish_chunk_bytes)
+		have_more = true;
+	if (!have_more)
+		drv->publish_timer_armed = false;
+	spin_unlock_irqrestore(&drv->ring_lock, flags);
+
+	if (have_more)
+		hrtimer_start(&drv->publish_timer, drv->publish_interval, HRTIMER_MODE_REL);
+}
+
+static enum hrtimer_restart hws_audio_publish_timer_fn(struct hrtimer *timer)
+{
+	struct hws_audio *drv = container_of(timer, struct hws_audio, publish_timer);
+	unsigned long flags;
+	bool have_more = false;
+
+	if (!hws_audio_stream_active(drv)) {
+		spin_lock_irqsave(&drv->ring_lock, flags);
+		drv->publish_timer_armed = false;
+		spin_unlock_irqrestore(&drv->ring_lock, flags);
+		return HRTIMER_NORESTART;
+	}
+
+	if (hws_audio_publish_one_period(drv) < 0) {
+		spin_lock_irqsave(&drv->ring_lock, flags);
+		drv->publish_timer_armed = false;
+		spin_unlock_irqrestore(&drv->ring_lock, flags);
+		return HRTIMER_NORESTART;
+	}
+
+	spin_lock_irqsave(&drv->ring_lock, flags);
+	if (drv->staged_fill_bytes >= drv->publish_chunk_bytes)
+		have_more = true;
+	if (!have_more)
+		drv->publish_timer_armed = false;
+	spin_unlock_irqrestore(&drv->ring_lock, flags);
+
+	if (!have_more)
+		return HRTIMER_NORESTART;
+
+	hrtimer_forward_now(timer, drv->publish_interval);
+	return HRTIMER_RESTART;
 }
 
 enum hws_audio_silence_reason {
@@ -2523,40 +2670,25 @@ static const char *hws_audio_silence_reason_name(enum hws_audio_silence_reason r
 }
 
 static void hws_inject_silence_packet(struct hws_pcie_dev *pdx, int dwAudioCh,
-			      unsigned int packet_bytes, enum hws_audio_silence_reason reason)
+				      unsigned int packet_bytes, enum hws_audio_silence_reason reason)
 {
-	unsigned int frame_bytes;
-	unsigned int remain;
-	static const u8 silence_chunk[512] = { 0 };
+	struct hws_audio *drv;
+	static const u8 silence_chunk[MAX_DMA_AUDIO_PK_SIZE] = { 0 };
 
 	if (dwAudioCh < 0 || dwAudioCh >= MAX_VID_CHANNELS)
 		return;
 
-	frame_bytes = (pdx->audio[dwAudioCh].channels > 0) ?
-		(2U * (unsigned int)pdx->audio[dwAudioCh].channels) : 0U;
-	if (frame_bytes == 0U)
+	drv = &pdx->audio[dwAudioCh];
+	packet_bytes = hws_audio_effective_packet_bytes(drv, packet_bytes);
+	if (!packet_bytes || packet_bytes > sizeof(silence_chunk))
 		return;
 
-	remain = packet_bytes;
-	remain -= remain % frame_bytes;
-	while (remain > 0U) {
-		unsigned int chunk = remain;
-		int delivered;
-
-		if (chunk > sizeof(silence_chunk))
-			chunk = sizeof(silence_chunk);
-		chunk -= chunk % frame_bytes;
-		if (chunk == 0U)
-			break;
-
-		delivered = _deliver_samples(&pdx->audio[dwAudioCh], (void *)silence_chunk, chunk);
-		if (delivered < 0) {
-			if (hws_diag_enabled())
-				atomic64_inc(&hws_audio_diag[dwAudioCh].delivery_errors);
-			break;
-		}
-		remain -= chunk;
+	if (hws_audio_stage_bytes(drv, silence_chunk, packet_bytes) < 0) {
+		if (hws_diag_enabled())
+			atomic64_inc(&hws_audio_diag[dwAudioCh].delivery_errors);
+		return;
 	}
+	hws_audio_arm_publish_timer(drv);
 
 	if (hws_diag_enabled()) {
 		if (reason == HWS_AUDIO_SILENCE_NO_VIDEO)
@@ -2684,14 +2816,16 @@ static void audio_data_process(struct work_struct *p_work)
 			break;
 		}
 
-		/* Do expensive copy/callback path outside device audio lock. */
-		delivered = _deliver_samples(drv, bBuf, aud_len);
-		if (delivered < 0) {
-			if (diag) {
-				atomic64_inc(&hws_audio_diag[dwAudioCh].delivery_errors);
-				pr_info_ratelimited("hws: audio delivery skipped ch=%d err=%d\n", dwAudioCh, delivered);
+			/* Stage hardware bursts, then publish ALSA periods at runtime cadence. */
+			delivered = hws_audio_stage_bytes(drv, bBuf, aud_len);
+			if (delivered < 0) {
+				if (diag) {
+					atomic64_inc(&hws_audio_diag[dwAudioCh].delivery_errors);
+					pr_info_ratelimited("hws: audio delivery skipped ch=%d err=%d\n", dwAudioCh, delivered);
+				}
+			} else {
+				hws_audio_arm_publish_timer(drv);
 			}
-		}
 
 		spin_lock_irqsave(&pdx->audiolock[dwAudioCh], flags);
 		pdx->m_AudioInfo[dwAudioCh].pStatusInfo[nIndex].byLock = MEM_UNLOCK;
@@ -4895,14 +5029,18 @@ static int hws_pcie_audio_close(struct snd_pcm_substream *substream)
 	struct hws_audio *drv = snd_pcm_substream_chip(substream);
 	unsigned long flags;
 
+	hrtimer_cancel(&drv->publish_timer);
+	cancel_delayed_work_sync(&drv->silence_work);
+	cancel_work_sync(&drv->audiowork);
+	hws_audio_reset_stage(drv);
 	spin_lock_irqsave(&drv->ring_lock, flags);
 	drv->ring_wpos_byframes = 0;
 	drv->period_used_byframes = 0;
 	drv->ring_size_byframes = 0;
 	drv->period_size_byframes = 0;
+	drv->publish_chunk_bytes = 0;
+	drv->publish_interval = ns_to_ktime(0);
 	spin_unlock_irqrestore(&drv->ring_lock, flags);
-	cancel_delayed_work_sync(&drv->silence_work);
-	cancel_work_sync(&drv->audiowork);
 	WRITE_ONCE(drv->last_irq_ns, 0);
 	WRITE_ONCE(drv->last_copy_ns, 0);
 	WRITE_ONCE(drv->last_progress_ns, 0);
@@ -4952,54 +5090,66 @@ static int hws_pcie_audio_prepare(struct snd_pcm_substream *substream)
 	WRITE_ONCE(drv->last_irq_ns, 0);
 	WRITE_ONCE(drv->last_copy_ns, 0);
 	WRITE_ONCE(drv->last_progress_ns, 0);
+	drv->publish_chunk_bytes = runtime->period_size * frame_bytes;
+	drv->publish_interval = ns_to_ktime(hws_audio_packet_duration_ns(drv, drv->publish_chunk_bytes));
     spin_unlock_irqrestore(&drv->ring_lock, flags);
+	hws_audio_reset_stage(drv);
+	hrtimer_cancel(&drv->publish_timer);
 	
 	return 0;
 }  
 static int hws_pcie_audio_trigger(struct snd_pcm_substream *substream, int cmd)
 {
 	struct hws_audio *chip = snd_pcm_substream_chip(substream);
-	struct hws_pcie_dev *dev= chip->dev;
+	struct hws_pcie_dev *dev = chip->dev;
 	unsigned long flags;
-	switch(cmd){
-		case SNDRV_PCM_TRIGGER_START:
-			//HWS_PCIE_READ(HWS_DMA_BASE(chip->index), HWS_DMA_STATUS);
-			//start dma
-			//HWS_PCIE_WRITE(HWS_INT_BASE, HWS_DMA_MASK(chip->index), 0x00000001); 
-			//HWS_PCIE_WRITE(HWS_DMA_BASE(chip->index), HWS_DMA_START, 0x00000001);
-			//printk(KERN_INFO "SNDRV_PCM_TRIGGER_START index:%x\n",chip->index);	
-	 					spin_lock_irqsave(&chip->ring_lock, flags);
-			chip->ring_wpos_byframes = 0;
-			chip->period_used_byframes = 0;
-			spin_unlock_irqrestore(&chip->ring_lock, flags);
-			WRITE_ONCE(chip->last_irq_ns, 0);
-			WRITE_ONCE(chip->last_copy_ns, 0);
-			WRITE_ONCE(chip->last_progress_ns, ktime_get_ns());
-			cancel_delayed_work(&chip->silence_work);
-			StartAudioCapture(dev,chip->index);
-			queue_delayed_work(dev->auwq, &chip->silence_work,
-					   hws_audio_fallback_delay_jiffies(chip, 0));
-			break;
-		case SNDRV_PCM_TRIGGER_STOP:
-			//stop dma
-			//HWS_PCIE_WRITE(HWS_INT_BASE, HWS_DMA_MASK(chip->index), 0x000000000); 
-			//HWS_PCIE_WRITE(HWS_DMA_BASE(chip->index), HWS_DMA_START, 0x00000000);
-			//printk(KERN_INFO "SNDRV_PCM_TRIGGER_STOP index:%x\n",chip->index);
-			StopAudioCapture(dev,chip->index);
-			/* Do not sleep in trigger path: can run under atomic constraints. */
-			cancel_delayed_work(&chip->silence_work);
-			cancel_work(&chip->audiowork);
-			spin_lock_irqsave(&chip->ring_lock, flags);
-			chip->ring_wpos_byframes = 0;
-			chip->period_used_byframes = 0;
-			spin_unlock_irqrestore(&chip->ring_lock, flags);
-			WRITE_ONCE(chip->last_irq_ns, 0);
-			WRITE_ONCE(chip->last_copy_ns, 0);
-			WRITE_ONCE(chip->last_progress_ns, 0);
-			break;
-		default:
-			return -EINVAL;
-			break;
+
+	switch (cmd) {
+	case SNDRV_PCM_TRIGGER_START:
+		//HWS_PCIE_READ(HWS_DMA_BASE(chip->index), HWS_DMA_STATUS);
+		//start dma
+		//HWS_PCIE_WRITE(HWS_INT_BASE, HWS_DMA_MASK(chip->index), 0x00000001);
+		//HWS_PCIE_WRITE(HWS_DMA_BASE(chip->index), HWS_DMA_START, 0x00000001);
+		//printk(KERN_INFO "SNDRV_PCM_TRIGGER_START index:%x\n",chip->index);
+		/*
+		 * Trigger can run under atomic constraints. Best-effort cancel the timer
+		 * and reset staged state; any in-flight callback will observe the reset.
+		 */
+		hrtimer_try_to_cancel(&chip->publish_timer);
+		hws_audio_reset_stage(chip);
+		spin_lock_irqsave(&chip->ring_lock, flags);
+		chip->ring_wpos_byframes = 0;
+		chip->period_used_byframes = 0;
+		spin_unlock_irqrestore(&chip->ring_lock, flags);
+		WRITE_ONCE(chip->last_irq_ns, 0);
+		WRITE_ONCE(chip->last_copy_ns, 0);
+		WRITE_ONCE(chip->last_progress_ns, ktime_get_ns());
+		cancel_delayed_work(&chip->silence_work);
+		StartAudioCapture(dev, chip->index);
+		queue_delayed_work(dev->auwq, &chip->silence_work,
+				   hws_audio_fallback_delay_jiffies(chip, 0));
+		break;
+	case SNDRV_PCM_TRIGGER_STOP:
+		//stop dma
+		//HWS_PCIE_WRITE(HWS_INT_BASE, HWS_DMA_MASK(chip->index), 0x000000000);
+		//HWS_PCIE_WRITE(HWS_DMA_BASE(chip->index), HWS_DMA_START, 0x00000000);
+		//printk(KERN_INFO "SNDRV_PCM_TRIGGER_STOP index:%x\n",chip->index);
+		StopAudioCapture(dev, chip->index);
+		/* Do not sleep in trigger path: can run under atomic constraints. */
+		hrtimer_try_to_cancel(&chip->publish_timer);
+		cancel_delayed_work(&chip->silence_work);
+		cancel_work(&chip->audiowork);
+		hws_audio_reset_stage(chip);
+		spin_lock_irqsave(&chip->ring_lock, flags);
+		chip->ring_wpos_byframes = 0;
+		chip->period_used_byframes = 0;
+		spin_unlock_irqrestore(&chip->ring_lock, flags);
+		WRITE_ONCE(chip->last_irq_ns, 0);
+		WRITE_ONCE(chip->last_copy_ns, 0);
+		WRITE_ONCE(chip->last_progress_ns, 0);
+		break;
+	default:
+		return -EINVAL;
 	}
 	return 0;
 }  
@@ -5078,18 +5228,22 @@ static int hws_audio_register(struct hws_pcie_dev *dev)
             audio_pcm_hardware.buffer_bytes_max,
             audio_pcm_hardware.buffer_bytes_max
             );
-		//----------------------------
-		  dev->audio[i].sample_rate_out        = 48000;
-    	  dev->audio[i].channels               = 2;
-		  dev->audio[i].resampled_buf_size = dev->audio[i].sample_rate_out * 2/* sample bytes */ * dev->audio[i].channels /* channels */;
-		  //dev->audio[i].resampled_buf = vmalloc(dev->audio[i].resampled_buf_size);  
-		//if(dev->audio[i].resampled_buf == NULL)
-		//	goto fail1;
-		//-----------------
-		spin_lock_init(&dev->audio[i].ring_lock);
-		INIT_WORK(&dev->audio[i].audiowork,audio_data_process);
-		INIT_DELAYED_WORK(&dev->audio[i].silence_work, hws_audio_silence_fallback_work);
-		ret = snd_card_register(card);
+			//----------------------------
+			  dev->audio[i].sample_rate_out        = 48000;
+	    	  dev->audio[i].channels               = 2;
+			  dev->audio[i].resampled_buf_size = dev->audio[i].sample_rate_out * 2/* sample bytes */ * dev->audio[i].channels /* channels */;
+			  dev->audio[i].resampled_buf = vzalloc(dev->audio[i].resampled_buf_size);
+			if(dev->audio[i].resampled_buf == NULL)
+				goto fail1;
+			//-----------------
+			spin_lock_init(&dev->audio[i].ring_lock);
+			dev->audio[i].publish_chunk_bytes = 0;
+			dev->audio[i].publish_interval = ns_to_ktime(0);
+			hrtimer_setup(&dev->audio[i].publish_timer, hws_audio_publish_timer_fn,
+				      CLOCK_MONOTONIC, HRTIMER_MODE_REL);
+			INIT_WORK(&dev->audio[i].audiowork,audio_data_process);
+			INIT_DELAYED_WORK(&dev->audio[i].silence_work, hws_audio_silence_fallback_work);
+			ret = snd_card_register(card);
 		if ( ret < 0) {
 			printk(KERN_ERR "%s() ERROR: snd_card_register failed\n",__func__);
 			goto fail1;
@@ -5106,11 +5260,12 @@ fail1:
 			snd_card_free(dev->audio[i].card);
 			dev->audio[i].card=NULL;
 		}
-		if(dev->audio[i].resampled_buf)
-		{
-			vfree(dev->audio[i].resampled_buf);
-			dev->audio[i].resampled_buf = NULL;
-		}
+			if(dev->audio[i].resampled_buf)
+			{
+				hrtimer_cancel(&dev->audio[i].publish_timer);
+				vfree(dev->audio[i].resampled_buf);
+				dev->audio[i].resampled_buf = NULL;
+			}
 	}
 fail0:
 	return -1;
@@ -5696,6 +5851,10 @@ static void hws_remove(struct pci_dev *pdev)
 	//-------------------------
 	//printk("hws_remove  1\n");
 	for(i=0;i<dev->m_nCurreMaxVideoChl;i++){
+		cancel_delayed_work_sync(&dev->audio[i].silence_work);
+		cancel_work_sync(&dev->audio[i].audiowork);
+		hrtimer_cancel(&dev->audio[i].publish_timer);
+		hws_audio_reset_stage(&dev->audio[i]);
 		if(dev->audio[i].resampled_buf)
 		{
 			vfree(dev->audio[i].resampled_buf);
@@ -5720,8 +5879,6 @@ static void hws_remove(struct pci_dev *pdev)
 	
 	if(dev->auwq)
 	{
-		for (i = 0; i < dev->m_nCurreMaxVideoChl; i++)
-			cancel_delayed_work_sync(&dev->audio[i].silence_work);
 		destroy_workqueue(dev->auwq);
 	}
 	dev->wq=NULL;
