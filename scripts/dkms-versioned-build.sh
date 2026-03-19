@@ -18,6 +18,7 @@ DRACUT_MODE="none"
 INITRD_PATH="${INITRD_PATH:-/boot/initramfs-linux-lts.img}"
 DRACUT_STRICT=0
 DRACUT_LAYOUT_USED="not-run"
+CURRENT_KERNEL="$(uname -r)"
 
 usage() {
   cat <<'USAGE'
@@ -318,6 +319,7 @@ echo "target_kernels=${TARGET_KERNELS[*]}"
 echo "dracut_mode=${DRACUT_MODE}"
 echo "dracut_strict=${DRACUT_STRICT}"
 echo "initrd_path=${INITRD_PATH}"
+echo "current_kernel=${CURRENT_KERNEL}"
 
 run dkms status | tee "${RUN_DIR}/dkms-status.before.txt" >/dev/null
 
@@ -378,25 +380,45 @@ if [[ "${PRUNE_OTHERS}" -eq 1 ]]; then
   done
 fi
 
+BUILD_RC=0
+CURRENT_KERNEL_INSTALLED=0
+declare -a SUCCEEDED_KERNELS=()
+declare -a FAILED_KERNELS=()
+
 for kver in "${TARGET_KERNELS[@]}"; do
-  run dkms build -m "${MODULE_NAME}" -v "${DKMS_VERSION}" -k "${kver}"
-  run dkms install -m "${MODULE_NAME}" -v "${DKMS_VERSION}" -k "${kver}" --force
+  if run dkms build -m "${MODULE_NAME}" -v "${DKMS_VERSION}" -k "${kver}" &&
+     run dkms install -m "${MODULE_NAME}" -v "${DKMS_VERSION}" -k "${kver}" --force; then
+    SUCCEEDED_KERNELS+=("${kver}")
+    if [[ "${kver}" == "${CURRENT_KERNEL}" ]]; then
+      CURRENT_KERNEL_INSTALLED=1
+    fi
+  else
+    echo "warning: dkms build/install failed for kernel ${kver}"
+    FAILED_KERNELS+=("${kver}")
+    BUILD_RC=1
+  fi
 done
+
+if [[ ${#SUCCEEDED_KERNELS[@]} -eq 0 ]]; then
+  echo "error: dkms build/install failed for all selected kernels"
+  exit 1
+fi
 
 run depmod -a
 
 if [[ "${DRACUT_MODE}" == "all" ]]; then
   run_dracut_all_for_selected_kernels || dracut_rc=$?
 elif [[ "${DRACUT_MODE}" == "current" ]]; then
-  dracut --force "${INITRD_PATH}" "$(uname -r)" || dracut_rc=$?
+  if [[ "${CURRENT_KERNEL_INSTALLED}" == "1" ]]; then
+    dracut --force "${INITRD_PATH}" "${CURRENT_KERNEL}" || dracut_rc=$?
+  else
+    echo "warning: skipping dracut for current kernel ${CURRENT_KERNEL} because its dkms build/install failed"
+    dracut_rc=8
+  fi
 fi
 dracut_rc="${dracut_rc:-0}"
 if [[ "${dracut_rc}" != "0" ]]; then
   echo "warning: dracut step failed with exit code ${dracut_rc}"
-  if [[ "${DRACUT_STRICT}" == "1" ]]; then
-    echo "error: --dracut-strict set, aborting"
-    exit "${dracut_rc}"
-  fi
 fi
 
 run dkms status | tee "${RUN_DIR}/dkms-status.after.txt" >/dev/null
@@ -421,6 +443,11 @@ MODINFO_FILENAME="$(modinfo "${MODULE_NAME}" 2>/dev/null | awk -F': *' '/^filena
   echo "dkms_version=${DKMS_VERSION}"
   echo "kernel_mode=${KERNEL_MODE}"
   echo "target_kernels=${TARGET_KERNELS[*]}"
+  echo "current_kernel=${CURRENT_KERNEL}"
+  echo "succeeded_kernels=${SUCCEEDED_KERNELS[*]}"
+  echo "failed_kernels=${FAILED_KERNELS[*]}"
+  echo "build_exit_code=${BUILD_RC}"
+  echo "current_kernel_installed=${CURRENT_KERNEL_INSTALLED}"
   echo "dracut_mode=${DRACUT_MODE}"
   echo "dracut_layout=${DRACUT_LAYOUT_USED}"
   echo "dracut_strict=${DRACUT_STRICT}"
@@ -443,13 +470,31 @@ MODINFO_FILENAME="$(modinfo "${MODULE_NAME}" 2>/dev/null | awk -F': *' '/^filena
 } | tee "${SUMMARY}"
 
 if [[ ! -f "${HISTORY}" ]]; then
-  echo -e "timestamp_utc\trun_id\tmodule\tversion\tkernel_mode\ttarget_kernels\tdracut_mode\tdracut_layout\tdracut_strict\tdracut_exit_code\tinitrd_path\tprune_others\tforce_reinstall\texisting_before\tgit_head\tgit_dirty\tmodinfo_srcversion\truntime_srcversion\trun_dir" > "${HISTORY}"
+  echo -e "timestamp_utc\trun_id\tmodule\tversion\tkernel_mode\ttarget_kernels\tcurrent_kernel\tsucceeded_kernels\tfailed_kernels\tbuild_exit_code\tdracut_mode\tdracut_layout\tdracut_strict\tdracut_exit_code\tinitrd_path\tprune_others\tforce_reinstall\texisting_before\tgit_head\tgit_dirty\tmodinfo_srcversion\truntime_srcversion\trun_dir" > "${HISTORY}"
 fi
-echo -e "$(date -u --iso-8601=seconds)\t${RUN_ID}\t${MODULE_NAME}\t${DKMS_VERSION}\t${KERNEL_MODE}\t${TARGET_KERNELS[*]}\t${DRACUT_MODE}\t${DRACUT_LAYOUT_USED}\t${DRACUT_STRICT}\t${dracut_rc}\t${INITRD_PATH}\t${PRUNE_OTHERS}\t${FORCE_REINSTALL}\t${EXISTING_VERSION}\t${GIT_HEAD}\t${GIT_DIRTY}\t${MODINFO_SRCVERSION:-unavailable}\t${RUNTIME_SRCVERSION}\t${RUN_DIR}" >> "${HISTORY}"
+echo -e "$(date -u --iso-8601=seconds)\t${RUN_ID}\t${MODULE_NAME}\t${DKMS_VERSION}\t${KERNEL_MODE}\t${TARGET_KERNELS[*]}\t${CURRENT_KERNEL}\t${SUCCEEDED_KERNELS[*]}\t${FAILED_KERNELS[*]}\t${BUILD_RC}\t${DRACUT_MODE}\t${DRACUT_LAYOUT_USED}\t${DRACUT_STRICT}\t${dracut_rc}\t${INITRD_PATH}\t${PRUNE_OTHERS}\t${FORCE_REINSTALL}\t${EXISTING_VERSION}\t${GIT_HEAD}\t${GIT_DIRTY}\t${MODINFO_SRCVERSION:-unavailable}\t${RUNTIME_SRCVERSION}\t${RUN_DIR}" >> "${HISTORY}"
 
-echo "done=1"
+OVERALL_RC=0
+if [[ "${BUILD_RC}" != "0" ]]; then
+  OVERALL_RC="${BUILD_RC}"
+fi
+if [[ "${dracut_rc}" != "0" && "${DRACUT_STRICT}" == "1" ]]; then
+  OVERALL_RC="${dracut_rc}"
+fi
+
+if [[ "${OVERALL_RC}" == "0" ]]; then
+  echo "done=1"
+else
+  echo "done=0"
+fi
 if [[ "${DRACUT_MODE}" == "none" ]]; then
   echo "next=Rebuild initramfs with dracut for the running kernel, then reboot."
+elif [[ "${CURRENT_KERNEL_INSTALLED}" == "1" ]]; then
+  echo "next=current-kernel dracut step executed; reboot when ready."
 else
-  echo "next=dracut step already executed by this run; reboot when ready."
+  echo "next=current kernel was not installed successfully; fix build failures before reboot."
+fi
+
+if [[ "${OVERALL_RC}" != "0" ]]; then
+  exit "${OVERALL_RC}"
 fi

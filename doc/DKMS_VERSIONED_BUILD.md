@@ -23,6 +23,11 @@ This workflow creates a unique DKMS module version per test run, logs what was b
   - classic GRUB-style `/boot/initramfs-*.img` hosts: rebuilds each selected kernel explicitly via
     `dracut --force /boot/initramfs-<pkgbase>.img <kver>`
   - kernel-install style hosts: falls back to `dracut --regenerate-all --force`
+- `--kernels all --dracut-current` now still rebuilds the running kernel's initramfs even if a
+  different installed kernel fails its DKMS build later in the run.
+- Per-run logs now record which kernels succeeded and which failed. The script exits non-zero on
+  partial DKMS failure, but only after logging the result and attempting the current-kernel dracut
+  step when possible.
 - dracut failures are still logged as warnings by default so DKMS install can succeed;
   use `--dracut-strict` to make dracut failure abort the script.
 
@@ -37,6 +42,9 @@ One-shot build + install + dracut for all kernels:
 
 ```bash
 sudo -E scripts/dkms-versioned-build.sh --kernels all --prune-others --dracut-all
+
+# rebuild only the running kernel's initramfs, but still build/install for all kernels
+sudo -E scripts/dkms-versioned-build.sh --kernels all --prune-others --dracut-current
 
 # keep all DKMS versions (not recommended for pacman hook stability)
 sudo -E scripts/dkms-versioned-build.sh --kernels all --keep-others
@@ -72,6 +80,10 @@ dkms status | rg HwsUHDX1Capture
 Expected:
 - `modinfo srcversion` matches `/sys/module/.../srcversion`.
 - `dkms status` shows the intended test version installed for your kernels.
+- If the script exited non-zero, inspect `dkms-build-logs/<run-id>/summary.env`:
+  - `succeeded_kernels=...`
+  - `failed_kernels=...`
+  - `current_kernel_installed=1` means the running kernel was still refreshed and is safe to reboot into.
 
 ## Rollback steps
 
