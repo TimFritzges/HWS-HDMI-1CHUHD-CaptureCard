@@ -2395,7 +2395,6 @@ static int _deliver_samples(struct hws_audio *drv, void *aud_data, u32 aud_len)
 	unsigned int wpos;
 	unsigned int period_size;
 	unsigned int period_used;
-	unsigned int wrapped_frames = 0;
 	bool diag = hws_diag_enabled();
 	int elapsed = 0;
 	u64 now_ns = ktime_get_ns();
@@ -2452,18 +2451,19 @@ static int _deliver_samples(struct hws_audio *drv, void *aud_data, u32 aud_len)
 		return -EAGAIN;
 	}
 
-	/* Keep newest data if a single packet exceeds ring capacity. */
+	/*
+	 * A single hardware burst must fit into the ALSA runtime buffer.
+	 * Truncating the packet here silently drops capture data and turns
+	 * low-quantum operation into a constant xrun source.
+	 */
 	if (frames > ring_size) {
-		unsigned int drop = frames - ring_size;
 		if (diag)
 			atomic64_inc(&hws_audio_diag[ch].oversized_packets);
-		src += drop * frame_bytes;
-		frames = ring_size;
-		aud_len = frames * frame_bytes;
+		return -ENOSPC;
 	}
 
 	if (wpos + frames > ring_size) {
-		wrapped_frames = ring_size - wpos;
+		unsigned int wrapped_frames = ring_size - wpos;
 		memcpy(dst + wpos * frame_bytes, src, wrapped_frames * frame_bytes);
 		memcpy(dst, src + wrapped_frames * frame_bytes, aud_len - wrapped_frames * frame_bytes);
 	} else {
@@ -2477,16 +2477,14 @@ static int _deliver_samples(struct hws_audio *drv, void *aud_data, u32 aud_len)
 	spin_unlock_irqrestore(&drv->ring_lock, flags);
 
 	if (elapsed && READ_ONCE(drv->substream) == substream) {
-		unsigned int i;
-
 		/*
-		 * A single DMA packet can cover multiple ALSA periods. Report each
-		 * elapsed period so low-quantum userspace does not undercount wakeups.
+		 * ALSA expects a single period_elapsed() notification per interrupt/
+		 * publication event even if the hardware pointer advanced across more
+		 * than one period since the previous callback.
 		 */
-		for (i = 0; i < elapsed; i++)
-			snd_pcm_period_elapsed(substream);
+		snd_pcm_period_elapsed(substream);
 		if (diag)
-			atomic64_add(elapsed, &hws_audio_diag[ch].period_elapsed_calls);
+			atomic64_inc(&hws_audio_diag[ch].period_elapsed_calls);
 	}
 
 	if (diag) {
@@ -4822,7 +4820,9 @@ static int hws_pcie_audio_open(struct snd_pcm_substream *substream)
 	unsigned int req_periods;
 	unsigned int req_period_max;
 	unsigned int req_buffer_max;
+	unsigned int req_buffer_min;
 	unsigned int req_period_count;
+	unsigned int packet_bytes;
 
 	
     drv->sample_rate_out        = 48000;
@@ -4858,6 +4858,10 @@ static int hws_pcie_audio_open(struct snd_pcm_substream *substream)
 		req_periods = 64U;
 	if (req_periods < 2U)
 		req_periods = 2U;
+	packet_bytes = hws_audio_effective_packet_bytes(drv, 0);
+	req_buffer_min = packet_bytes ? packet_bytes : req_period_bytes * 2U;
+	if (req_buffer_max < req_buffer_min)
+		req_buffer_max = req_buffer_min;
 
 	runtime->hw.period_bytes_min = req_period_bytes;
 	runtime->hw.period_bytes_max = req_period_max;
@@ -4868,7 +4872,9 @@ static int hws_pcie_audio_open(struct snd_pcm_substream *substream)
 		snd_pcm_hw_constraint_list(runtime, 0, SNDRV_PCM_HW_PARAM_PERIOD_BYTES,
 					 &drv->period_bytes_constraint);
 	snd_pcm_hw_constraint_integer(runtime, SNDRV_PCM_HW_PARAM_PERIODS);
-    WRITE_ONCE(drv->substream, substream);
+	snd_pcm_hw_constraint_minmax(runtime, SNDRV_PCM_HW_PARAM_BUFFER_BYTES,
+				      req_buffer_min, req_buffer_max);
+	WRITE_ONCE(drv->substream, substream);
 	WRITE_ONCE(drv->last_irq_ns, 0);
 	WRITE_ONCE(drv->last_copy_ns, 0);
 	WRITE_ONCE(drv->last_progress_ns, 0);
@@ -4911,11 +4917,23 @@ static int hws_pcie_audio_prepare(struct snd_pcm_substream *substream)
 {
 	struct snd_pcm_runtime *runtime = substream->runtime;
 	struct hws_audio *drv = snd_pcm_substream_chip(substream);
+	unsigned int frame_bytes;
+	unsigned int packet_frames;
 	//struct hws_pcie_dev *dev= drv->dev;
 	//int i;
 	unsigned long flags;
 	//printk(KERN_INFO "%s() index:%x\n",__func__,drv->index);
-	
+
+	frame_bytes = hws_audio_frame_bytes(drv);
+	packet_frames = 0;
+	if (frame_bytes)
+		packet_frames = hws_audio_effective_packet_bytes(drv, 0) / frame_bytes;
+	if (packet_frames && runtime->buffer_size < packet_frames) {
+		pr_err("hws: runtime buffer too small ch=%d buffer=%lu packet=%u frames\n",
+		       drv->index, runtime->buffer_size, packet_frames);
+		return -EINVAL;
+	}
+
 	spin_lock_irqsave(&drv->ring_lock, flags);
     drv->ring_size_byframes = runtime->buffer_size;
     drv->ring_wpos_byframes = 0;
