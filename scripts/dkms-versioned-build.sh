@@ -359,14 +359,36 @@ run sed -i "s/^AUTOINSTALL=.*/AUTOINSTALL=\"yes\"/" "${DKMS_SRC}/dkms.conf"
 run dkms add -m "${MODULE_NAME}" -v "${DKMS_VERSION}"
 
 list_module_versions() {
-  dkms status | awk -v mod="${MODULE_NAME}" '
-    {
-      split($1, a, "/");
-      if (a[1] != mod) next;
-      v = a[2];
-      sub(/[:,].*$/, "", v);
-      if (v != "") print v;
-    }' | sort -u
+  {
+    dkms status 2>/dev/null | awk -v mod="${MODULE_NAME}" '
+      {
+        split($1, a, "/");
+        if (a[1] != mod) next;
+        v = a[2];
+        sub(/[:,].*$/, "", v);
+        if (v != "") print v;
+      }'
+
+    if [[ -d "/var/lib/dkms/${MODULE_NAME}" ]]; then
+      find "/var/lib/dkms/${MODULE_NAME}" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' 2>/dev/null || true
+    fi
+
+    find /usr/src -mindepth 1 -maxdepth 1 -type d -name "${MODULE_NAME}-*" -printf '%f\n' 2>/dev/null \
+      | sed "s#^${MODULE_NAME}-##"
+  } | sed '/^$/d' | sort -u
+}
+
+purge_version_paths() {
+  local version="${1}"
+  local dkms_dir="/var/lib/dkms/${MODULE_NAME}/${version}"
+  local src_dir="/usr/src/${MODULE_NAME}-${version}"
+
+  if [[ -d "${dkms_dir}" ]]; then
+    run rm -rf "${dkms_dir}"
+  fi
+  if [[ -d "${src_dir}" ]]; then
+    run rm -rf "${src_dir}"
+  fi
 }
 
 if [[ "${PRUNE_OTHERS}" -eq 1 ]]; then
@@ -377,6 +399,7 @@ if [[ "${PRUNE_OTHERS}" -eq 1 ]]; then
   for oldv in "${OTHER_VERSIONS[@]:-}"; do
     [[ -n "${oldv}" ]] || continue
     run dkms remove -m "${MODULE_NAME}" -v "${oldv}" --all || true
+    purge_version_paths "${oldv}"
   done
 fi
 

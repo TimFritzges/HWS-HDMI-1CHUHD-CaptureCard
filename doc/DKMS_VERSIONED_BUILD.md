@@ -19,6 +19,12 @@ This workflow creates a unique DKMS module version per test run, logs what was b
 - Appends history row in `dkms-build-logs/history.tsv`.
 - By default, old DKMS versions are pruned so kernel updates rebuild only one active version.
   Use `--keep-others` to opt out.
+- `--prune-others` now prunes by scanning all three places that matter for future pacman hooks:
+  - `dkms status`
+  - `/var/lib/dkms/HwsUHDX1Capture/`
+  - `/usr/src/HwsUHDX1Capture-*`
+  This removes stale versions that were no longer visible enough through `dkms status` alone
+  but still got picked up later by Garuda's DKMS post-transaction hook.
 - `--dracut-all` now detects the host boot layout:
   - classic GRUB-style `/boot/initramfs-*.img` hosts: rebuilds each selected kernel explicitly via
     `dracut --force /boot/initramfs-<pkgbase>.img <kver>`
