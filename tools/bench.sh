@@ -122,34 +122,22 @@ audio_diag_delta_from_snapshots() {
     }
     FNR == 1 {
       delete after_idx
-      for (i = 1; i <= NF; i++)
+      for (i = 1; i <= NF; i++) {
         after_idx[$i] = i
-      print "ch delta_work_runs delta_buffers_found delta_delivered_bytes delta_delivered_frames delta_period_elapsed delta_oversized_packets delta_drop_no_substream delta_drop_bad_runtime delta_drop_ring_not_ready delta_no_video_silence_injects delta_fallback_silence_injects delta_timer_silence_injects delta_no_free_queue_slots delta_memcopy_failures delta_bad_packet_sizes delta_workqueue_requeues delta_stream_not_running delta_timer_runs delta_delivery_errors"
+        after_names[i] = $i
+      }
+      printf "ch"
+      for (i = 2; i <= NF; i++)
+        printf " delta_%s", after_names[i]
+      printf "\n"
       next
     }
     {
       ch = $1
-      printf "%s %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d\n",
-        ch,
-        (current_value("work_runs") - before_value(ch, "work_runs")),
-        (current_value("buffers_found") - before_value(ch, "buffers_found")),
-        (current_value("delivered_bytes") - before_value(ch, "delivered_bytes")),
-        (current_value("delivered_frames") - before_value(ch, "delivered_frames")),
-        (current_value("period_elapsed") - before_value(ch, "period_elapsed")),
-        (current_value("oversized_packets") - before_value(ch, "oversized_packets")),
-        (current_value("drop_no_substream") - before_value(ch, "drop_no_substream")),
-        (current_value("drop_bad_runtime") - before_value(ch, "drop_bad_runtime")),
-        (current_value("drop_ring_not_ready") - before_value(ch, "drop_ring_not_ready")),
-        (current_value("no_video_silence_injects") - before_value(ch, "no_video_silence_injects")),
-        (current_value("fallback_silence_injects") - before_value(ch, "fallback_silence_injects")),
-        (current_value("timer_silence_injects") - before_value(ch, "timer_silence_injects")),
-        (current_value("no_free_queue_slots") - before_value(ch, "no_free_queue_slots")),
-        (current_value("memcopy_failures") - before_value(ch, "memcopy_failures")),
-        (current_value("bad_packet_sizes") - before_value(ch, "bad_packet_sizes")),
-        (current_value("workqueue_requeues") - before_value(ch, "workqueue_requeues")),
-        (current_value("stream_not_running") - before_value(ch, "stream_not_running")),
-        (current_value("timer_runs") - before_value(ch, "timer_runs")),
-        (current_value("delivery_errors") - before_value(ch, "delivery_errors"))
+      printf "%s", ch
+      for (i = 2; i <= NF; i++)
+        printf " %d", (current_value(after_names[i]) - before_value(ch, after_names[i]))
+      printf "\n"
     }
   ' "${before_file}" "${after_file}" > "${out_file}" || true
 }

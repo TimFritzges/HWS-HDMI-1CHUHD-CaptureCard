@@ -113,6 +113,17 @@ struct hws_audio_diag_stats {
 	atomic64_t queue_free_slots_total;
 	atomic64_t queue_free_slots_samples;
 	atomic64_t delivery_errors;
+	atomic64_t real_periods;
+	atomic64_t silence_periods;
+	atomic64_t underrun_periods;
+	atomic64_t source_lost_periods;
+	atomic64_t staged_overruns;
+	atomic64_t staged_bytes_dropped;
+	atomic64_t timer_late_events;
+	atomic64_t timer_late_ns_max;
+	atomic64_t pcm_running;
+	atomic64_t staged_fill_bytes_min;
+	atomic64_t staged_fill_bytes_max;
 };
 
 struct hws_diag_stats {
@@ -188,17 +199,28 @@ static inline void hws_diag_reset(void)
 		atomic64_set(&hws_audio_diag[i].irq_to_copy_samples, 0);
 		atomic64_set(&hws_audio_diag[i].copy_to_deliver_ns_total, 0);
 		atomic64_set(&hws_audio_diag[i].copy_to_deliver_ns_max, 0);
-		atomic64_set(&hws_audio_diag[i].copy_to_deliver_samples, 0);
-		atomic64_set(&hws_audio_diag[i].irq_to_deliver_ns_total, 0);
-		atomic64_set(&hws_audio_diag[i].irq_to_deliver_ns_max, 0);
-		atomic64_set(&hws_audio_diag[i].irq_to_deliver_samples, 0);
-		atomic64_set(&hws_audio_diag[i].queue_free_slots_min, MAX_AUDIO_QUEUE);
-		atomic64_set(&hws_audio_diag[i].queue_free_slots_max, 0);
-		atomic64_set(&hws_audio_diag[i].queue_free_slots_total, 0);
-		atomic64_set(&hws_audio_diag[i].queue_free_slots_samples, 0);
-		atomic64_set(&hws_audio_diag[i].delivery_errors, 0);
+			atomic64_set(&hws_audio_diag[i].copy_to_deliver_samples, 0);
+			atomic64_set(&hws_audio_diag[i].irq_to_deliver_ns_total, 0);
+			atomic64_set(&hws_audio_diag[i].irq_to_deliver_ns_max, 0);
+			atomic64_set(&hws_audio_diag[i].irq_to_deliver_samples, 0);
+			atomic64_set(&hws_audio_diag[i].queue_free_slots_min, MAX_AUDIO_QUEUE);
+			atomic64_set(&hws_audio_diag[i].queue_free_slots_max, 0);
+			atomic64_set(&hws_audio_diag[i].queue_free_slots_total, 0);
+			atomic64_set(&hws_audio_diag[i].queue_free_slots_samples, 0);
+			atomic64_set(&hws_audio_diag[i].delivery_errors, 0);
+			atomic64_set(&hws_audio_diag[i].real_periods, 0);
+			atomic64_set(&hws_audio_diag[i].silence_periods, 0);
+			atomic64_set(&hws_audio_diag[i].underrun_periods, 0);
+			atomic64_set(&hws_audio_diag[i].source_lost_periods, 0);
+			atomic64_set(&hws_audio_diag[i].staged_overruns, 0);
+			atomic64_set(&hws_audio_diag[i].staged_bytes_dropped, 0);
+			atomic64_set(&hws_audio_diag[i].timer_late_events, 0);
+			atomic64_set(&hws_audio_diag[i].timer_late_ns_max, 0);
+			atomic64_set(&hws_audio_diag[i].pcm_running, 0);
+			atomic64_set(&hws_audio_diag[i].staged_fill_bytes_min, S64_MAX);
+			atomic64_set(&hws_audio_diag[i].staged_fill_bytes_max, 0);
+		}
 	}
-}
 
 static inline void hws_diag_update_max(atomic64_t *slot, u64 value)
 {
@@ -245,6 +267,14 @@ static inline void hws_audio_diag_record_queue_free(int ch, u32 free_slots)
 	hws_diag_update_max(&hws_audio_diag[ch].queue_free_slots_max, free_slots);
 	atomic64_add((s64)free_slots, &hws_audio_diag[ch].queue_free_slots_total);
 	atomic64_inc(&hws_audio_diag[ch].queue_free_slots_samples);
+}
+
+static inline void hws_audio_diag_record_staged_fill(int ch, u32 fill_bytes)
+{
+	if (ch < 0 || ch >= MAX_VID_CHANNELS)
+		return;
+	hws_diag_update_min(&hws_audio_diag[ch].staged_fill_bytes_min, fill_bytes);
+	hws_diag_update_max(&hws_audio_diag[ch].staged_fill_bytes_max, fill_bytes);
 }
 
 static inline u32 hws_audio_frame_bytes(const struct hws_audio *drv)
@@ -318,7 +348,7 @@ static unsigned long hws_audio_fallback_delay_jiffies(struct hws_audio *drv, u32
 }
 
 static unsigned int hws_audio_init_period_constraints(struct hws_audio *drv,
-						      unsigned int min_period_bytes)
+							      unsigned int min_period_bytes)
 {
 	unsigned int packet_bytes;
 	unsigned int frame_bytes;
@@ -362,6 +392,12 @@ static unsigned int hws_audio_init_period_constraints(struct hws_audio *drv,
 	return count;
 }
 
+enum hws_audio_silence_reason {
+	HWS_AUDIO_SILENCE_NO_VIDEO = 0,
+	HWS_AUDIO_SILENCE_FALLBACK,
+	HWS_AUDIO_SILENCE_TIMER,
+};
+
 static int _deliver_samples(struct hws_audio *drv, void *aud_data, u32 aud_len);
 
 static void hws_audio_publish_timer_init(struct hrtimer *timer,
@@ -388,7 +424,7 @@ static bool hws_audio_stream_active(struct hws_audio *drv)
 	if (!pdx || ch < 0 || ch >= MAX_VID_CHANNELS)
 		return false;
 
-	return READ_ONCE(pdx->m_bAudioRun[ch]) && READ_ONCE(pdx->m_bACapStarted[ch]);
+	return READ_ONCE(drv->pcm_running);
 }
 
 static void hws_audio_reset_stage(struct hws_audio *drv)
@@ -401,24 +437,45 @@ static void hws_audio_reset_stage(struct hws_audio *drv)
 	drv->staged_fill_bytes = 0;
 	drv->publish_timer_armed = false;
 	spin_unlock_irqrestore(&drv->ring_lock, flags);
+	WRITE_ONCE(drv->last_timer_fire_ns, 0);
 }
 
 static int hws_audio_stage_bytes(struct hws_audio *drv, const u8 *src, u32 aud_len)
 {
 	unsigned long flags;
+	u32 free_bytes;
 	u32 first;
+	u32 drop_bytes;
+	u32 frame_bytes;
 	u8 *stage;
+	int ch;
 
 	if (!drv || !src || !aud_len || !drv->resampled_buf || !drv->resampled_buf_size)
 		return -EINVAL;
 	if (aud_len > drv->resampled_buf_size)
 		return -ENOSPC;
+	ch = drv->index;
+	frame_bytes = hws_audio_frame_bytes(drv);
+	if (frame_bytes && aud_len % frame_bytes)
+		aud_len -= aud_len % frame_bytes;
+	if (!aud_len)
+		return -EINVAL;
 
 	stage = drv->resampled_buf;
 	spin_lock_irqsave(&drv->ring_lock, flags);
-	if (drv->staged_fill_bytes > drv->resampled_buf_size - aud_len) {
-		spin_unlock_irqrestore(&drv->ring_lock, flags);
-		return -ENOSPC;
+	free_bytes = drv->resampled_buf_size - drv->staged_fill_bytes;
+	if (free_bytes < aud_len) {
+		drop_bytes = aud_len - free_bytes;
+		if (frame_bytes && drop_bytes % frame_bytes)
+			drop_bytes += frame_bytes - (drop_bytes % frame_bytes);
+		if (drop_bytes > drv->staged_fill_bytes)
+			drop_bytes = drv->staged_fill_bytes;
+		drv->staged_rpos_bytes = (drv->staged_rpos_bytes + drop_bytes) % drv->resampled_buf_size;
+		drv->staged_fill_bytes -= drop_bytes;
+		if (hws_diag_enabled() && ch >= 0 && ch < MAX_VID_CHANNELS) {
+			atomic64_inc(&hws_audio_diag[ch].staged_overruns);
+			atomic64_add(drop_bytes, &hws_audio_diag[ch].staged_bytes_dropped);
+		}
 	}
 
 	first = min(aud_len, drv->resampled_buf_size - drv->staged_wpos_bytes);
@@ -428,6 +485,8 @@ static int hws_audio_stage_bytes(struct hws_audio *drv, const u8 *src, u32 aud_l
 
 	drv->staged_wpos_bytes = (drv->staged_wpos_bytes + aud_len) % drv->resampled_buf_size;
 	drv->staged_fill_bytes += aud_len;
+	if (hws_diag_enabled())
+		hws_audio_diag_record_staged_fill(ch, drv->staged_fill_bytes);
 	spin_unlock_irqrestore(&drv->ring_lock, flags);
 
 	return 0;
@@ -438,7 +497,14 @@ static int hws_audio_publish_one_period(struct hws_audio *drv)
 	unsigned long flags;
 	u32 aud_len;
 	u32 first;
+	u32 copied = 0;
+	u64 now_ns;
+	u64 last_irq_ns;
+	u64 packet_ns;
 	u8 *stage;
+	bool diag;
+	bool source_lost = false;
+	int ch;
 
 	if (!drv || !drv->resampled_buf)
 		return -EINVAL;
@@ -446,22 +512,52 @@ static int hws_audio_publish_one_period(struct hws_audio *drv)
 	aud_len = READ_ONCE(drv->publish_chunk_bytes);
 	if (!aud_len)
 		return -EINVAL;
+	if (aud_len > sizeof(drv->publish_scratch))
+		return -EMSGSIZE;
 
+	ch = drv->index;
+	diag = hws_diag_enabled() && ch >= 0 && ch < MAX_VID_CHANNELS;
+	now_ns = ktime_get_ns();
+	last_irq_ns = READ_ONCE(drv->last_irq_ns);
+	packet_ns = hws_audio_packet_duration_ns(drv, aud_len);
 	stage = drv->resampled_buf;
+	memset(drv->publish_scratch, 0, aud_len);
+
 	spin_lock_irqsave(&drv->ring_lock, flags);
-	if (drv->staged_fill_bytes < aud_len) {
-		spin_unlock_irqrestore(&drv->ring_lock, flags);
-		return 0;
+	copied = min(aud_len, drv->staged_fill_bytes);
+	if (copied) {
+		first = min(copied, drv->resampled_buf_size - drv->staged_rpos_bytes);
+		memcpy(drv->publish_scratch, stage + drv->staged_rpos_bytes, first);
+		if (first < copied)
+			memcpy(drv->publish_scratch + first, stage, copied - first);
+
+		drv->staged_rpos_bytes = (drv->staged_rpos_bytes + copied) % drv->resampled_buf_size;
+		drv->staged_fill_bytes -= copied;
 	}
-
-	first = min(aud_len, drv->resampled_buf_size - drv->staged_rpos_bytes);
-	memcpy(drv->publish_scratch, stage + drv->staged_rpos_bytes, first);
-	if (first < aud_len)
-		memcpy(drv->publish_scratch + first, stage, aud_len - first);
-
-	drv->staged_rpos_bytes = (drv->staged_rpos_bytes + aud_len) % drv->resampled_buf_size;
-	drv->staged_fill_bytes -= aud_len;
+	if (diag)
+		hws_audio_diag_record_staged_fill(ch, drv->staged_fill_bytes);
 	spin_unlock_irqrestore(&drv->ring_lock, flags);
+
+	if (diag) {
+		if (copied == aud_len) {
+			atomic64_inc(&hws_audio_diag[ch].real_periods);
+		} else {
+			if (copied)
+				atomic64_inc(&hws_audio_diag[ch].underrun_periods);
+			else
+				atomic64_inc(&hws_audio_diag[ch].silence_periods);
+			if (!last_irq_ns || READ_ONCE(drv->dev->m_curr_No_Video[ch]) ||
+			    (packet_ns && now_ns > last_irq_ns && now_ns - last_irq_ns > packet_ns * 4))
+				source_lost = true;
+			if (source_lost)
+				atomic64_inc(&hws_audio_diag[ch].source_lost_periods);
+			atomic64_inc(&hws_audio_diag[ch].timer_silence_injects);
+		}
+	}
+	if (copied < aud_len && hws_audio_trace_enabled())
+		trace_printk("hws_audio_silence ch=%d bytes=%u real=%u reason=%s\n",
+			     ch, aud_len - copied, copied,
+			     source_lost ? "source_lost" : "underrun");
 
 	return _deliver_samples(drv, drv->publish_scratch, aud_len);
 }
@@ -469,11 +565,14 @@ static int hws_audio_publish_one_period(struct hws_audio *drv)
 static void hws_audio_arm_publish_timer(struct hws_audio *drv)
 {
 	unsigned long flags;
-	bool have_more = false;
+	ktime_t interval;
 
 	if (!drv || !READ_ONCE(drv->publish_chunk_bytes))
 		return;
 	if (!hws_audio_stream_active(drv))
+		return;
+	interval = READ_ONCE(drv->publish_interval);
+	if (!ktime_to_ns(interval))
 		return;
 
 	spin_lock_irqsave(&drv->ring_lock, flags);
@@ -483,30 +582,22 @@ static void hws_audio_arm_publish_timer(struct hws_audio *drv)
 	}
 	drv->publish_timer_armed = true;
 	spin_unlock_irqrestore(&drv->ring_lock, flags);
-
-	if (hws_audio_publish_one_period(drv) < 0) {
-		spin_lock_irqsave(&drv->ring_lock, flags);
-		drv->publish_timer_armed = false;
-		spin_unlock_irqrestore(&drv->ring_lock, flags);
-		return;
-	}
-
-	spin_lock_irqsave(&drv->ring_lock, flags);
-	if (drv->staged_fill_bytes >= drv->publish_chunk_bytes)
-		have_more = true;
-	if (!have_more)
-		drv->publish_timer_armed = false;
-	spin_unlock_irqrestore(&drv->ring_lock, flags);
-
-	if (have_more)
-		hrtimer_start(&drv->publish_timer, drv->publish_interval, HRTIMER_MODE_REL);
+	hrtimer_start(&drv->publish_timer, interval, HRTIMER_MODE_REL);
 }
 
 static enum hrtimer_restart hws_audio_publish_timer_fn(struct hrtimer *timer)
 {
 	struct hws_audio *drv = container_of(timer, struct hws_audio, publish_timer);
 	unsigned long flags;
-	bool have_more = false;
+	ktime_t interval;
+	u64 now_ns;
+	u64 last_ns;
+	u64 interval_ns;
+	int ch = drv->index;
+	bool diag = hws_diag_enabled() && ch >= 0 && ch < MAX_VID_CHANNELS;
+
+	if (diag)
+		atomic64_inc(&hws_audio_diag[ch].timer_runs);
 
 	if (!hws_audio_stream_active(drv)) {
 		spin_lock_irqsave(&drv->ring_lock, flags);
@@ -515,6 +606,24 @@ static enum hrtimer_restart hws_audio_publish_timer_fn(struct hrtimer *timer)
 		return HRTIMER_NORESTART;
 	}
 
+	interval = READ_ONCE(drv->publish_interval);
+	interval_ns = ktime_to_ns(interval);
+	if (!interval_ns) {
+		spin_lock_irqsave(&drv->ring_lock, flags);
+		drv->publish_timer_armed = false;
+		spin_unlock_irqrestore(&drv->ring_lock, flags);
+		return HRTIMER_NORESTART;
+	}
+
+	now_ns = ktime_get_ns();
+	last_ns = READ_ONCE(drv->last_timer_fire_ns);
+	if (diag && last_ns && now_ns > last_ns + interval_ns + interval_ns / 2) {
+		atomic64_inc(&hws_audio_diag[ch].timer_late_events);
+		hws_diag_update_max(&hws_audio_diag[ch].timer_late_ns_max,
+				    now_ns - last_ns - interval_ns);
+	}
+	WRITE_ONCE(drv->last_timer_fire_ns, now_ns);
+
 	if (hws_audio_publish_one_period(drv) < 0) {
 		spin_lock_irqsave(&drv->ring_lock, flags);
 		drv->publish_timer_armed = false;
@@ -522,25 +631,9 @@ static enum hrtimer_restart hws_audio_publish_timer_fn(struct hrtimer *timer)
 		return HRTIMER_NORESTART;
 	}
 
-	spin_lock_irqsave(&drv->ring_lock, flags);
-	if (drv->staged_fill_bytes >= drv->publish_chunk_bytes)
-		have_more = true;
-	if (!have_more)
-		drv->publish_timer_armed = false;
-	spin_unlock_irqrestore(&drv->ring_lock, flags);
-
-	if (!have_more)
-		return HRTIMER_NORESTART;
-
-	hrtimer_forward_now(timer, drv->publish_interval);
+	hrtimer_forward_now(timer, interval);
 	return HRTIMER_RESTART;
 }
-
-enum hws_audio_silence_reason {
-	HWS_AUDIO_SILENCE_NO_VIDEO = 0,
-	HWS_AUDIO_SILENCE_FALLBACK,
-	HWS_AUDIO_SILENCE_TIMER,
-};
 
 static int hws_diag_show(struct seq_file *m, void *unused)
 {
@@ -582,9 +675,12 @@ static int hws_audio_diag_show(struct seq_file *m, void *unused)
 {
 	int i;
 
-	seq_puts(m, "ch work_runs buffers_found delivered_bytes delivered_frames period_elapsed oversized_packets drop_no_substream drop_bad_runtime drop_ring_not_ready no_video_silence_injects fallback_silence_injects timer_silence_injects no_free_queue_slots memcopy_failures bad_packet_sizes workqueue_requeues stream_not_running timer_runs irq_to_copy_ns_total irq_to_copy_ns_max irq_to_copy_samples copy_to_deliver_ns_total copy_to_deliver_ns_max copy_to_deliver_samples irq_to_deliver_ns_total irq_to_deliver_ns_max irq_to_deliver_samples queue_free_slots_min queue_free_slots_max queue_free_slots_total queue_free_slots_samples delivery_errors\n");
+	seq_puts(m, "ch work_runs buffers_found delivered_bytes delivered_frames period_elapsed oversized_packets drop_no_substream drop_bad_runtime drop_ring_not_ready no_video_silence_injects fallback_silence_injects timer_silence_injects no_free_queue_slots memcopy_failures bad_packet_sizes workqueue_requeues stream_not_running timer_runs irq_to_copy_ns_total irq_to_copy_ns_max irq_to_copy_samples copy_to_deliver_ns_total copy_to_deliver_ns_max copy_to_deliver_samples irq_to_deliver_ns_total irq_to_deliver_ns_max irq_to_deliver_samples queue_free_slots_min queue_free_slots_max queue_free_slots_total queue_free_slots_samples delivery_errors real_periods silence_periods underrun_periods source_lost_periods staged_overruns staged_bytes_dropped timer_late_events timer_late_ns_max pcm_running staged_fill_bytes_min staged_fill_bytes_max\n");
 	for (i = 0; i < MAX_VID_CHANNELS; i++) {
-		seq_printf(m, "%d %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld\n",
+		long long staged_min = atomic64_read(&hws_audio_diag[i].staged_fill_bytes_min);
+		if (staged_min == S64_MAX)
+			staged_min = 0;
+		seq_printf(m, "%d %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld\n",
 			i,
 			(long long)atomic64_read(&hws_audio_diag[i].work_runs),
 			(long long)atomic64_read(&hws_audio_diag[i].buffers_found),
@@ -617,7 +713,18 @@ static int hws_audio_diag_show(struct seq_file *m, void *unused)
 			(long long)atomic64_read(&hws_audio_diag[i].queue_free_slots_max),
 			(long long)atomic64_read(&hws_audio_diag[i].queue_free_slots_total),
 			(long long)atomic64_read(&hws_audio_diag[i].queue_free_slots_samples),
-			(long long)atomic64_read(&hws_audio_diag[i].delivery_errors));
+			(long long)atomic64_read(&hws_audio_diag[i].delivery_errors),
+			(long long)atomic64_read(&hws_audio_diag[i].real_periods),
+			(long long)atomic64_read(&hws_audio_diag[i].silence_periods),
+			(long long)atomic64_read(&hws_audio_diag[i].underrun_periods),
+			(long long)atomic64_read(&hws_audio_diag[i].source_lost_periods),
+			(long long)atomic64_read(&hws_audio_diag[i].staged_overruns),
+			(long long)atomic64_read(&hws_audio_diag[i].staged_bytes_dropped),
+			(long long)atomic64_read(&hws_audio_diag[i].timer_late_events),
+			(long long)atomic64_read(&hws_audio_diag[i].timer_late_ns_max),
+			(long long)atomic64_read(&hws_audio_diag[i].pcm_running),
+			staged_min,
+			(long long)atomic64_read(&hws_audio_diag[i].staged_fill_bytes_max));
 	}
 
 	return 0;
@@ -2369,8 +2476,7 @@ static const struct vb2_ops hwspcie_video_qops = {
 	.buf_prepare  = hws_buffer_prepare,
 	.buf_finish = hws_buffer_finish,
 	.buf_queue    = hws_buffer_queue,
-	.wait_prepare = vb2_ops_wait_prepare,
-	.wait_finish = vb2_ops_wait_finish,
+	HWS_VB2_WAIT_OPS
 	.start_streaming = hws_start_streaming,
 	.stop_streaming = hws_stop_streaming,
 };
@@ -2495,8 +2601,7 @@ static const struct vb2_ops hwspcie_video_multi_qops = {
     .buf_prepare    = hws_buffer_prepare_multi,
     .buf_finish     = hws_buffer_finish,
     .buf_queue      = hws_buffer_queue_multi,
-    .wait_prepare   = vb2_ops_wait_prepare,
-    .wait_finish    = vb2_ops_wait_finish,
+    HWS_VB2_WAIT_OPS
     .start_streaming= hws_start_streaming_multi,
     .stop_streaming = hws_stop_streaming_multi,
 };
@@ -2684,21 +2789,19 @@ static void hws_inject_silence_packet(struct hws_pcie_dev *pdx, int dwAudioCh,
 				      unsigned int packet_bytes, enum hws_audio_silence_reason reason)
 {
 	struct hws_audio *drv;
-	static const u8 silence_chunk[MAX_DMA_AUDIO_PK_SIZE] = { 0 };
 
 	if (dwAudioCh < 0 || dwAudioCh >= MAX_VID_CHANNELS)
 		return;
 
 	drv = &pdx->audio[dwAudioCh];
 	packet_bytes = hws_audio_effective_packet_bytes(drv, packet_bytes);
-	if (!packet_bytes || packet_bytes > sizeof(silence_chunk))
+	if (!packet_bytes)
 		return;
 
-	if (hws_audio_stage_bytes(drv, silence_chunk, packet_bytes) < 0) {
-		if (hws_diag_enabled())
-			atomic64_inc(&hws_audio_diag[dwAudioCh].delivery_errors);
-		return;
-	}
+	/*
+	 * Silence is now generated by the ALSA period timer. Queueing zeroes in
+	 * the staging FIFO hides real-data pressure and can grow latency.
+	 */
 	hws_audio_arm_publish_timer(drv);
 
 	if (hws_diag_enabled()) {
@@ -5031,6 +5134,8 @@ static int hws_pcie_audio_open(struct snd_pcm_substream *substream)
 	WRITE_ONCE(drv->last_irq_ns, 0);
 	WRITE_ONCE(drv->last_copy_ns, 0);
 	WRITE_ONCE(drv->last_progress_ns, 0);
+	WRITE_ONCE(drv->last_timer_fire_ns, 0);
+	WRITE_ONCE(drv->pcm_running, false);
 	//snd_pcm_hw_constraint_minmax(runtime,SNDRV_PCM_HW_PARAM_RATE,setrate,setrate);
 	return 0;
 }
@@ -5045,6 +5150,7 @@ static int hws_pcie_audio_close(struct snd_pcm_substream *substream)
 	cancel_work_sync(&drv->audiowork);
 	hws_audio_reset_stage(drv);
 	spin_lock_irqsave(&drv->ring_lock, flags);
+	drv->pcm_running = false;
 	drv->ring_wpos_byframes = 0;
 	drv->period_used_byframes = 0;
 	drv->ring_size_byframes = 0;
@@ -5055,6 +5161,9 @@ static int hws_pcie_audio_close(struct snd_pcm_substream *substream)
 	WRITE_ONCE(drv->last_irq_ns, 0);
 	WRITE_ONCE(drv->last_copy_ns, 0);
 	WRITE_ONCE(drv->last_progress_ns, 0);
+	WRITE_ONCE(drv->last_timer_fire_ns, 0);
+	if (hws_diag_enabled() && drv->index >= 0 && drv->index < MAX_VID_CHANNELS)
+		atomic64_set(&hws_audio_diag[drv->index].pcm_running, 0);
 	WRITE_ONCE(drv->substream, NULL);
 	return 0;
 } 
@@ -5094,16 +5203,17 @@ static int hws_pcie_audio_prepare(struct snd_pcm_substream *substream)
 	spin_lock_irqsave(&drv->ring_lock, flags);
     drv->ring_size_byframes = runtime->buffer_size;
     drv->ring_wpos_byframes = 0;
-    drv->period_size_byframes = runtime->period_size;
-    drv->period_used_byframes = 0;
+	drv->period_size_byframes = runtime->period_size;
+	drv->period_used_byframes = 0;
 	drv->ring_offsize =0;
 	drv->ring_over_size =0;
 	WRITE_ONCE(drv->last_irq_ns, 0);
 	WRITE_ONCE(drv->last_copy_ns, 0);
 	WRITE_ONCE(drv->last_progress_ns, 0);
+	WRITE_ONCE(drv->last_timer_fire_ns, 0);
 	drv->publish_chunk_bytes = runtime->period_size * frame_bytes;
 	drv->publish_interval = ns_to_ktime(hws_audio_packet_duration_ns(drv, drv->publish_chunk_bytes));
-    spin_unlock_irqrestore(&drv->ring_lock, flags);
+	spin_unlock_irqrestore(&drv->ring_lock, flags);
 	hws_audio_reset_stage(drv);
 	hrtimer_cancel(&drv->publish_timer);
 	
@@ -5131,20 +5241,26 @@ static int hws_pcie_audio_trigger(struct snd_pcm_substream *substream, int cmd)
 		spin_lock_irqsave(&chip->ring_lock, flags);
 		chip->ring_wpos_byframes = 0;
 		chip->period_used_byframes = 0;
+		chip->pcm_running = true;
 		spin_unlock_irqrestore(&chip->ring_lock, flags);
 		WRITE_ONCE(chip->last_irq_ns, 0);
 		WRITE_ONCE(chip->last_copy_ns, 0);
 		WRITE_ONCE(chip->last_progress_ns, ktime_get_ns());
+		WRITE_ONCE(chip->last_timer_fire_ns, 0);
+		if (hws_diag_enabled() && chip->index >= 0 && chip->index < MAX_VID_CHANNELS)
+			atomic64_set(&hws_audio_diag[chip->index].pcm_running, 1);
 		cancel_delayed_work(&chip->silence_work);
 		StartAudioCapture(dev, chip->index);
-		queue_delayed_work(dev->auwq, &chip->silence_work,
-				   hws_audio_fallback_delay_jiffies(chip, 0));
+		hws_audio_arm_publish_timer(chip);
 		break;
 	case SNDRV_PCM_TRIGGER_STOP:
 		//stop dma
 		//HWS_PCIE_WRITE(HWS_INT_BASE, HWS_DMA_MASK(chip->index), 0x000000000);
 		//HWS_PCIE_WRITE(HWS_DMA_BASE(chip->index), HWS_DMA_START, 0x00000000);
 		//printk(KERN_INFO "SNDRV_PCM_TRIGGER_STOP index:%x\n",chip->index);
+		WRITE_ONCE(chip->pcm_running, false);
+		if (hws_diag_enabled() && chip->index >= 0 && chip->index < MAX_VID_CHANNELS)
+			atomic64_set(&hws_audio_diag[chip->index].pcm_running, 0);
 		StopAudioCapture(dev, chip->index);
 		/* Do not sleep in trigger path: can run under atomic constraints. */
 		hrtimer_try_to_cancel(&chip->publish_timer);
@@ -5158,6 +5274,7 @@ static int hws_pcie_audio_trigger(struct snd_pcm_substream *substream, int cmd)
 		WRITE_ONCE(chip->last_irq_ns, 0);
 		WRITE_ONCE(chip->last_copy_ns, 0);
 		WRITE_ONCE(chip->last_progress_ns, 0);
+		WRITE_ONCE(chip->last_timer_fire_ns, 0);
 		break;
 	default:
 		return -EINVAL;
@@ -5250,6 +5367,9 @@ static int hws_audio_register(struct hws_pcie_dev *dev)
 			spin_lock_init(&dev->audio[i].ring_lock);
 			dev->audio[i].publish_chunk_bytes = 0;
 			dev->audio[i].publish_interval = ns_to_ktime(0);
+			dev->audio[i].publish_timer_armed = false;
+			dev->audio[i].pcm_running = false;
+			dev->audio[i].last_timer_fire_ns = 0;
 			hws_audio_publish_timer_init(&dev->audio[i].publish_timer,
 						     hws_audio_publish_timer_fn);
 			INIT_WORK(&dev->audio[i].audiowork,audio_data_process);

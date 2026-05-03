@@ -81,7 +81,13 @@ Current `audio_diag` includes root-cause counters for:
 - queue starvation and copy failures (`no_free_queue_slots`, `memcopy_failures`)
 - silence injection paths (`no_video_silence_injects`, `fallback_silence_injects`, `timer_silence_injects`)
 - timing and pressure (`irq_to_copy_*`, `copy_to_deliver_*`, `irq_to_deliver_*`, `queue_free_slots_*`)
-- timer fallback activity (`timer_runs`)
+- timer activity and source-loss behavior (`timer_runs`, `real_periods`, `silence_periods`,
+  `underrun_periods`, `source_lost_periods`, `timer_late_*`, `pcm_running`,
+  `staged_fill_bytes_*`)
+
+The ALSA capture clock is timer-driven while PCM is running. If HDMI audio or the
+video source stops producing packets, the driver should continue advancing ALSA
+periods with silence instead of letting PipeWire accumulate xruns.
 
 ## Rollback
 

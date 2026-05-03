@@ -15,7 +15,11 @@ FORCE_REINSTALL=0
 VERSION_OVERRIDE=""
 NO_BUMP=0
 DRACUT_MODE="none"
-INITRD_PATH="${INITRD_PATH:-/boot/initramfs-linux-lts.img}"
+INITRD_PATH="${INITRD_PATH:-}"
+INITRD_PATH_EXPLICIT=0
+if [[ -n "${INITRD_PATH}" ]]; then
+  INITRD_PATH_EXPLICIT=1
+fi
 DRACUT_STRICT=0
 DRACUT_LAYOUT_USED="not-run"
 CURRENT_KERNEL="$(uname -r)"
@@ -34,12 +38,12 @@ Options:
                          This is the default behavior.
   --keep-others          Do not remove other DKMS versions.
   --force-reinstall      Remove same module/version before add/build/install.
-  --dracut-current       Run dracut for current kernel using --initrd path.
+  --dracut-current       Run dracut for current kernel using detected initramfs
+                         path, unless --initrd is supplied.
   --dracut-all           Rebuild initramfs for all selected kernels using the
                          detected host boot layout.
   --dracut-strict        Fail script if dracut step fails.
-  --initrd <path>        Initramfs output path for --dracut-current
-                         (default: /boot/initramfs-linux-lts.img).
+  --initrd <path>        Explicit initramfs output path for --dracut-current.
   --src-dir <path>       Source directory to package (default: ./src).
   --log-root <path>      Log root directory (default: ./dkms-build-logs).
   -h, --help             Show this help.
@@ -93,6 +97,7 @@ while (($#)); do
       ;;
     --initrd)
       INITRD_PATH="${2:-}"
+      INITRD_PATH_EXPLICIT=1
       shift 2
       ;;
     --src-dir)
@@ -221,6 +226,11 @@ run_dracut_all_for_selected_kernels() {
     DRACUT_LAYOUT_USED="${dracut_layout}"
     echo "dracut_layout=${dracut_layout}"
     for kver in "${TARGET_KERNELS[@]}"; do
+      if [[ ! -r "/usr/lib/modules/${kver}/modules.dep" ]]; then
+        echo "warning: skipping dracut for ${kver}: missing modules.dep"
+        rc=7
+        continue
+      fi
       initrd="$(kernel_initrd_path_for "${kver}" || true)"
       if [[ -z "${initrd}" ]]; then
         echo "warning: could not determine initramfs path for kernel ${kver}"
@@ -288,6 +298,10 @@ select_kernels() {
     for k in /lib/modules/*; do
       [[ -d "${k}" ]] || continue
       [[ -d "${k}/build" ]] || continue
+      if [[ ! -r "${k}/modules.dep" ]]; then
+        echo "warning: skipping $(basename "${k}"): no modules.dep; headers-only or incomplete kernel tree" >&2
+        continue
+      fi
       basename "${k}"
     done
     return 0
@@ -300,6 +314,15 @@ mapfile -t TARGET_KERNELS < <(select_kernels "${KERNEL_MODE}")
 if [[ ${#TARGET_KERNELS[@]} -eq 0 ]]; then
   echo "No kernels selected (mode=${KERNEL_MODE})" >&2
   exit 2
+fi
+
+if [[ "${DRACUT_MODE}" == "current" && -z "${INITRD_PATH}" ]]; then
+  INITRD_PATH="$(kernel_initrd_path_for "${CURRENT_KERNEL}" || true)"
+  if [[ -z "${INITRD_PATH}" ]]; then
+    echo "Could not determine initramfs path for current kernel: ${CURRENT_KERNEL}" >&2
+    echo "Pass --initrd <path> explicitly or use --dracut-all." >&2
+    exit 2
+  fi
 fi
 
 RUN_ID="$(date -u +%Y%m%d-%H%M%S)-${DKMS_VERSION//[^A-Za-z0-9._-]/_}"
@@ -433,7 +456,13 @@ if [[ "${DRACUT_MODE}" == "all" ]]; then
   run_dracut_all_for_selected_kernels || dracut_rc=$?
 elif [[ "${DRACUT_MODE}" == "current" ]]; then
   if [[ "${CURRENT_KERNEL_INSTALLED}" == "1" ]]; then
-    dracut --force "${INITRD_PATH}" "${CURRENT_KERNEL}" || dracut_rc=$?
+    if [[ "${INITRD_PATH_EXPLICIT}" == "1" ]]; then
+      DRACUT_LAYOUT_USED="current-explicit-path"
+    else
+      DRACUT_LAYOUT_USED="current-detected-path"
+    fi
+    echo "dracut_layout=${DRACUT_LAYOUT_USED}"
+    run dracut --force "${INITRD_PATH}" "${CURRENT_KERNEL}" || dracut_rc=$?
   else
     echo "warning: skipping dracut for current kernel ${CURRENT_KERNEL} because its dkms build/install failed"
     dracut_rc=8

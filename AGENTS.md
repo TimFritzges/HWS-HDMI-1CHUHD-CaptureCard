@@ -104,6 +104,15 @@ Notes:
 - Audio diagnostics now expose timing and queue pressure metrics:
   - Latency chains: `irq_to_copy_*`, `copy_to_deliver_*`, `irq_to_deliver_*`.
   - Queue pressure: `queue_free_slots_min/max/total/samples`.
+- Audio clock behavior added after Linux 7.0 compatibility work:
+  - ALSA capture timing is driven by the PCM period timer while `pcm_running=1`.
+  - Hardware audio packets are staged; the timer publishes one ALSA period per tick.
+  - Missing or late hardware/source packets are converted to silence periods instead
+    of stopping ALSA pointer advancement.
+  - New counters include `real_periods`, `silence_periods`, `underrun_periods`,
+    `source_lost_periods`, `staged_overruns`, `staged_bytes_dropped`,
+    `timer_late_events`, `timer_late_ns_max`, `pcm_running`,
+    `staged_fill_bytes_min`, and `staged_fill_bytes_max`.
 - Trace lines when `audio_trace_enable=1`:
   - `hws_audio_drop ... reason=bad_packet|no_free_queue|memcopy_fail|stream_not_running`
-  - `hws_audio_silence ... reason=no_video|fallback|timer`
+  - `hws_audio_silence ... reason=no_video|fallback|timer|source_lost|underrun`
