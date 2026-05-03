@@ -55,6 +55,8 @@ static int audio_trace_enable;
 module_param_named(audio_trace_enable, audio_trace_enable, int, 0644);
 MODULE_PARM_DESC(audio_trace_enable, "Enable trace hooks for audio drop/silence events (0=off, 1=on)");
 
+#define HWS_AUDIO_MAX_TIMER_CATCHUP_PERIODS 8U
+
 enum {
 	HWS_FPS_POLICY_SOURCE_TRUTH = 1,
 	HWS_FPS_POLICY_USERSPACE_CONVERT = 2,
@@ -593,6 +595,9 @@ static enum hrtimer_restart hws_audio_publish_timer_fn(struct hrtimer *timer)
 	u64 now_ns;
 	u64 last_ns;
 	u64 interval_ns;
+	u64 overruns;
+	unsigned int periods_due;
+	unsigned int i;
 	int ch = drv->index;
 	bool diag = hws_diag_enabled() && ch >= 0 && ch < MAX_VID_CHANNELS;
 
@@ -624,14 +629,33 @@ static enum hrtimer_restart hws_audio_publish_timer_fn(struct hrtimer *timer)
 	}
 	WRITE_ONCE(drv->last_timer_fire_ns, now_ns);
 
-	if (hws_audio_publish_one_period(drv) < 0) {
+	/*
+	 * The timer can run late under OBS/system load. hrtimer_forward_now()
+	 * tells us how many periods elapsed; publish a bounded catch-up batch
+	 * instead of silently lowering the ALSA capture rate.
+	 */
+	overruns = hrtimer_forward_now(timer, interval);
+	if (overruns == 0)
+		overruns = 1;
+	if (overruns > 1 && diag) {
+		atomic64_inc(&hws_audio_diag[ch].timer_late_events);
+		if (last_ns && now_ns > last_ns + interval_ns)
+			hws_diag_update_max(&hws_audio_diag[ch].timer_late_ns_max,
+					    now_ns - last_ns - interval_ns);
+	}
+
+	periods_due = (unsigned int)min_t(u64, overruns,
+					  HWS_AUDIO_MAX_TIMER_CATCHUP_PERIODS);
+	for (i = 0; i < periods_due; i++) {
+		if (hws_audio_publish_one_period(drv) == 0)
+			continue;
+
 		spin_lock_irqsave(&drv->ring_lock, flags);
 		drv->publish_timer_armed = false;
 		spin_unlock_irqrestore(&drv->ring_lock, flags);
 		return HRTIMER_NORESTART;
 	}
 
-	hrtimer_forward_now(timer, interval);
 	return HRTIMER_RESTART;
 }
 
