@@ -304,6 +304,7 @@ struct hws_vfh_ctx {
     struct v4l2_fh      fh;
     struct vb2_queue    vbq;
     struct list_head    buf_queue;   /* queued hwsvideo_buffer for this fh */
+    struct mutex        queue_lock;   /* vb2 sleep/wakeup lock for this fh */
     spinlock_t          qlock;       /* protects buf_queue */
     bool                streaming;
     u32                 seqnr;       /* per-consumer sequence counter */

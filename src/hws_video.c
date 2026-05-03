@@ -1506,6 +1506,7 @@ static int hws_open(struct file *file)
 
     ctx->video = videodev;
     INIT_LIST_HEAD(&ctx->buf_queue);
+    mutex_init(&ctx->queue_lock);
     spin_lock_init(&ctx->qlock);
     ctx->streaming = false;
     WRITE_ONCE(videodev->next_frame_ts_ns, 0);
@@ -1528,7 +1529,12 @@ static int hws_open(struct file *file)
     q->ops = &hwspcie_video_multi_qops;
     q->mem_ops = &vb2_vmalloc_memops;
     q->timestamp_flags = V4L2_BUF_FLAG_TIMESTAMP_MONOTONIC;
-    q->lock = NULL; /* we use our own locks */
+    /*
+     * Linux 7 rejects vb2 queues that have neither wait_prepare callbacks nor
+     * q->lock. Each open has its own queue, so use a per-file mutex instead of
+     * the device-wide queue lock.
+     */
+    q->lock = &ctx->queue_lock;
     q->dev = &pdx->pdev->dev;
 
     ret = vb2_queue_init(q);
