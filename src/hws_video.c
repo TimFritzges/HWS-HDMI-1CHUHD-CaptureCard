@@ -5066,6 +5066,15 @@ static struct snd_pcm_hardware audio_pcm_hardware ={
 	.buffer_bytes_max = HWS_AUDIO_CELL_SIZE*4,
 };
 #endif
+
+static const struct snd_pcm_chmap_elem hws_audio_stereo_chmap[] = {
+	{
+		.channels = 2,
+		.map = { SNDRV_CHMAP_FL, SNDRV_CHMAP_FR },
+	},
+	{ }
+};
+
 static int hws_pcie_audio_open(struct snd_pcm_substream *substream)
 {
 	struct hws_audio *drv = snd_pcm_substream_chip(substream);
@@ -5350,6 +5359,10 @@ static int hws_audio_register(struct hws_pcie_dev *dev)
 		pcm->private_data = &dev->audio[i];	
 		strscpy(pcm->name, audioname, sizeof(pcm->name));
 		snd_pcm_set_ops(pcm,SNDRV_PCM_STREAM_CAPTURE,&hws_pcie_pcm_ops);
+		ret = snd_pcm_add_chmap_ctls(pcm, SNDRV_PCM_STREAM_CAPTURE,
+					     hws_audio_stereo_chmap, 2, 0, NULL);
+		if (ret < 0)
+			pr_warn("hws: failed to register stereo channel map: %d\n", ret);
 		//snd_pcm_lib_preallocate_pages_for_all(pcm, SNDRV_DMA_TYPE_DEV,snd_dma_pci_data(dev->pdev), HWS_AUDIO_CELL_SIZE*4, HWS_AUDIO_CELL_SIZE*4);
 		 snd_pcm_lib_preallocate_pages_for_all(
             pcm,
