@@ -1,0 +1,17 @@
+# Build artifacts from in-tree kernel module builds
+src/*.o
+src/*.ko
+src/*.mod
+src/*.mod.c
+src/*.cmd
+src/.*.cmd
+src/Module.symvers
+src/modules.order
+
+# Runtime and diagnostic artifacts
+bench-results/
+dkms-build-logs/
+config/
+
+# Installer logs
+*.log
