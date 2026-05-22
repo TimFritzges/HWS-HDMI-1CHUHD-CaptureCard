@@ -113,6 +113,7 @@
 #endif 
 #define MEM_LOCK					1
 #define MEM_UNLOCK					0
+#define MEM_WRITE					2
 
 
 typedef unsigned int DWORD;
@@ -308,6 +309,11 @@ struct hws_vfh_ctx {
     spinlock_t          qlock;       /* protects buf_queue */
     bool                streaming;
     u32                 seqnr;       /* per-consumer sequence counter */
+    u64                 next_frame_ts_ns;
+    u64                 last_frame_ts_ns;
+    u32                 last_seqnr;
+    bool                last_frame_ts_valid;
+    bool                last_seqnr_valid;
     struct hws_video   *video;
     struct list_head    node;        /* link into video->consumers */
 };
@@ -348,6 +354,7 @@ struct hws_video{
 	int current_out_size_index;
 	u64 next_frame_ts_ns;
 	u32 output_rate_accum;
+	int last_complete_index;
 };
 	
 struct hws_audio{

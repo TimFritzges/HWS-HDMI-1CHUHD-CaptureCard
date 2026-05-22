@@ -31,6 +31,7 @@ static int StartVideoCapture(struct hws_pcie_dev *pdx,int index);
 static int StartAudioCapture(struct hws_pcie_dev *pdx,int index);
 static void StopAudioCapture(struct hws_pcie_dev *pdx,int index);
 static void StopVideoCapture(struct hws_pcie_dev *pdx,int index);
+static int hws_nearest_supported_fps(int fps);
 static int diag_enable;
 module_param_named(diag_enable, diag_enable, int, 0644);
 MODULE_PARM_DESC(diag_enable, "Enable HWS runtime diagnostics (0=off, 1=on)");
@@ -55,7 +56,17 @@ static int audio_trace_enable;
 module_param_named(audio_trace_enable, audio_trace_enable, int, 0644);
 MODULE_PARM_DESC(audio_trace_enable, "Enable trace hooks for audio drop/silence events (0=off, 1=on)");
 
-#define HWS_AUDIO_MAX_TIMER_CATCHUP_PERIODS 8U
+static int audio_starved_low_pct = 50;
+module_param_named(audio_starved_low_pct, audio_starved_low_pct, int, 0644);
+MODULE_PARM_DESC(audio_starved_low_pct, "Low watermark percent for SOURCE_STARVED transition (1-99)");
+
+static int audio_recovery_high_pct = 150;
+module_param_named(audio_recovery_high_pct, audio_recovery_high_pct, int, 0644);
+MODULE_PARM_DESC(audio_recovery_high_pct, "High watermark percent for SOURCE_OK transition from RECOVERY (100-500)");
+
+static int audio_jitter_tolerance_periods = 4;
+module_param_named(audio_jitter_tolerance_periods, audio_jitter_tolerance_periods, int, 0644);
+MODULE_PARM_DESC(audio_jitter_tolerance_periods, "Packet lateness tolerance in periods before declaring SOURCE_STARVED");
 
 enum {
 	HWS_FPS_POLICY_SOURCE_TRUTH = 1,
@@ -64,7 +75,7 @@ enum {
 	HWS_FPS_POLICY_AUTO_PROFILE = 4,
 };
 
-static int fps_policy_mode = HWS_FPS_POLICY_AUTO_PROFILE;
+static int fps_policy_mode = HWS_FPS_POLICY_SOURCE_TRUTH;
 module_param_named(fps_policy_mode, fps_policy_mode, int, 0644);
 MODULE_PARM_DESC(fps_policy_mode, "FPS policy: 1=source-truth, 2=userspace-convert, 3=driver-convert (experimental), 4=auto-profile");
 
@@ -126,6 +137,13 @@ struct hws_audio_diag_stats {
 	atomic64_t pcm_running;
 	atomic64_t staged_fill_bytes_min;
 	atomic64_t staged_fill_bytes_max;
+	atomic64_t source_ok_transitions;
+	atomic64_t source_starved_transitions;
+	atomic64_t recovery_transitions;
+	atomic64_t source_starved_periods;
+	atomic64_t recovery_periods;
+	atomic64_t silence_source_starved;
+	atomic64_t silence_worker_lag;
 };
 
 struct hws_diag_stats {
@@ -146,6 +164,10 @@ struct hws_diag_stats {
 	atomic64_t source_interval_ns_total;
 	atomic64_t source_interval_ns_max;
 	atomic64_t source_interval_samples;
+	atomic64_t reused_no_fresh_runs;
+	atomic64_t reused_backpressure_runs;
+	atomic64_t ts_non_monotonic_events;
+	atomic64_t seq_non_monotonic_events;
 };
 
 static struct hws_diag_stats hws_diag[MAX_VID_CHANNELS];
@@ -153,6 +175,17 @@ static struct hws_audio_diag_stats hws_audio_diag[MAX_VID_CHANNELS];
 static struct dentry *hws_diag_root;
 static u64 hws_diag_last_fresh_ns[MAX_VID_CHANNELS];
 static u64 hws_source_interval_ns_avg[MAX_VID_CHANNELS];
+static u64 hws_diag_last_ts_ns[MAX_VID_CHANNELS];
+static u32 hws_diag_last_seq[MAX_VID_CHANNELS];
+static bool hws_diag_last_ts_valid[MAX_VID_CHANNELS];
+static bool hws_diag_last_seq_valid[MAX_VID_CHANNELS];
+
+enum hws_audio_source_state {
+	HWS_AUDIO_SOURCE_OK = 0,
+	HWS_AUDIO_SOURCE_STARVED = 1,
+	HWS_AUDIO_SOURCE_RECOVERY = 2,
+};
+static int hws_audio_source_state[MAX_VID_CHANNELS];
 
 static inline void hws_diag_reset(void)
 {
@@ -176,8 +209,17 @@ static inline void hws_diag_reset(void)
 		atomic64_set(&hws_diag[i].source_interval_ns_total, 0);
 		atomic64_set(&hws_diag[i].source_interval_ns_max, 0);
 		atomic64_set(&hws_diag[i].source_interval_samples, 0);
+		atomic64_set(&hws_diag[i].reused_no_fresh_runs, 0);
+		atomic64_set(&hws_diag[i].reused_backpressure_runs, 0);
+		atomic64_set(&hws_diag[i].ts_non_monotonic_events, 0);
+		atomic64_set(&hws_diag[i].seq_non_monotonic_events, 0);
 		hws_diag_last_fresh_ns[i] = 0;
 		hws_source_interval_ns_avg[i] = 0;
+		hws_diag_last_ts_ns[i] = 0;
+		hws_diag_last_seq[i] = 0;
+		hws_diag_last_ts_valid[i] = false;
+		hws_diag_last_seq_valid[i] = false;
+		hws_audio_source_state[i] = HWS_AUDIO_SOURCE_OK;
 		atomic64_set(&hws_audio_diag[i].work_runs, 0);
 		atomic64_set(&hws_audio_diag[i].buffers_found, 0);
 		atomic64_set(&hws_audio_diag[i].delivered_bytes, 0);
@@ -221,6 +263,13 @@ static inline void hws_diag_reset(void)
 			atomic64_set(&hws_audio_diag[i].pcm_running, 0);
 			atomic64_set(&hws_audio_diag[i].staged_fill_bytes_min, S64_MAX);
 			atomic64_set(&hws_audio_diag[i].staged_fill_bytes_max, 0);
+			atomic64_set(&hws_audio_diag[i].source_ok_transitions, 0);
+			atomic64_set(&hws_audio_diag[i].source_starved_transitions, 0);
+			atomic64_set(&hws_audio_diag[i].recovery_transitions, 0);
+			atomic64_set(&hws_audio_diag[i].source_starved_periods, 0);
+			atomic64_set(&hws_audio_diag[i].recovery_periods, 0);
+			atomic64_set(&hws_audio_diag[i].silence_source_starved, 0);
+			atomic64_set(&hws_audio_diag[i].silence_worker_lag, 0);
 		}
 	}
 
@@ -440,6 +489,8 @@ static void hws_audio_reset_stage(struct hws_audio *drv)
 	drv->publish_timer_armed = false;
 	spin_unlock_irqrestore(&drv->ring_lock, flags);
 	WRITE_ONCE(drv->last_timer_fire_ns, 0);
+	if (drv->index >= 0 && drv->index < MAX_VID_CHANNELS)
+		WRITE_ONCE(hws_audio_source_state[drv->index], HWS_AUDIO_SOURCE_OK);
 }
 
 static int hws_audio_stage_bytes(struct hws_audio *drv, const u8 *src, u32 aud_len)
@@ -506,6 +557,14 @@ static int hws_audio_publish_one_period(struct hws_audio *drv)
 	u8 *stage;
 	bool diag;
 	bool source_lost = false;
+	bool hold_recovery = false;
+	bool source_no_video = false;
+	enum hws_audio_source_state new_state = HWS_AUDIO_SOURCE_OK;
+	int prev_state = HWS_AUDIO_SOURCE_OK;
+	u32 remaining_fill;
+	u32 low_wm_bytes;
+	u32 high_wm_bytes;
+	u64 jitter_ns;
 	int ch;
 
 	if (!drv || !drv->resampled_buf)
@@ -523,10 +582,19 @@ static int hws_audio_publish_one_period(struct hws_audio *drv)
 	last_irq_ns = READ_ONCE(drv->last_irq_ns);
 	packet_ns = hws_audio_packet_duration_ns(drv, aud_len);
 	stage = drv->resampled_buf;
+	low_wm_bytes = (u32)(((u64)aud_len * (u64)clamp(audio_starved_low_pct, 1, 99)) / 100ULL);
+	high_wm_bytes = (u32)(((u64)aud_len * (u64)clamp(audio_recovery_high_pct, 100, 500)) / 100ULL);
+	jitter_ns = packet_ns * (u64)clamp(audio_jitter_tolerance_periods, 1, 16);
+	if (ch >= 0 && ch < MAX_VID_CHANNELS) {
+		prev_state = READ_ONCE(hws_audio_source_state[ch]);
+		source_no_video = READ_ONCE(drv->dev->m_curr_No_Video[ch]);
+	}
 	memset(drv->publish_scratch, 0, aud_len);
 
 	spin_lock_irqsave(&drv->ring_lock, flags);
-	copied = min(aud_len, drv->staged_fill_bytes);
+	hold_recovery = prev_state != HWS_AUDIO_SOURCE_OK &&
+			drv->staged_fill_bytes < high_wm_bytes;
+	copied = hold_recovery ? 0 : min(aud_len, drv->staged_fill_bytes);
 	if (copied) {
 		first = min(copied, drv->resampled_buf_size - drv->staged_rpos_bytes);
 		memcpy(drv->publish_scratch, stage + drv->staged_rpos_bytes, first);
@@ -538,7 +606,26 @@ static int hws_audio_publish_one_period(struct hws_audio *drv)
 	}
 	if (diag)
 		hws_audio_diag_record_staged_fill(ch, drv->staged_fill_bytes);
+	remaining_fill = drv->staged_fill_bytes;
 	spin_unlock_irqrestore(&drv->ring_lock, flags);
+
+	if (copied < aud_len &&
+	    (!last_irq_ns || source_no_video ||
+	     (packet_ns && now_ns > last_irq_ns && now_ns - last_irq_ns > jitter_ns)))
+		source_lost = true;
+
+	if (copied == aud_len) {
+		new_state = HWS_AUDIO_SOURCE_OK;
+		if (prev_state == HWS_AUDIO_SOURCE_RECOVERY && remaining_fill < high_wm_bytes)
+			new_state = HWS_AUDIO_SOURCE_RECOVERY;
+	} else if (source_lost || (!hold_recovery && remaining_fill <= low_wm_bytes)) {
+		new_state = HWS_AUDIO_SOURCE_STARVED;
+	} else {
+		new_state = HWS_AUDIO_SOURCE_RECOVERY;
+	}
+
+	if (ch >= 0 && ch < MAX_VID_CHANNELS && prev_state != new_state)
+		WRITE_ONCE(hws_audio_source_state[ch], new_state);
 
 	if (diag) {
 		if (copied == aud_len) {
@@ -548,12 +635,31 @@ static int hws_audio_publish_one_period(struct hws_audio *drv)
 				atomic64_inc(&hws_audio_diag[ch].underrun_periods);
 			else
 				atomic64_inc(&hws_audio_diag[ch].silence_periods);
-			if (!last_irq_ns || READ_ONCE(drv->dev->m_curr_No_Video[ch]) ||
-			    (packet_ns && now_ns > last_irq_ns && now_ns - last_irq_ns > packet_ns * 4))
-				source_lost = true;
 			if (source_lost)
 				atomic64_inc(&hws_audio_diag[ch].source_lost_periods);
 			atomic64_inc(&hws_audio_diag[ch].timer_silence_injects);
+			if (source_lost)
+				atomic64_inc(&hws_audio_diag[ch].silence_source_starved);
+			else
+				atomic64_inc(&hws_audio_diag[ch].silence_worker_lag);
+		}
+		if (new_state == HWS_AUDIO_SOURCE_STARVED)
+			atomic64_inc(&hws_audio_diag[ch].source_starved_periods);
+		else if (new_state == HWS_AUDIO_SOURCE_RECOVERY)
+			atomic64_inc(&hws_audio_diag[ch].recovery_periods);
+
+		if (prev_state != new_state) {
+			switch (new_state) {
+			case HWS_AUDIO_SOURCE_OK:
+				atomic64_inc(&hws_audio_diag[ch].source_ok_transitions);
+				break;
+			case HWS_AUDIO_SOURCE_STARVED:
+				atomic64_inc(&hws_audio_diag[ch].source_starved_transitions);
+				break;
+			case HWS_AUDIO_SOURCE_RECOVERY:
+				atomic64_inc(&hws_audio_diag[ch].recovery_transitions);
+				break;
+			}
 		}
 	}
 	if (copied < aud_len && hws_audio_trace_enabled())
@@ -596,8 +702,6 @@ static enum hrtimer_restart hws_audio_publish_timer_fn(struct hrtimer *timer)
 	u64 last_ns;
 	u64 interval_ns;
 	u64 overruns;
-	unsigned int periods_due;
-	unsigned int i;
 	int ch = drv->index;
 	bool diag = hws_diag_enabled() && ch >= 0 && ch < MAX_VID_CHANNELS;
 
@@ -630,9 +734,8 @@ static enum hrtimer_restart hws_audio_publish_timer_fn(struct hrtimer *timer)
 	WRITE_ONCE(drv->last_timer_fire_ns, now_ns);
 
 	/*
-	 * The timer can run late under OBS/system load. hrtimer_forward_now()
-	 * tells us how many periods elapsed; publish a bounded catch-up batch
-	 * instead of silently lowering the ALSA capture rate.
+	 * A callback represents one period publication decision. Track timer
+	 * lateness, but do not burst multiple ALSA periods from one callback.
 	 */
 	overruns = hrtimer_forward_now(timer, interval);
 	if (overruns == 0)
@@ -644,12 +747,7 @@ static enum hrtimer_restart hws_audio_publish_timer_fn(struct hrtimer *timer)
 					    now_ns - last_ns - interval_ns);
 	}
 
-	periods_due = (unsigned int)min_t(u64, overruns,
-					  HWS_AUDIO_MAX_TIMER_CATCHUP_PERIODS);
-	for (i = 0; i < periods_due; i++) {
-		if (hws_audio_publish_one_period(drv) == 0)
-			continue;
-
+	if (hws_audio_publish_one_period(drv) != 0) {
 		spin_lock_irqsave(&drv->ring_lock, flags);
 		drv->publish_timer_armed = false;
 		spin_unlock_irqrestore(&drv->ring_lock, flags);
@@ -663,10 +761,10 @@ static int hws_diag_show(struct seq_file *m, void *unused)
 {
 	int i;
 
-	seq_puts(m, "ch work_runs work_ns_total work_ns_max buf_processed buf_done buf_error copy_frames scaler_frames novideo_frames miss_fallbacks memcopy_ns_total scaler_ns_total fresh_runs nofresh_runs src_interval_ns_total src_interval_ns_max src_interval_samples\n");
+	seq_puts(m, "ch work_runs work_ns_total work_ns_max buf_processed buf_done buf_error copy_frames scaler_frames novideo_frames miss_fallbacks memcopy_ns_total scaler_ns_total fresh_runs nofresh_runs src_interval_ns_total src_interval_ns_max src_interval_samples reused_no_fresh_runs reused_backpressure_runs ts_non_monotonic_events seq_non_monotonic_events\n");
 	for (i = 0; i < MAX_VID_CHANNELS; i++) {
 		seq_printf(m,
-			"%d %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld\n",
+			"%d %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld\n",
 			i,
 			(long long)atomic64_read(&hws_diag[i].work_runs),
 			(long long)atomic64_read(&hws_diag[i].work_ns_total),
@@ -684,7 +782,11 @@ static int hws_diag_show(struct seq_file *m, void *unused)
 			(long long)atomic64_read(&hws_diag[i].nofresh_frame_runs),
 			(long long)atomic64_read(&hws_diag[i].source_interval_ns_total),
 			(long long)atomic64_read(&hws_diag[i].source_interval_ns_max),
-			(long long)atomic64_read(&hws_diag[i].source_interval_samples));
+			(long long)atomic64_read(&hws_diag[i].source_interval_samples),
+			(long long)atomic64_read(&hws_diag[i].reused_no_fresh_runs),
+			(long long)atomic64_read(&hws_diag[i].reused_backpressure_runs),
+			(long long)atomic64_read(&hws_diag[i].ts_non_monotonic_events),
+			(long long)atomic64_read(&hws_diag[i].seq_non_monotonic_events));
 	}
 
 	return 0;
@@ -699,12 +801,12 @@ static int hws_audio_diag_show(struct seq_file *m, void *unused)
 {
 	int i;
 
-	seq_puts(m, "ch work_runs buffers_found delivered_bytes delivered_frames period_elapsed oversized_packets drop_no_substream drop_bad_runtime drop_ring_not_ready no_video_silence_injects fallback_silence_injects timer_silence_injects no_free_queue_slots memcopy_failures bad_packet_sizes workqueue_requeues stream_not_running timer_runs irq_to_copy_ns_total irq_to_copy_ns_max irq_to_copy_samples copy_to_deliver_ns_total copy_to_deliver_ns_max copy_to_deliver_samples irq_to_deliver_ns_total irq_to_deliver_ns_max irq_to_deliver_samples queue_free_slots_min queue_free_slots_max queue_free_slots_total queue_free_slots_samples delivery_errors real_periods silence_periods underrun_periods source_lost_periods staged_overruns staged_bytes_dropped timer_late_events timer_late_ns_max pcm_running staged_fill_bytes_min staged_fill_bytes_max\n");
+	seq_puts(m, "ch work_runs buffers_found delivered_bytes delivered_frames period_elapsed oversized_packets drop_no_substream drop_bad_runtime drop_ring_not_ready no_video_silence_injects fallback_silence_injects timer_silence_injects no_free_queue_slots memcopy_failures bad_packet_sizes workqueue_requeues stream_not_running timer_runs irq_to_copy_ns_total irq_to_copy_ns_max irq_to_copy_samples copy_to_deliver_ns_total copy_to_deliver_ns_max copy_to_deliver_samples irq_to_deliver_ns_total irq_to_deliver_ns_max irq_to_deliver_samples queue_free_slots_min queue_free_slots_max queue_free_slots_total queue_free_slots_samples delivery_errors real_periods silence_periods underrun_periods source_lost_periods staged_overruns staged_bytes_dropped timer_late_events timer_late_ns_max pcm_running staged_fill_bytes_min staged_fill_bytes_max source_ok_transitions source_starved_transitions recovery_transitions source_starved_periods recovery_periods silence_source_starved silence_worker_lag source_state\n");
 	for (i = 0; i < MAX_VID_CHANNELS; i++) {
 		long long staged_min = atomic64_read(&hws_audio_diag[i].staged_fill_bytes_min);
 		if (staged_min == S64_MAX)
 			staged_min = 0;
-		seq_printf(m, "%d %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld\n",
+		seq_printf(m, "%d %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %d\n",
 			i,
 			(long long)atomic64_read(&hws_audio_diag[i].work_runs),
 			(long long)atomic64_read(&hws_audio_diag[i].buffers_found),
@@ -748,7 +850,15 @@ static int hws_audio_diag_show(struct seq_file *m, void *unused)
 			(long long)atomic64_read(&hws_audio_diag[i].timer_late_ns_max),
 			(long long)atomic64_read(&hws_audio_diag[i].pcm_running),
 			staged_min,
-			(long long)atomic64_read(&hws_audio_diag[i].staged_fill_bytes_max));
+			(long long)atomic64_read(&hws_audio_diag[i].staged_fill_bytes_max),
+			(long long)atomic64_read(&hws_audio_diag[i].source_ok_transitions),
+			(long long)atomic64_read(&hws_audio_diag[i].source_starved_transitions),
+			(long long)atomic64_read(&hws_audio_diag[i].recovery_transitions),
+			(long long)atomic64_read(&hws_audio_diag[i].source_starved_periods),
+			(long long)atomic64_read(&hws_audio_diag[i].recovery_periods),
+			(long long)atomic64_read(&hws_audio_diag[i].silence_source_starved),
+			(long long)atomic64_read(&hws_audio_diag[i].silence_worker_lag),
+			hws_audio_source_state[i]);
 	}
 
 	return 0;
@@ -759,9 +869,40 @@ static int hws_audio_diag_open(struct inode *inode, struct file *file)
 	return single_open(file, hws_audio_diag_show, inode->i_private);
 }
 
+static int hws_source_cadence_show(struct seq_file *m, void *unused)
+{
+	int i;
+
+	seq_puts(m, "ch avg_source_interval_ns active_source_fps\n");
+	for (i = 0; i < MAX_VID_CHANNELS; i++) {
+		u64 avg_ns = READ_ONCE(hws_source_interval_ns_avg[i]);
+		int fps = 0;
+
+		if (avg_ns)
+			fps = hws_nearest_supported_fps((int)DIV_ROUND_CLOSEST_ULL(1000000000ULL, avg_ns));
+
+		seq_printf(m, "%d %llu %d\n", i, avg_ns, fps);
+	}
+
+	return 0;
+}
+
+static int hws_source_cadence_open(struct inode *inode, struct file *file)
+{
+	return single_open(file, hws_source_cadence_show, inode->i_private);
+}
+
 static const struct file_operations hws_audio_diag_fops = {
 	.owner = THIS_MODULE,
 	.open = hws_audio_diag_open,
+	.read = seq_read,
+	.llseek = seq_lseek,
+	.release = single_release,
+};
+
+static const struct file_operations hws_source_cadence_fops = {
+	.owner = THIS_MODULE,
+	.open = hws_source_cadence_open,
 	.read = seq_read,
 	.llseek = seq_lseek,
 	.release = single_release,
@@ -788,6 +929,7 @@ static void hws_diag_init_debugfs(void)
 
 	debugfs_create_file("video_diag", 0444, hws_diag_root, NULL, &hws_diag_fops);
 	debugfs_create_file("audio_diag", 0444, hws_diag_root, NULL, &hws_audio_diag_fops);
+	debugfs_create_file("source_cadence", 0444, hws_diag_root, NULL, &hws_source_cadence_fops);
 }
 
 static void hws_diag_remove_debugfs(void)
@@ -1533,9 +1675,8 @@ static int hws_open(struct file *file)
     mutex_init(&ctx->queue_lock);
     spin_lock_init(&ctx->qlock);
     ctx->streaming = false;
-    WRITE_ONCE(videodev->next_frame_ts_ns, 0);
-	videodev->output_rate_accum = 0;
     ctx->seqnr = 0;
+    ctx->next_frame_ts_ns = 0;
 
     /* v4l2 file-handle */
     v4l2_fh_init(&ctx->fh, &videodev->vdev);
@@ -2436,6 +2577,7 @@ static int hws_start_streaming(struct vb2_queue *q, unsigned int count)
 	videodev->seqnr = 0;
 	WRITE_ONCE(videodev->next_frame_ts_ns, 0);
 	videodev->output_rate_accum = 0;
+	videodev->last_complete_index = -1;
 	hws_diag_last_fresh_ns[videodev->index] = 0;
 	hws_source_interval_ns_avg[videodev->index] = 0;
 	msleep(100);
@@ -2580,14 +2722,18 @@ static int hws_start_streaming_multi(struct vb2_queue *q, unsigned int count)
 
     ctx->streaming = true;
     ctx->seqnr = 0;
-    WRITE_ONCE(videodev->next_frame_ts_ns, 0);
-	videodev->output_rate_accum = 0;
-    hws_diag_last_fresh_ns[videodev->index] = 0;
-	hws_source_interval_ns_avg[videodev->index] = 0;
+    ctx->next_frame_ts_ns = 0;
+    ctx->last_frame_ts_valid = false;
+    ctx->last_seqnr_valid = false;
 
     /* Start hardware engine only once, on first streamer */
     if (atomic_inc_return(&videodev->engine_users) == 1) {
         videodev->seqnr = 0;
+        WRITE_ONCE(videodev->next_frame_ts_ns, 0);
+        videodev->output_rate_accum = 0;
+        videodev->last_complete_index = -1;
+        hws_diag_last_fresh_ns[videodev->index] = 0;
+        hws_source_interval_ns_avg[videodev->index] = 0;
         StartVideoCapture(videodev->dev, videodev->index);
     }
     return 0;
@@ -2601,10 +2747,9 @@ static void hws_stop_streaming_multi(struct vb2_queue *q)
     unsigned long flags;
 
     ctx->streaming = false;
-    WRITE_ONCE(videodev->next_frame_ts_ns, 0);
-	videodev->output_rate_accum = 0;
-    hws_diag_last_fresh_ns[videodev->index] = 0;
-	hws_source_interval_ns_avg[videodev->index] = 0;
+    ctx->next_frame_ts_ns = 0;
+    ctx->last_frame_ts_valid = false;
+    ctx->last_seqnr_valid = false;
 
     /*
      * Serialize with worker-side dequeue so buffers from this ctx are not
@@ -2622,8 +2767,14 @@ static void hws_stop_streaming_multi(struct vb2_queue *q)
     spin_unlock_irqrestore(&ctx->qlock, flags);
 
     /* Stop engine when the last streamer goes away */
-    if (atomic_dec_return(&videodev->engine_users) == 0)
+    if (atomic_dec_return(&videodev->engine_users) == 0) {
+        WRITE_ONCE(videodev->next_frame_ts_ns, 0);
+        videodev->output_rate_accum = 0;
+        videodev->last_complete_index = -1;
+        hws_diag_last_fresh_ns[videodev->index] = 0;
+        hws_source_interval_ns_avg[videodev->index] = 0;
         StopVideoCapture(videodev->dev, videodev->index);
+    }
 }
 
 static const struct vb2_ops hwspcie_video_multi_qops = {
@@ -4589,9 +4740,11 @@ static unsigned int hws_pending_consumer_count(struct hws_video *videodev)
     return count;
 }
 
-static u64 hws_next_frame_ts_ns(struct hws_video *videodev, u64 now_ns)
+static u64 hws_next_frame_ts_ns(struct hws_video *videodev,
+				struct hws_vfh_ctx *ctx, u64 now_ns)
 {
-	u64 prev = READ_ONCE(videodev->next_frame_ts_ns);
+	u64 prev = ctx ? READ_ONCE(ctx->next_frame_ts_ns) :
+			 READ_ONCE(videodev->next_frame_ts_ns);
 	u64 interval_ns;
 	int fps = hws_policy_select_fps(videodev, 60);
 
@@ -4606,7 +4759,10 @@ static u64 hws_next_frame_ts_ns(struct hws_video *videodev, u64 now_ns)
 	else
 		prev += interval_ns;
 
-	WRITE_ONCE(videodev->next_frame_ts_ns, prev);
+	if (ctx)
+		WRITE_ONCE(ctx->next_frame_ts_ns, prev);
+	else
+		WRITE_ONCE(videodev->next_frame_ts_ns, prev);
 	return prev;
 }
 
@@ -4648,6 +4804,7 @@ static void video_data_process(struct work_struct *p_work)
 	u64 frame_ts_ns = 0;
 	bool had_fresh_frame = false;
 	bool no_fresh_frame = false;
+	bool reused_complete_frame = false;
 	u64 source_interval_ns = 0;
 	unsigned int output_frames_target = 1;
 	int source_fps = 0;
@@ -4691,11 +4848,26 @@ static void video_data_process(struct work_struct *p_work)
 			nCopySize[3] = pdx->m_VideoInfo[nCh].m_VideoBufferSize[3];
 			interlace = pdx->m_VideoInfo[nCh].pStatusInfo[nVindex].dwinterlace;
 		}
+		if (nVindex == -1 &&
+		    videodev->last_complete_index >= 0 &&
+		    pdx->m_VideoInfo[nCh].pStatusInfo[videodev->last_complete_index].byLock == MEM_LOCK) {
+			nVindex = videodev->last_complete_index;
+			bBuf[0] = pdx->m_VideoInfo[nCh].m_pVideoBufData[nVindex];
+			bBuf[1] = pdx->m_VideoInfo[nCh].m_pVideoBufData1[nVindex];
+			bBuf[2] = pdx->m_VideoInfo[nCh].m_pVideoBufData2[nVindex];
+			bBuf[3] = pdx->m_VideoInfo[nCh].m_pVideoBufData3[nVindex];
+			nCopySize[0] = pdx->m_VideoInfo[nCh].m_VideoBufferSize[0];
+			nCopySize[1] = pdx->m_VideoInfo[nCh].m_VideoBufferSize[1];
+			nCopySize[2] = pdx->m_VideoInfo[nCh].m_VideoBufferSize[2];
+			nCopySize[3] = pdx->m_VideoInfo[nCh].m_VideoBufferSize[3];
+			interlace = pdx->m_VideoInfo[nCh].pStatusInfo[nVindex].dwinterlace;
+			reused_complete_frame = true;
+		}
 		if (nVindex == -1)
 			miss_freme = 1;
 	}
 	if (curr_no_video == 0) {
-		if (nVindex >= 0) {
+		if (nVindex >= 0 && !reused_complete_frame) {
 			u64 now_ns = ktime_get_ns();
 			had_fresh_frame = true;
 			if (hws_diag_last_fresh_ns[nCh] != 0 && now_ns > hws_diag_last_fresh_ns[nCh])
@@ -4711,9 +4883,10 @@ static void video_data_process(struct work_struct *p_work)
 		}
 	} else {
 		for (i = 0; i < MAX_VIDEO_QUEUE; i++) {
-			if (pdx->m_VideoInfo[nCh].pStatusInfo[i].byLock == MEM_LOCK)
+			if (pdx->m_VideoInfo[nCh].pStatusInfo[i].byLock != MEM_UNLOCK)
 				pdx->m_VideoInfo[nCh].pStatusInfo[i].byLock = MEM_UNLOCK;
 		}
+		videodev->last_complete_index = -1;
 	}
 	spin_unlock_irqrestore(&pdx->videoslock[nCh], devflags);
 
@@ -4766,6 +4939,7 @@ static void video_data_process(struct work_struct *p_work)
 		u64 copy_start;
 		unsigned int dst_capacity;
 		unsigned int required_size;
+		struct hws_vfh_ctx *ctx;
 
 		if (processed_in_run >= per_frame_budget) {
 			budget_exhausted = true;
@@ -4779,7 +4953,8 @@ static void video_data_process(struct work_struct *p_work)
 		processed_in_run++;
 		buf_processed++;
 
-		frame_ts_ns = hws_next_frame_ts_ns(videodev, ktime_get_ns());
+			ctx = buf->vb.vb2_buf.vb2_queue->drv_priv;
+			frame_ts_ns = hws_next_frame_ts_ns(videodev, ctx, ktime_get_ns());
 		buf->vb.vb2_buf.timestamp = frame_ts_ns;
 		buf->vb.field = V4L2_FIELD_NONE;
 
@@ -4841,7 +5016,34 @@ static void video_data_process(struct work_struct *p_work)
 			novideo_frames++;
 		}
 
-		buf->vb.sequence = videodev->seqnr++;
+			if (ctx)
+				buf->vb.sequence = ctx->seqnr++;
+			else
+				buf->vb.sequence = videodev->seqnr++;
+			if (diag_on) {
+				bool last_seq_valid = ctx ? ctx->last_seqnr_valid :
+							   hws_diag_last_seq_valid[nCh];
+				bool last_ts_valid = ctx ? ctx->last_frame_ts_valid :
+							  hws_diag_last_ts_valid[nCh];
+				u32 last_seq = ctx ? ctx->last_seqnr : hws_diag_last_seq[nCh];
+				u64 last_ts = ctx ? ctx->last_frame_ts_ns : hws_diag_last_ts_ns[nCh];
+
+				if (last_seq_valid && buf->vb.sequence <= last_seq)
+					atomic64_inc(&hws_diag[nCh].seq_non_monotonic_events);
+				if (last_ts_valid && buf->vb.vb2_buf.timestamp <= last_ts)
+					atomic64_inc(&hws_diag[nCh].ts_non_monotonic_events);
+				if (ctx) {
+					ctx->last_seqnr = buf->vb.sequence;
+					ctx->last_seqnr_valid = true;
+					ctx->last_frame_ts_ns = buf->vb.vb2_buf.timestamp;
+					ctx->last_frame_ts_valid = true;
+				} else {
+					hws_diag_last_seq[nCh] = buf->vb.sequence;
+					hws_diag_last_seq_valid[nCh] = true;
+					hws_diag_last_ts_ns[nCh] = buf->vb.vb2_buf.timestamp;
+					hws_diag_last_ts_valid[nCh] = true;
+				}
+			}
 		vb2_buffer_done(&buf->vb.vb2_buf, VB2_BUF_STATE_DONE);
 		buf_done++;
 
@@ -4850,8 +5052,12 @@ static void video_data_process(struct work_struct *p_work)
 	}
 
 	spin_lock_irqsave(&pdx->videoslock[nCh], devflags);
-	if (curr_no_video == 0 && nVindex >= 0) {
-		pdx->m_VideoInfo[nCh].pStatusInfo[nVindex].byLock = MEM_UNLOCK;
+	if (curr_no_video == 0 && nVindex >= 0 && !reused_complete_frame) {
+		if (videodev->last_complete_index >= 0 &&
+		    videodev->last_complete_index != nVindex &&
+		    pdx->m_VideoInfo[nCh].pStatusInfo[videodev->last_complete_index].byLock == MEM_LOCK)
+			pdx->m_VideoInfo[nCh].pStatusInfo[videodev->last_complete_index].byLock = MEM_UNLOCK;
+		videodev->last_complete_index = nVindex;
 		pdx->m_nRDVideoIndex[nCh] = nVindex + 1;
 		if (pdx->m_nRDVideoIndex[nCh] >= MAX_VIDEO_QUEUE)
 			pdx->m_nRDVideoIndex[nCh] = 0;
@@ -4872,6 +5078,10 @@ out_finish:
 		atomic64_add(novideo_frames, &hws_diag[nCh].novideo_frames);
 		if (miss_freme)
 			atomic64_inc(&hws_diag[nCh].miss_frame_fallbacks);
+		if (miss_freme || reused_complete_frame)
+			atomic64_inc(&hws_diag[nCh].reused_no_fresh_runs);
+		if (budget_exhausted && had_fresh_frame)
+			atomic64_inc(&hws_diag[nCh].reused_backpressure_runs);
 		atomic64_add(memcopy_ns, &hws_diag[nCh].memcopy_ns_total);
 		atomic64_add(scaler_ns, &hws_diag[nCh].scaler_ns_total);
 		if (had_fresh_frame)
@@ -5013,6 +5223,7 @@ static int hws_video_register(struct hws_pcie_dev *dev)
 		}
 		
 		INIT_WORK(&dev->video[i].videowork,video_data_process);
+		dev->video[i].last_complete_index = -1;
 		#if (LINUX_VERSION_CODE < KERNEL_VERSION(5,7,0))
 		err = video_register_device(vdev, VFL_TYPE_GRABBER,-1);
 		#else
@@ -5290,8 +5501,11 @@ static int hws_pcie_audio_trigger(struct snd_pcm_substream *substream, int cmd)
 			atomic64_set(&hws_audio_diag[chip->index].pcm_running, 1);
 		cancel_delayed_work(&chip->silence_work);
 		StartAudioCapture(dev, chip->index);
-		hws_audio_arm_publish_timer(chip);
-		break;
+			/*
+			 * Start period publication when the first source packet arrives.
+			 * Source-loss fallback can still arm the timer explicitly.
+			 */
+			break;
 	case SNDRV_PCM_TRIGGER_STOP:
 		//stop dma
 		//HWS_PCIE_WRITE(HWS_INT_BASE, HWS_DMA_MASK(chip->index), 0x000000000);
@@ -6161,6 +6375,7 @@ static int StartVideoCapture(struct hws_pcie_dev *pdx,int index)
 	{
 			pdx->m_pVCAPStatus[index][j].byLock = MEM_UNLOCK;
 			pdx->m_pVCAPStatus[index][j].byPath = 2;
+			pdx->m_VideoInfo[index].pStatusInfo[j].byLock = MEM_UNLOCK;
 			
 	}
 	//spin_unlock_irqrestore(&pdx->videoslock[index], flags);
@@ -6180,6 +6395,7 @@ static int StartVideoCapture(struct hws_pcie_dev *pdx,int index)
 static void StopVideoCapture(struct hws_pcie_dev *pdx,int index)
 {
 	//int inc=0;
+	int j;
 	
 	if(pdx->m_bVCapStarted[index] ==0) return;	
 	//pdx->m_nVideoIndex[index] =0;
@@ -6203,11 +6419,15 @@ static void StopVideoCapture(struct hws_pcie_dev *pdx,int index)
 	}
 	#endif 
 	EnableVideoCapture(pdx,index,0);
+	for (j = 0; j < MAX_VIDEO_QUEUE; j++)
+		pdx->m_VideoInfo[index].pStatusInfo[j].byLock = MEM_UNLOCK;
+	pdx->video[index].last_complete_index = -1;
 	pdx->m_bVCapIntDone[index] = 0;
 }
 static void StopAudioCapture(struct hws_pcie_dev *pdx,int index)
 {
 	//int inc=0;
+	int j;
 	if(pdx->m_bAudioRun[index] ==0) return;
 	pdx->m_bAudioRun[index] = 0;
 	pdx->m_bAudioStop[index] = 1;
@@ -6233,6 +6453,8 @@ static void StopAudioCapture(struct hws_pcie_dev *pdx,int index)
 	}
 	#endif 
 	EnableAudioCapture(pdx,index,0);
+	for (j = 0; j < MAX_AUDIO_QUEUE; j++)
+		pdx->m_AudioInfo[index].pStatusInfo[j].byLock = MEM_UNLOCK;
 }
 //-----------------------------
 
@@ -6311,10 +6533,14 @@ static int MemCopyVideoToSteam(struct hws_pcie_dev *pdx,int nDecoder)
 		{
 			//DbgPrint("########-*pMask- [%d]%X[%d-%d]\n",nDecoder, *pMask,nw,nh);
 			//------------------------------
-			if(pdx->m_nVideoHalfDone[nDecoder] == 1)
-			{
-				pdx->m_nVideoHalfDone[nDecoder] =0; 
-			}
+				if(pdx->m_nVideoHalfDone[nDecoder] == 1)
+				{
+					spin_lock_irqsave(&pdx->videoslock[nDecoder], flags);
+					if (pdx->m_VideoInfo[nDecoder].pStatusInfo[pdx->m_VideoInfo[nDecoder].m_nVideoIndex].byLock == MEM_WRITE)
+						pdx->m_VideoInfo[nDecoder].pStatusInfo[pdx->m_VideoInfo[nDecoder].m_nVideoIndex].byLock = MEM_UNLOCK;
+					spin_unlock_irqrestore(&pdx->videoslock[nDecoder], flags);
+					pdx->m_nVideoHalfDone[nDecoder] =0;
+				}
 			//------------------------------
 			return -1;
 		}
@@ -6340,44 +6566,35 @@ static int MemCopyVideoToSteam(struct hws_pcie_dev *pdx,int nDecoder)
 		pSrcBuf1 = pDmaSrcBuf1;
 		bBuf =NULL;
 		bBuf1 = NULL;
-		if(pdx->m_VideoInfo[nDecoder].dwisRuning ==1)
-		{
-			//--------------			
-			if(mVideoBufIndex== 1)
+			if(pdx->m_VideoInfo[nDecoder].dwisRuning ==1)
 			{
-				if(pdx->m_VideoInfo[nDecoder].pStatusInfo[pdx->m_VideoInfo[nDecoder].m_nVideoIndex].byLock== MEM_UNLOCK)
-	
-				{
-						nIndex = pdx->m_VideoInfo[nDecoder].m_nVideoIndex;
-						bBuf =	pdx->m_VideoInfo[nDecoder].m_pVideoBufData[nIndex];
+				/*
+				 * Reserve the software slot while a DMA half is copied into it.
+				 * Readers only consume MEM_LOCK frames, so the producer may not
+				 * steal a retained or in-flight complete slot.
+				 */
+				spin_lock_irqsave(&pdx->videoslock[nDecoder], flags);
+				nIndex = pdx->m_VideoInfo[nDecoder].m_nVideoIndex;
+				if (mVideoBufIndex == 1) {
+					if (pdx->m_VideoInfo[nDecoder].pStatusInfo[nIndex].byLock == MEM_UNLOCK) {
+						pdx->m_VideoInfo[nDecoder].pStatusInfo[nIndex].byLock = MEM_WRITE;
+						bBuf = pdx->m_VideoInfo[nDecoder].m_pVideoBufData[nIndex];
 						bBuf1 = pdx->m_VideoInfo[nDecoder].m_pVideoBufData1[nIndex];
-
+					} else {
+						nIndex = -1;
+					}
+				} else if (pdx->m_VideoInfo[nDecoder].pStatusInfo[nIndex].byLock == MEM_WRITE) {
+					bBuf = pdx->m_VideoInfo[nDecoder].m_pVideoBufData2[nIndex];
+					bBuf1 = pdx->m_VideoInfo[nDecoder].m_pVideoBufData3[nIndex];
+				} else {
+					nIndex = -1;
 				}
-			}
-			else
-			{
-					   nIndex = pdx->m_VideoInfo[nDecoder].m_nVideoIndex;
-					   bBuf =  pdx->m_VideoInfo[nDecoder].m_pVideoBufData2[nIndex];
-					   bBuf1 = pdx->m_VideoInfo[nDecoder].m_pVideoBufData3[nIndex];
+				spin_unlock_irqrestore(&pdx->videoslock[nDecoder], flags);
 
-			}
-			if(nIndex== -1)
-			{
-							
-					//if(pdx->m_VideoInfo[nDecoder].pStatusInfo[video_index][pdx->m_VideoInfo[nDecoder].m_nVideoIndex[video_index]].byField== 0)
-				//{
-					pdx->m_VideoInfo[nDecoder].pStatusInfo[pdx->m_VideoInfo[nDecoder].m_nVideoIndex].byLock= MEM_UNLOCK;
-					nIndex = pdx->m_VideoInfo[nDecoder].m_nVideoIndex;
-					bBuf =  pdx->m_VideoInfo[nDecoder].m_pVideoBufData[nIndex];
-					bBuf1 = pdx->m_VideoInfo[nDecoder].m_pVideoBufData1[nIndex];
-				//}
-			}
-
-			//-------------------
-			if((nIndex!= -1)&& bBuf&&bBuf1)
-			{
-				memcpy(bBuf,pSrcBuf,copysize);
-				memcpy(bBuf1,pSrcBuf1,copysize1);
+				if((nIndex!= -1)&& bBuf&&bBuf1)
+				{
+					memcpy(bBuf,pSrcBuf,copysize);
+					memcpy(bBuf1,pSrcBuf1,copysize1);
 				//----------------------
 					if(mVideoBufIndex== 0)
 					{
@@ -6398,21 +6615,29 @@ static int MemCopyVideoToSteam(struct hws_pcie_dev *pdx,int nDecoder)
 
 							spin_unlock_irqrestore(&pdx->videoslock[nDecoder], flags);
 					}
-					else
-					{
-						pdx->m_VideoInfo[nDecoder].m_VideoBufferSize[0] = copysize;
-						pdx->m_VideoInfo[nDecoder].m_VideoBufferSize[1] = copysize1;
-						pdx->m_nVideoHalfDone[nDecoder] = 1; 
+						else
+						{
+							spin_lock_irqsave(&pdx->videoslock[nDecoder], flags);
+							pdx->m_VideoInfo[nDecoder].m_VideoBufferSize[0] = copysize;
+							pdx->m_VideoInfo[nDecoder].m_VideoBufferSize[1] = copysize1;
+							spin_unlock_irqrestore(&pdx->videoslock[nDecoder], flags);
+							pdx->m_nVideoHalfDone[nDecoder] = 1;
 
-					}
+						}
 					 
 				}
-				else
-				{
-					 //printk("No Buffer Write %d",nDecoder);
-					 //queue_work(pdx->wq,&pdx->video[nDecoder].videowork);
-					 pdx->m_nVideoHalfDone[nDecoder] =0; 
-				}
+					else
+					{
+						 //printk("No Buffer Write %d",nDecoder);
+						 //queue_work(pdx->wq,&pdx->video[nDecoder].videowork);
+						 pdx->m_nVideoHalfDone[nDecoder] =0;
+						 if (nIndex >= 0 && mVideoBufIndex == 1) {
+							spin_lock_irqsave(&pdx->videoslock[nDecoder], flags);
+							if (pdx->m_VideoInfo[nDecoder].pStatusInfo[nIndex].byLock == MEM_WRITE)
+								pdx->m_VideoInfo[nDecoder].pStatusInfo[nIndex].byLock = MEM_UNLOCK;
+							spin_unlock_irqrestore(&pdx->videoslock[nDecoder], flags);
+						 }
+					}
 		}
 		*pMask = 0x55AAAA55;
 		return status;
@@ -6487,12 +6712,17 @@ static int MemCopyAudioToSteam( struct hws_pcie_dev  *pdx,int dwAudioCh)
 		nIndex = -1;
 		if(pdx->m_AudioInfo[dwAudioCh].dwisRuning ==1)
 		{
+			/*
+			 * Reserve one software queue slot before the packet copy. The
+			 * worker consumes only MEM_LOCK slots, so it cannot stage bytes
+			 * from a packet whose status metadata is not committed yet.
+			 */
+			spin_lock_irqsave(&pdx->audiolock[dwAudioCh], flags);
 			for( i = pdx->m_AudioInfo[dwAudioCh].m_nAudioIndex;i<MAX_AUDIO_QUEUE;i++)
 			{
 				if(pdx->m_AudioInfo[dwAudioCh].pStatusInfo[i].byLock== MEM_UNLOCK)
 				{
 						nIndex =i;
-						bBuf = pdx->m_AudioInfo[dwAudioCh].m_pAudioBufData[i];
 						break;
 				}
 			}
@@ -6503,13 +6733,10 @@ static int MemCopyAudioToSteam( struct hws_pcie_dev  *pdx,int dwAudioCh)
 					if(pdx->m_AudioInfo[dwAudioCh].pStatusInfo[i].byLock== MEM_UNLOCK)
 					{
 						nIndex =i;
-						bBuf = pdx->m_AudioInfo[dwAudioCh].m_pAudioBufData[i];
 						break;
 					}
-				
 				}
 			}
-			
 			if (diag) {
 				free_slots = 0;
 				for (i = 0; i < MAX_AUDIO_QUEUE; i++) {
@@ -6518,6 +6745,14 @@ static int MemCopyAudioToSteam( struct hws_pcie_dev  *pdx,int dwAudioCh)
 				}
 				hws_audio_diag_record_queue_free(dwAudioCh, free_slots);
 			}
+			if (nIndex != -1) {
+				pdx->m_AudioInfo[dwAudioCh].pStatusInfo[nIndex].byLock = MEM_WRITE;
+				pdx->m_AudioInfo[dwAudioCh].m_nAudioIndex = nIndex + 1;
+				if(pdx->m_AudioInfo[dwAudioCh].m_nAudioIndex>= MAX_AUDIO_QUEUE)
+					pdx->m_AudioInfo[dwAudioCh].m_nAudioIndex =0;
+				bBuf = pdx->m_AudioInfo[dwAudioCh].m_pAudioBufData[nIndex];
+			}
+			spin_unlock_irqrestore(&pdx->audiolock[dwAudioCh], flags);
 
 			if((nIndex!= -1)&& bBuf)
 			{
@@ -6526,11 +6761,6 @@ static int MemCopyAudioToSteam( struct hws_pcie_dev  *pdx,int dwAudioCh)
 					dma_sync_single_for_cpu(&pdx->pdev->dev,pdx->m_pbyAudio_phys[dwAudioCh],MAX_AUDIO_CAP_SIZE,2);
 					memcpy(bBuf, pSrcBuf, pdx->m_dwAudioPTKSize);
 					
-					pdx->m_AudioInfo[dwAudioCh].m_nAudioIndex = nIndex+1;
-					if(pdx->m_AudioInfo[dwAudioCh].m_nAudioIndex>= MAX_AUDIO_QUEUE)
-					{
-						pdx->m_AudioInfo[dwAudioCh].m_nAudioIndex =0;
-					}
 					spin_lock_irqsave(&pdx->audiolock[dwAudioCh], flags);
 					pdx->m_AudioInfo[dwAudioCh].pStatusInfo[nIndex].dwLength = pdx->m_dwAudioPTKSize ;
 			 		pdx->m_AudioInfo[dwAudioCh].pStatusInfo[nIndex].byLock = MEM_LOCK;
@@ -6555,6 +6785,12 @@ static int MemCopyAudioToSteam( struct hws_pcie_dev  *pdx,int dwAudioCh)
 			}
 			else
 			{
+				if (nIndex != -1) {
+					spin_lock_irqsave(&pdx->audiolock[dwAudioCh], flags);
+					if (pdx->m_AudioInfo[dwAudioCh].pStatusInfo[nIndex].byLock == MEM_WRITE)
+						pdx->m_AudioInfo[dwAudioCh].pStatusInfo[nIndex].byLock = MEM_UNLOCK;
+					spin_unlock_irqrestore(&pdx->audiolock[dwAudioCh], flags);
+				}
 				if (diag) {
 					atomic64_inc(&hws_audio_diag[dwAudioCh].no_free_queue_slots);
 					atomic64_inc(&hws_audio_diag[dwAudioCh].memcopy_failures);

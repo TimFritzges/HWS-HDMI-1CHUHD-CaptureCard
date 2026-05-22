@@ -54,35 +54,47 @@ diag_delta_from_snapshots() {
   fi
 
   awk '
-    FNR == 1 { next }
+    function before_value(ch, name,    key) {
+      key = ch SUBSEP name
+      if (key in before_values)
+        return before_values[key]
+      return 0
+    }
+    function current_value(name,    idx) {
+      idx = after_idx[name]
+      if (idx > 0)
+        return $(idx)
+      return 0
+    }
+    FNR == 1 && NR == FNR {
+      for (i = 1; i <= NF; i++)
+        before_names[i] = $i
+      next
+    }
     NR == FNR {
       ch = $1
-      b_work[ch]=$2
-      b_buf_processed[ch]=$5
-      b_buf_done[ch]=$6
-      b_buf_error[ch]=$7
-      b_copy[ch]=$8
-      b_scaler[ch]=$9
-      b_novideo[ch]=$10
-      b_fallback[ch]=$11
+      for (i = 2; i <= NF; i++)
+        before_values[ch SUBSEP before_names[i]] = $i
       next
     }
     FNR == 1 {
-      print "ch delta_work_runs delta_buf_processed delta_buf_done delta_buf_error delta_copy_frames delta_scaler_frames delta_novideo_frames delta_miss_fallbacks"
+      delete after_idx
+      for (i = 1; i <= NF; i++) {
+        after_idx[$i] = i
+        after_names[i] = $i
+      }
+      printf "ch"
+      for (i = 2; i <= NF; i++)
+        printf " delta_%s", after_names[i]
+      printf "\n"
       next
     }
     {
       ch = $1
-      printf "%s %d %d %d %d %d %d %d %d\n",
-        ch,
-        ($2 - b_work[ch]),
-        ($5 - b_buf_processed[ch]),
-        ($6 - b_buf_done[ch]),
-        ($7 - b_buf_error[ch]),
-        ($8 - b_copy[ch]),
-        ($9 - b_scaler[ch]),
-        ($10 - b_novideo[ch]),
-        ($11 - b_fallback[ch])
+      printf "%s", ch
+      for (i = 2; i <= NF; i++)
+        printf " %d", (current_value(after_names[i]) - before_value(ch, after_names[i]))
+      printf "\n"
     }
   ' "${before_file}" "${after_file}" > "${out_file}" || true
 }
@@ -97,39 +109,47 @@ audio_diag_delta_from_snapshots() {
   fi
 
   awk '
-    FNR == 1 { next }
+    function before_value(ch, name,    key) {
+      key = ch SUBSEP name
+      if (key in before_values)
+        return before_values[key]
+      return 0
+    }
+    function current_value(name,    idx) {
+      idx = after_idx[name]
+      if (idx > 0)
+        return $(idx)
+      return 0
+    }
+    FNR == 1 && NR == FNR {
+      for (i = 1; i <= NF; i++)
+        before_names[i] = $i
+      next
+    }
     NR == FNR {
       ch = $1
-      b_work[ch]=$2
-      b_buffers[ch]=$3
-      b_bytes[ch]=$4
-      b_frames[ch]=$5
-      b_period[ch]=$6
-      b_oversized[ch]=$7
-      b_drop_nosub[ch]=$8
-      b_drop_runtime[ch]=$9
-      b_drop_ring[ch]=$10
-      b_err[ch]=$11
+      for (i = 2; i <= NF; i++)
+        before_values[ch SUBSEP before_names[i]] = $i
       next
     }
     FNR == 1 {
-      print "ch delta_work_runs delta_buffers_found delta_delivered_bytes delta_delivered_frames delta_period_elapsed delta_oversized_packets delta_drop_no_substream delta_drop_bad_runtime delta_drop_ring_not_ready delta_delivery_errors"
+      delete after_idx
+      for (i = 1; i <= NF; i++) {
+        after_idx[$i] = i
+        after_names[i] = $i
+      }
+      printf "ch"
+      for (i = 2; i <= NF; i++)
+        printf " delta_%s", after_names[i]
+      printf "\n"
       next
     }
     {
       ch = $1
-      printf "%s %d %d %d %d %d %d %d %d %d %d\n",
-        ch,
-        ($2 - b_work[ch]),
-        ($3 - b_buffers[ch]),
-        ($4 - b_bytes[ch]),
-        ($5 - b_frames[ch]),
-        ($6 - b_period[ch]),
-        ($7 - b_oversized[ch]),
-        ($8 - b_drop_nosub[ch]),
-        ($9 - b_drop_runtime[ch]),
-        ($10 - b_drop_ring[ch]),
-        ($11 - b_err[ch])
+      printf "%s", ch
+      for (i = 2; i <= NF; i++)
+        printf " %d", (current_value(after_names[i]) - before_value(ch, after_names[i]))
+      printf "\n"
     }
   ' "${before_file}" "${after_file}" > "${out_file}" || true
 }
@@ -989,6 +1009,18 @@ if [[ "${drop_estimate}" -lt 0 ]]; then
   drop_estimate=0
 fi
 
+source_truth_requested_fps="${FPS}"
+source_truth_observed_fps="0.000"
+source_truth_mismatch_flag=0
+if [[ "${actual_seconds}" -gt 0 ]]; then
+  if [[ -n "${source_seq_span_frames:-}" && "${source_seq_span_frames:-0}" -gt 0 ]]; then
+    source_truth_observed_fps="$(awk -v f="${source_seq_span_frames}" -v s="${actual_seconds}" 'BEGIN { printf "%.3f", f / s }')"
+  elif [[ "${actual_frames}" -gt 0 ]]; then
+    source_truth_observed_fps="$(awk -v f="${actual_frames}" -v s="${actual_seconds}" 'BEGIN { printf "%.3f", f / s }')"
+  fi
+fi
+source_truth_mismatch_flag="$(awk -v req="${FPS}" -v obs="${source_truth_observed_fps}" 'BEGIN { if (req <= 0 || obs <= 0) { print 0; exit } diff=req-obs; if (diff<0) diff=-diff; print (diff > (req * 0.10)) ? 1 : 0 }')"
+
 dmesg --ctime > "${outdir}/${run_id}-dmesg.after.txt" 2>/dev/null || true
 dmesg --ctime --since "${start_local}" > "${outdir}/${run_id}-dmesg.since.txt" 2>/dev/null || true
 if [[ -r "${DIAG_FILE}" ]]; then
@@ -1008,6 +1040,51 @@ if [[ "${diag_before_captured}" -eq 1 && "${diag_after_captured}" -eq 1 ]]; then
 fi
 if [[ "${audio_diag_before_captured}" -eq 1 && "${audio_diag_after_captured}" -eq 1 ]]; then
   audio_diag_delta_from_snapshots "${audio_diag_before_file}" "${audio_diag_after_file}" "${audio_diag_delta_file}"
+fi
+
+audio_source_lost_periods_delta=0
+audio_timer_silence_injects_delta=0
+audio_workqueue_requeues_delta=0
+audio_memcopy_failures_delta=0
+audio_queue_free_slots_min_observed=0
+audio_queue_free_slots_max_observed=0
+audio_starvation_intervals=0
+audio_mean_recovery_periods="0.000"
+audio_source_starved_transitions_delta=0
+audio_recovery_transitions_delta=0
+audio_timer_late_events_delta=0
+if [[ -s "${audio_diag_delta_file}" ]]; then
+  audio_source_lost_periods_delta="$(awk 'NR==1 {for(i=1;i<=NF;i++) if($i=="delta_source_lost_periods") c=i; next} c {sum+=$c} END{print sum+0}' "${audio_diag_delta_file}")"
+  audio_timer_silence_injects_delta="$(awk 'NR==1 {for(i=1;i<=NF;i++) if($i=="delta_timer_silence_injects") c=i; next} c {sum+=$c} END{print sum+0}' "${audio_diag_delta_file}")"
+  audio_workqueue_requeues_delta="$(awk 'NR==1 {for(i=1;i<=NF;i++) if($i=="delta_workqueue_requeues") c=i; next} c {sum+=$c} END{print sum+0}' "${audio_diag_delta_file}")"
+  audio_memcopy_failures_delta="$(awk 'NR==1 {for(i=1;i<=NF;i++) if($i=="delta_memcopy_failures") c=i; next} c {sum+=$c} END{print sum+0}' "${audio_diag_delta_file}")"
+  audio_queue_free_slots_min_observed="$(awk 'NR==1 {for(i=1;i<=NF;i++) if($i=="delta_queue_free_slots_min") c=i; next} c && (NR==2 || $c<min) {min=$c} END{print (NR>1)?min:0}' "${audio_diag_delta_file}")"
+  audio_queue_free_slots_max_observed="$(awk 'NR==1 {for(i=1;i<=NF;i++) if($i=="delta_queue_free_slots_max") c=i; next} c && $c>max {max=$c} END{print max+0}' "${audio_diag_delta_file}")"
+  audio_source_starved_transitions_delta="$(awk 'NR==1 {for(i=1;i<=NF;i++) if($i=="delta_source_starved_transitions") c=i; next} c {sum+=$c} END{print sum+0}' "${audio_diag_delta_file}")"
+  audio_recovery_transitions_delta="$(awk 'NR==1 {for(i=1;i<=NF;i++) if($i=="delta_recovery_transitions") c=i; next} c {sum+=$c} END{print sum+0}' "${audio_diag_delta_file}")"
+  audio_timer_late_events_delta="$(awk 'NR==1 {for(i=1;i<=NF;i++) if($i=="delta_timer_late_events") c=i; next} c {sum+=$c} END{print sum+0}' "${audio_diag_delta_file}")"
+fi
+video_reused_no_fresh_delta=0
+video_reused_backpressure_delta=0
+video_ts_non_monotonic_delta=0
+video_seq_non_monotonic_delta=0
+if [[ -s "${diag_delta_file}" ]]; then
+  video_reused_no_fresh_delta="$(awk 'NR==1 {for(i=1;i<=NF;i++) if($i=="delta_reused_no_fresh_runs") c=i; next} c {sum+=$c} END{print sum+0}' "${diag_delta_file}")"
+  video_reused_backpressure_delta="$(awk 'NR==1 {for(i=1;i<=NF;i++) if($i=="delta_reused_backpressure_runs") c=i; next} c {sum+=$c} END{print sum+0}' "${diag_delta_file}")"
+  video_ts_non_monotonic_delta="$(awk 'NR==1 {for(i=1;i<=NF;i++) if($i=="delta_ts_non_monotonic_events") c=i; next} c {sum+=$c} END{print sum+0}' "${diag_delta_file}")"
+  video_seq_non_monotonic_delta="$(awk 'NR==1 {for(i=1;i<=NF;i++) if($i=="delta_seq_non_monotonic_events") c=i; next} c {sum+=$c} END{print sum+0}' "${diag_delta_file}")"
+fi
+audio_starvation_intervals=$((audio_source_lost_periods_delta + audio_timer_silence_injects_delta))
+if [[ "${audio_source_lost_periods_delta}" -gt 0 ]]; then
+  audio_mean_recovery_periods="$(awk -v loss="${audio_source_lost_periods_delta}" -v starve="${audio_starvation_intervals}" 'BEGIN { if (loss<=0) printf "0.000"; else printf "%.3f", starve/loss }')"
+fi
+
+source_truth_health_verdict="pass"
+if [[ "${source_truth_mismatch_flag}" -eq 1 || "${audio_starvation_intervals}" -gt 0 || "${frame_delta_over_3x_target_events}" -gt 0 ]]; then
+  source_truth_health_verdict="warn"
+fi
+if [[ "${drop_estimate}" -gt 0 || "${audio_memcopy_failures_delta}" -gt 0 ]]; then
+  source_truth_health_verdict="fail"
 fi
 {
   echo "diag_after_captured=${diag_after_captured}"
@@ -1103,6 +1180,25 @@ fi
   echo "frame_delta_over_2x_target_events=${frame_delta_over_2x_target_events}"
   echo "frame_delta_over_3x_target_events=${frame_delta_over_3x_target_events}"
   echo "pacing_status=${pacing_status}"
+  echo "source_truth_requested_fps=${source_truth_requested_fps}"
+  echo "source_truth_observed_fps=${source_truth_observed_fps}"
+  echo "source_truth_mismatch_flag=${source_truth_mismatch_flag}"
+  echo "audio_source_lost_periods_delta=${audio_source_lost_periods_delta}"
+  echo "audio_timer_silence_injects_delta=${audio_timer_silence_injects_delta}"
+  echo "audio_workqueue_requeues_delta=${audio_workqueue_requeues_delta}"
+  echo "audio_memcopy_failures_delta=${audio_memcopy_failures_delta}"
+  echo "audio_queue_free_slots_min_observed=${audio_queue_free_slots_min_observed}"
+  echo "audio_queue_free_slots_max_observed=${audio_queue_free_slots_max_observed}"
+  echo "audio_starvation_intervals=${audio_starvation_intervals}"
+  echo "audio_mean_recovery_periods=${audio_mean_recovery_periods}"
+  echo "audio_source_starved_transitions_delta=${audio_source_starved_transitions_delta}"
+  echo "audio_recovery_transitions_delta=${audio_recovery_transitions_delta}"
+  echo "audio_timer_late_events_delta=${audio_timer_late_events_delta}"
+  echo "video_reused_no_fresh_delta=${video_reused_no_fresh_delta}"
+  echo "video_reused_backpressure_delta=${video_reused_backpressure_delta}"
+  echo "video_ts_non_monotonic_delta=${video_ts_non_monotonic_delta}"
+  echo "video_seq_non_monotonic_delta=${video_seq_non_monotonic_delta}"
+  echo "source_truth_health_verdict=${source_truth_health_verdict}"
   echo "retire_capture_urb_events=${retire_capture_urb_events}"
   echo "callbacks_suppressed_events=${callbacks_suppressed_events}"
   echo "callbacks_suppressed_total=${callbacks_suppressed_total}"
@@ -1182,9 +1278,9 @@ fi
 } > "${summary_file}"
 
 if [[ ! -f "${history_file}" ]]; then
-  echo "run_id,timestamp_utc,run_tag,backend,device,size,fps,duration,expected_frames,actual_frames,estimated_drop_vs_target_frames,source_seq_span_frames,source_seq_gap_frames,ffmpeg_counter_frames,pacing_samples,target_frame_interval_ms,frame_delta_ms_avg,frame_delta_ms_p95,frame_delta_ms_p99,frame_delta_ms_max,frame_delta_over_2x_target_events,frame_delta_over_3x_target_events,pacing_status,retire_capture_urb_events,callbacks_suppressed_events,callbacks_suppressed_total,uvcvideo_events,module_events,preflight_status,preflight_warning_count,idle_elapsed_seconds,idle_err_delta_total,idle_err_rate_per_s,idle_capture_err_delta_total,idle_capture_err_rate_per_s,test_err_delta_total,test_err_rate_per_s,test_capture_err_delta_total,test_capture_err_rate_per_s,net_err_rate_over_idle_per_s,net_capture_err_rate_over_idle_per_s,net_err_delta_over_idle,net_capture_err_delta_over_idle,elapsed_seconds,results_dir" > "${history_file}"
+  echo "run_id,timestamp_utc,run_tag,backend,device,size,fps,duration,expected_frames,actual_frames,estimated_drop_vs_target_frames,source_seq_span_frames,source_seq_gap_frames,ffmpeg_counter_frames,pacing_samples,target_frame_interval_ms,frame_delta_ms_avg,frame_delta_ms_p95,frame_delta_ms_p99,frame_delta_ms_max,frame_delta_over_2x_target_events,frame_delta_over_3x_target_events,pacing_status,source_truth_observed_fps,source_truth_mismatch_flag,audio_source_lost_periods_delta,audio_timer_silence_injects_delta,audio_workqueue_requeues_delta,audio_memcopy_failures_delta,audio_starvation_intervals,audio_mean_recovery_periods,source_truth_health_verdict,retire_capture_urb_events,callbacks_suppressed_events,callbacks_suppressed_total,uvcvideo_events,module_events,preflight_status,preflight_warning_count,idle_elapsed_seconds,idle_err_delta_total,idle_err_rate_per_s,idle_capture_err_delta_total,idle_capture_err_rate_per_s,test_err_delta_total,test_err_rate_per_s,test_capture_err_delta_total,test_capture_err_rate_per_s,net_err_rate_over_idle_per_s,net_capture_err_rate_over_idle_per_s,net_err_delta_over_idle,net_capture_err_delta_over_idle,elapsed_seconds,results_dir" > "${history_file}"
 fi
-echo "${run_id},$(date -u --iso-8601=seconds),${RUN_TAG:-none},${backend},${DEVICE},${SIZE},${FPS},${DURATION},${expected_frames},${actual_frames},${drop_estimate},${source_seq_span_frames:-},${source_seq_gap_frames:-},${ffmpeg_counter_frames:-},${pacing_samples},${target_frame_interval_ms},${frame_delta_ms_avg},${frame_delta_ms_p95},${frame_delta_ms_p99},${frame_delta_ms_max},${frame_delta_over_2x_target_events},${frame_delta_over_3x_target_events},${pacing_status},${retire_capture_urb_events},${callbacks_suppressed_events},${callbacks_suppressed_total},${uvcvideo_events},${module_events},${preflight_status},${preflight_warning_count},${idle_elapsed_seconds},${idle_err_delta_total},${idle_err_rate_per_s},${idle_capture_err_delta_total},${idle_capture_err_rate_per_s},${test_err_delta_total},${test_err_rate_per_s},${test_capture_err_delta_total},${test_capture_err_rate_per_s},${net_err_rate_over_idle_per_s},${net_capture_err_rate_over_idle_per_s},${net_err_delta_over_idle},${net_capture_err_delta_over_idle},${actual_seconds},${outdir}" >> "${history_file}"
+echo "${run_id},$(date -u --iso-8601=seconds),${RUN_TAG:-none},${backend},${DEVICE},${SIZE},${FPS},${DURATION},${expected_frames},${actual_frames},${drop_estimate},${source_seq_span_frames:-},${source_seq_gap_frames:-},${ffmpeg_counter_frames:-},${pacing_samples},${target_frame_interval_ms},${frame_delta_ms_avg},${frame_delta_ms_p95},${frame_delta_ms_p99},${frame_delta_ms_max},${frame_delta_over_2x_target_events},${frame_delta_over_3x_target_events},${pacing_status},${source_truth_observed_fps},${source_truth_mismatch_flag},${audio_source_lost_periods_delta},${audio_timer_silence_injects_delta},${audio_workqueue_requeues_delta},${audio_memcopy_failures_delta},${audio_starvation_intervals},${audio_mean_recovery_periods},${source_truth_health_verdict},${retire_capture_urb_events},${callbacks_suppressed_events},${callbacks_suppressed_total},${uvcvideo_events},${module_events},${preflight_status},${preflight_warning_count},${idle_elapsed_seconds},${idle_err_delta_total},${idle_err_rate_per_s},${idle_capture_err_delta_total},${idle_capture_err_rate_per_s},${test_err_delta_total},${test_err_rate_per_s},${test_capture_err_delta_total},${test_capture_err_rate_per_s},${net_err_rate_over_idle_per_s},${net_capture_err_rate_over_idle_per_s},${net_err_delta_over_idle},${net_capture_err_delta_over_idle},${actual_seconds},${outdir}" >> "${history_file}"
 
 cat "${summary_file}"
 echo "logs=${run_log}"
