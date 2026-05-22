@@ -16,6 +16,7 @@
 #include <media/v4l2-ctrls.h>
 #include <media/v4l2-device.h>
 #include <linux/debugfs.h>
+#include <linux/proc_fs.h>
 #include <linux/seq_file.h>
 #include <linux/sched.h>
 #include <linux/ktime.h>
@@ -34,11 +35,15 @@ static void StopVideoCapture(struct hws_pcie_dev *pdx,int index);
 static int hws_nearest_supported_fps(int fps);
 static int diag_enable;
 module_param_named(diag_enable, diag_enable, int, 0644);
-MODULE_PARM_DESC(diag_enable, "Enable HWS runtime diagnostics (0=off, 1=on)");
+MODULE_PARM_DESC(diag_enable, "Enable HWS verbose diagnostic logging and timing (counters stay available)");
 
 static int video_work_budget = 2;
 module_param_named(video_work_budget, video_work_budget, int, 0644);
 MODULE_PARM_DESC(video_work_budget, "Max queued buffers handled per video worker run (min 1)");
+
+static int video_stall_timeout_ms = 500;
+module_param_named(video_stall_timeout_ms, video_stall_timeout_ms, int, 0644);
+MODULE_PARM_DESC(video_stall_timeout_ms, "Fresh-frame timeout before active HDMI uses placeholder cadence (min 100)");
 
 static int audio_work_budget = 8;
 module_param_named(audio_work_budget, audio_work_budget, int, 0644);
@@ -73,6 +78,19 @@ enum {
 	HWS_FPS_POLICY_USERSPACE_CONVERT = 2,
 	HWS_FPS_POLICY_DRIVER_CONVERT_EXPERIMENTAL = 3,
 	HWS_FPS_POLICY_AUTO_PROFILE = 4,
+};
+
+enum hws_video_signal_state {
+	HWS_VIDEO_SIGNAL_LIVE = 0,
+	HWS_VIDEO_SIGNAL_STALLED,
+	HWS_VIDEO_SIGNAL_NO_SIGNAL,
+};
+
+enum hws_video_fallback_cadence_reason {
+	HWS_VIDEO_CADENCE_NONE = 0,
+	HWS_VIDEO_CADENCE_LAST_STABLE,
+	HWS_VIDEO_CADENCE_REQUESTED,
+	HWS_VIDEO_CADENCE_DEFAULT_60,
 };
 
 static int fps_policy_mode = HWS_FPS_POLICY_SOURCE_TRUTH;
@@ -168,11 +186,20 @@ struct hws_diag_stats {
 	atomic64_t reused_backpressure_runs;
 	atomic64_t ts_non_monotonic_events;
 	atomic64_t seq_non_monotonic_events;
+	atomic64_t signal_live_transitions;
+	atomic64_t signal_stalled_transitions;
+	atomic64_t signal_no_signal_transitions;
+	atomic64_t no_signal_placeholder_frames;
+	atomic64_t stalled_placeholder_frames;
+	atomic64_t fallback_last_stable_ticks;
+	atomic64_t fallback_requested_ticks;
+	atomic64_t fallback_default_60_ticks;
 };
 
 static struct hws_diag_stats hws_diag[MAX_VID_CHANNELS];
 static struct hws_audio_diag_stats hws_audio_diag[MAX_VID_CHANNELS];
 static struct dentry *hws_diag_root;
+static struct proc_dir_entry *hws_diag_proc_root;
 static u64 hws_diag_last_fresh_ns[MAX_VID_CHANNELS];
 static u64 hws_source_interval_ns_avg[MAX_VID_CHANNELS];
 static u64 hws_diag_last_ts_ns[MAX_VID_CHANNELS];
@@ -213,6 +240,14 @@ static inline void hws_diag_reset(void)
 		atomic64_set(&hws_diag[i].reused_backpressure_runs, 0);
 		atomic64_set(&hws_diag[i].ts_non_monotonic_events, 0);
 		atomic64_set(&hws_diag[i].seq_non_monotonic_events, 0);
+		atomic64_set(&hws_diag[i].signal_live_transitions, 0);
+		atomic64_set(&hws_diag[i].signal_stalled_transitions, 0);
+		atomic64_set(&hws_diag[i].signal_no_signal_transitions, 0);
+		atomic64_set(&hws_diag[i].no_signal_placeholder_frames, 0);
+		atomic64_set(&hws_diag[i].stalled_placeholder_frames, 0);
+		atomic64_set(&hws_diag[i].fallback_last_stable_ticks, 0);
+		atomic64_set(&hws_diag[i].fallback_requested_ticks, 0);
+		atomic64_set(&hws_diag[i].fallback_default_60_ticks, 0);
 		hws_diag_last_fresh_ns[i] = 0;
 		hws_source_interval_ns_avg[i] = 0;
 		hws_diag_last_ts_ns[i] = 0;
@@ -451,8 +486,8 @@ enum hws_audio_silence_reason {
 
 static int _deliver_samples(struct hws_audio *drv, void *aud_data, u32 aud_len);
 
-static void hws_audio_publish_timer_init(struct hrtimer *timer,
-					 enum hrtimer_restart (*fn)(struct hrtimer *))
+static void hws_hrtimer_init(struct hrtimer *timer,
+			     enum hrtimer_restart (*fn)(struct hrtimer *))
 {
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6,14,0)
 	hrtimer_setup(timer, fn, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
@@ -525,7 +560,7 @@ static int hws_audio_stage_bytes(struct hws_audio *drv, const u8 *src, u32 aud_l
 			drop_bytes = drv->staged_fill_bytes;
 		drv->staged_rpos_bytes = (drv->staged_rpos_bytes + drop_bytes) % drv->resampled_buf_size;
 		drv->staged_fill_bytes -= drop_bytes;
-		if (hws_diag_enabled() && ch >= 0 && ch < MAX_VID_CHANNELS) {
+		if (ch >= 0 && ch < MAX_VID_CHANNELS) {
 			atomic64_inc(&hws_audio_diag[ch].staged_overruns);
 			atomic64_add(drop_bytes, &hws_audio_diag[ch].staged_bytes_dropped);
 		}
@@ -538,7 +573,7 @@ static int hws_audio_stage_bytes(struct hws_audio *drv, const u8 *src, u32 aud_l
 
 	drv->staged_wpos_bytes = (drv->staged_wpos_bytes + aud_len) % drv->resampled_buf_size;
 	drv->staged_fill_bytes += aud_len;
-	if (hws_diag_enabled())
+	if (ch >= 0 && ch < MAX_VID_CHANNELS)
 		hws_audio_diag_record_staged_fill(ch, drv->staged_fill_bytes);
 	spin_unlock_irqrestore(&drv->ring_lock, flags);
 
@@ -577,7 +612,7 @@ static int hws_audio_publish_one_period(struct hws_audio *drv)
 		return -EMSGSIZE;
 
 	ch = drv->index;
-	diag = hws_diag_enabled() && ch >= 0 && ch < MAX_VID_CHANNELS;
+	diag = ch >= 0 && ch < MAX_VID_CHANNELS;
 	now_ns = ktime_get_ns();
 	last_irq_ns = READ_ONCE(drv->last_irq_ns);
 	packet_ns = hws_audio_packet_duration_ns(drv, aud_len);
@@ -703,7 +738,7 @@ static enum hrtimer_restart hws_audio_publish_timer_fn(struct hrtimer *timer)
 	u64 interval_ns;
 	u64 overruns;
 	int ch = drv->index;
-	bool diag = hws_diag_enabled() && ch >= 0 && ch < MAX_VID_CHANNELS;
+	bool diag = ch >= 0 && ch < MAX_VID_CHANNELS;
 
 	if (diag)
 		atomic64_inc(&hws_audio_diag[ch].timer_runs);
@@ -761,10 +796,10 @@ static int hws_diag_show(struct seq_file *m, void *unused)
 {
 	int i;
 
-	seq_puts(m, "ch work_runs work_ns_total work_ns_max buf_processed buf_done buf_error copy_frames scaler_frames novideo_frames miss_fallbacks memcopy_ns_total scaler_ns_total fresh_runs nofresh_runs src_interval_ns_total src_interval_ns_max src_interval_samples reused_no_fresh_runs reused_backpressure_runs ts_non_monotonic_events seq_non_monotonic_events\n");
+	seq_puts(m, "ch work_runs work_ns_total work_ns_max buf_processed buf_done buf_error copy_frames scaler_frames novideo_frames miss_fallbacks memcopy_ns_total scaler_ns_total fresh_runs nofresh_runs src_interval_ns_total src_interval_ns_max src_interval_samples reused_no_fresh_runs reused_backpressure_runs ts_non_monotonic_events seq_non_monotonic_events signal_live_transitions signal_stalled_transitions signal_no_signal_transitions no_signal_placeholder_frames stalled_placeholder_frames fallback_last_stable_ticks fallback_requested_ticks fallback_default_60_ticks\n");
 	for (i = 0; i < MAX_VID_CHANNELS; i++) {
 		seq_printf(m,
-			"%d %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld\n",
+			"%d %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld\n",
 			i,
 			(long long)atomic64_read(&hws_diag[i].work_runs),
 			(long long)atomic64_read(&hws_diag[i].work_ns_total),
@@ -786,7 +821,15 @@ static int hws_diag_show(struct seq_file *m, void *unused)
 			(long long)atomic64_read(&hws_diag[i].reused_no_fresh_runs),
 			(long long)atomic64_read(&hws_diag[i].reused_backpressure_runs),
 			(long long)atomic64_read(&hws_diag[i].ts_non_monotonic_events),
-			(long long)atomic64_read(&hws_diag[i].seq_non_monotonic_events));
+			(long long)atomic64_read(&hws_diag[i].seq_non_monotonic_events),
+			(long long)atomic64_read(&hws_diag[i].signal_live_transitions),
+			(long long)atomic64_read(&hws_diag[i].signal_stalled_transitions),
+			(long long)atomic64_read(&hws_diag[i].signal_no_signal_transitions),
+			(long long)atomic64_read(&hws_diag[i].no_signal_placeholder_frames),
+			(long long)atomic64_read(&hws_diag[i].stalled_placeholder_frames),
+			(long long)atomic64_read(&hws_diag[i].fallback_last_stable_ticks),
+			(long long)atomic64_read(&hws_diag[i].fallback_requested_ticks),
+			(long long)atomic64_read(&hws_diag[i].fallback_default_60_ticks));
 	}
 
 	return 0;
@@ -915,6 +958,56 @@ static const struct file_operations hws_diag_fops = {
 	.llseek = seq_lseek,
 	.release = single_release,
 };
+
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5,6,0)
+static const struct proc_ops hws_audio_diag_proc_ops = {
+	.proc_open = hws_audio_diag_open,
+	.proc_read = seq_read,
+	.proc_lseek = seq_lseek,
+	.proc_release = single_release,
+};
+
+static const struct proc_ops hws_source_cadence_proc_ops = {
+	.proc_open = hws_source_cadence_open,
+	.proc_read = seq_read,
+	.proc_lseek = seq_lseek,
+	.proc_release = single_release,
+};
+
+static const struct proc_ops hws_diag_proc_ops = {
+	.proc_open = hws_diag_open,
+	.proc_read = seq_read,
+	.proc_lseek = seq_lseek,
+	.proc_release = single_release,
+};
+#else
+#define hws_audio_diag_proc_ops hws_audio_diag_fops
+#define hws_source_cadence_proc_ops hws_source_cadence_fops
+#define hws_diag_proc_ops hws_diag_fops
+#endif
+
+static void hws_diag_init_procfs(void)
+{
+	if (hws_diag_proc_root)
+		return;
+
+	hws_diag_proc_root = proc_mkdir("hwsuhdx1", NULL);
+	if (!hws_diag_proc_root)
+		return;
+
+	proc_create("video_diag", 0444, hws_diag_proc_root, &hws_diag_proc_ops);
+	proc_create("audio_diag", 0444, hws_diag_proc_root, &hws_audio_diag_proc_ops);
+	proc_create("source_cadence", 0444, hws_diag_proc_root, &hws_source_cadence_proc_ops);
+}
+
+static void hws_diag_remove_procfs(void)
+{
+	if (!hws_diag_proc_root)
+		return;
+
+	remove_proc_subtree("hwsuhdx1", NULL);
+	hws_diag_proc_root = NULL;
+}
 
 static void hws_diag_init_debugfs(void)
 {
@@ -1095,10 +1188,12 @@ static const framegrabber_pixfmt_t support_pixfmts[] = {
 };
 
 static const int framegrabber_support_refreshrate[]= {
+    [REFRESHRATE_12]=12,
     [REFRESHRATE_15]=15,
     [REFRESHRATE_24]=24,
     [REFRESHRATE_25]=25,
     [REFRESHRATE_30]=30,
+    [REFRESHRATE_48]=48,
     [REFRESHRATE_50]=50,
     [REFRESHRATE_60]=60,
     [REFRESHRATE_100]=100,
@@ -1141,7 +1236,7 @@ static int hws_effective_source_fps(struct hws_video *videodev)
 
 	return hws_nearest_supported_fps(fps);
 }
-static const int hws_common_fps[] = { 25, 30, 50, 60, 100 };
+static const int hws_common_fps[] = { 12, 15, 24, 25, 30, 48, 50, 60, 100, 120, 144, 240 };
 #define HWS_COMMON_FPS_COUNT ARRAY_SIZE(hws_common_fps)
 
 static bool hws_is_common_fps(int fps)
@@ -1222,6 +1317,98 @@ static int hws_policy_select_fps(struct hws_video *videodev, int fallback_fps)
 			fps = hws_nearest_common_fps(fps);
 		return fps;
 	}
+}
+
+static void hws_video_set_signal_state(struct hws_video *videodev,
+				       enum hws_video_signal_state state)
+{
+	int prev;
+	int ch;
+
+	if (!videodev)
+		return;
+
+	prev = READ_ONCE(videodev->signal_state);
+	if (prev == state)
+		return;
+
+	WRITE_ONCE(videodev->signal_state, state);
+
+	ch = videodev->index;
+	if (ch < 0 || ch >= MAX_VID_CHANNELS)
+		return;
+
+	switch (state) {
+	case HWS_VIDEO_SIGNAL_LIVE:
+		atomic64_inc(&hws_diag[ch].signal_live_transitions);
+		break;
+	case HWS_VIDEO_SIGNAL_STALLED:
+		atomic64_inc(&hws_diag[ch].signal_stalled_transitions);
+		break;
+	case HWS_VIDEO_SIGNAL_NO_SIGNAL:
+		atomic64_inc(&hws_diag[ch].signal_no_signal_transitions);
+		break;
+	}
+}
+
+static int hws_video_fallback_fps(struct hws_video *videodev,
+				  enum hws_video_fallback_cadence_reason *reason)
+{
+	int fps;
+
+	fps = READ_ONCE(videodev->last_stable_source_fps);
+	if (fps > 0) {
+		if (reason)
+			*reason = HWS_VIDEO_CADENCE_LAST_STABLE;
+		return hws_nearest_supported_fps(fps);
+	}
+
+	fps = READ_ONCE(videodev->current_out_framerate);
+	if (fps > 0) {
+		if (reason)
+			*reason = HWS_VIDEO_CADENCE_REQUESTED;
+		return hws_nearest_supported_fps(fps);
+	}
+
+	if (reason)
+		*reason = HWS_VIDEO_CADENCE_DEFAULT_60;
+	return 60;
+}
+
+static u64 hws_video_interval_ns(int fps)
+{
+	if (fps <= 0)
+		fps = 60;
+
+	return DIV_ROUND_CLOSEST_ULL(HWS_NS_PER_SEC, (u64)fps);
+}
+
+static ktime_t hws_video_fallback_interval(struct hws_video *videodev)
+{
+	u64 interval_ns = hws_video_interval_ns(hws_video_fallback_fps(videodev, NULL));
+
+	if (!interval_ns)
+		interval_ns = 16666667ULL;
+	return ns_to_ktime(interval_ns);
+}
+
+static void hws_video_arm_fallback_timer(struct hws_video *videodev)
+{
+	if (!videodev || READ_ONCE(videodev->fallback_timer_armed))
+		return;
+
+	WRITE_ONCE(videodev->fallback_timer_armed, true);
+	hrtimer_start(&videodev->fallback_timer,
+		      hws_video_fallback_interval(videodev), HRTIMER_MODE_REL);
+}
+
+static void hws_video_cancel_fallback_timer(struct hws_video *videodev)
+{
+	if (!videodev)
+		return;
+
+	WRITE_ONCE(videodev->fallback_timer_armed, false);
+	hrtimer_cancel(&videodev->fallback_timer);
 }
 //-------------------------------------------
 static int v4l2_get_suport_VideoFormatIndex(struct v4l2_format *fmt) 
@@ -2271,7 +2458,6 @@ static int hws_vidioc_enum_frameintervals(struct file *file, void *fh,
 static int hws_vidioc_s_parm(struct file *file, void *fh, struct v4l2_streamparm *a)
 {
 	struct hws_video *videodev = video_drvdata(file);
-	v4l2_model_timing_t *mode;
 	int io_frame_rate;
 	int src_fps;
 	int policy_mode = hws_effective_policy_mode();
@@ -2296,10 +2482,6 @@ static int hws_vidioc_s_parm(struct file *file, void *fh, struct v4l2_streamparm
 		if (abs(io_frame_rate - src_fps) > 1)
 			return -EINVAL;
 		io_frame_rate = src_fps;
-	} else if (policy_mode == HWS_FPS_POLICY_SOURCE_TRUTH) {
-		mode = v4l2_model_get_support_videoformat(videodev->current_out_size_index);
-		if (mode)
-			io_frame_rate = hws_nearest_common_fps(mode->refresh_rate);
 	} else if (policy_mode == HWS_FPS_POLICY_AUTO_PROFILE && src_fps > 0) {
 		if (io_frame_rate > src_fps)
 			io_frame_rate = src_fps;
@@ -2578,6 +2760,11 @@ static int hws_start_streaming(struct vb2_queue *q, unsigned int count)
 	WRITE_ONCE(videodev->next_frame_ts_ns, 0);
 	videodev->output_rate_accum = 0;
 	videodev->last_complete_index = -1;
+	WRITE_ONCE(videodev->stream_start_ns, ktime_get_ns());
+	WRITE_ONCE(videodev->last_source_complete_ns, 0);
+	WRITE_ONCE(videodev->last_stable_source_fps, 0);
+	WRITE_ONCE(videodev->fallback_cadence_reason, HWS_VIDEO_CADENCE_NONE);
+	hws_video_set_signal_state(videodev, HWS_VIDEO_SIGNAL_LIVE);
 	hws_diag_last_fresh_ns[videodev->index] = 0;
 	hws_source_interval_ns_avg[videodev->index] = 0;
 	msleep(100);
@@ -2586,6 +2773,7 @@ static int hws_start_streaming(struct vb2_queue *q, unsigned int count)
 	//{
 		//printk( "StartVideoCapture %s(%d)->%d\n", __func__,videodev->index,videodev->fileindex);
 		StartVideoCapture(videodev->dev,videodev->index);
+		hws_video_arm_fallback_timer(videodev);
 		videodev->startstreamIndex++;
 		//------------------------ reset queue
    	   //printk( "%s(%d)->%d  reset queue \n", __func__,videodev->index,videodev->fileindex);
@@ -2619,7 +2807,13 @@ static void hws_stop_streaming(struct vb2_queue *q)
 	#if 1
 	//-----------------------------------
 	WRITE_ONCE(videodev->next_frame_ts_ns, 0);
+	hws_video_cancel_fallback_timer(videodev);
 	videodev->output_rate_accum = 0;
+	WRITE_ONCE(videodev->stream_start_ns, 0);
+	WRITE_ONCE(videodev->last_source_complete_ns, 0);
+	WRITE_ONCE(videodev->last_stable_source_fps, 0);
+	WRITE_ONCE(videodev->fallback_cadence_reason, HWS_VIDEO_CADENCE_NONE);
+	hws_video_set_signal_state(videodev, HWS_VIDEO_SIGNAL_LIVE);
 	hws_diag_last_fresh_ns[videodev->index] = 0;
 	hws_source_interval_ns_avg[videodev->index] = 0;
 	videodev->startstreamIndex --;
@@ -2732,9 +2926,15 @@ static int hws_start_streaming_multi(struct vb2_queue *q, unsigned int count)
         WRITE_ONCE(videodev->next_frame_ts_ns, 0);
         videodev->output_rate_accum = 0;
         videodev->last_complete_index = -1;
+        WRITE_ONCE(videodev->stream_start_ns, ktime_get_ns());
+        WRITE_ONCE(videodev->last_source_complete_ns, 0);
+        WRITE_ONCE(videodev->last_stable_source_fps, 0);
+        WRITE_ONCE(videodev->fallback_cadence_reason, HWS_VIDEO_CADENCE_NONE);
+        hws_video_set_signal_state(videodev, HWS_VIDEO_SIGNAL_LIVE);
         hws_diag_last_fresh_ns[videodev->index] = 0;
         hws_source_interval_ns_avg[videodev->index] = 0;
         StartVideoCapture(videodev->dev, videodev->index);
+        hws_video_arm_fallback_timer(videodev);
     }
     return 0;
 }
@@ -2769,8 +2969,14 @@ static void hws_stop_streaming_multi(struct vb2_queue *q)
     /* Stop engine when the last streamer goes away */
     if (atomic_dec_return(&videodev->engine_users) == 0) {
         WRITE_ONCE(videodev->next_frame_ts_ns, 0);
+        hws_video_cancel_fallback_timer(videodev);
         videodev->output_rate_accum = 0;
         videodev->last_complete_index = -1;
+        WRITE_ONCE(videodev->stream_start_ns, 0);
+        WRITE_ONCE(videodev->last_source_complete_ns, 0);
+        WRITE_ONCE(videodev->last_stable_source_fps, 0);
+        WRITE_ONCE(videodev->fallback_cadence_reason, HWS_VIDEO_CADENCE_NONE);
+        hws_video_set_signal_state(videodev, HWS_VIDEO_SIGNAL_LIVE);
         hws_diag_last_fresh_ns[videodev->index] = 0;
         hws_source_interval_ns_avg[videodev->index] = 0;
         StopVideoCapture(videodev->dev, videodev->index);
@@ -2839,7 +3045,7 @@ static int _deliver_samples(struct hws_audio *drv, void *aud_data, u32 aud_len)
 	unsigned int wpos;
 	unsigned int period_size;
 	unsigned int period_used;
-	bool diag = hws_diag_enabled();
+	bool diag = true;
 	int elapsed = 0;
 	u64 now_ns = ktime_get_ns();
 	u64 last_irq_ns = READ_ONCE(drv->last_irq_ns);
@@ -2985,7 +3191,7 @@ static void hws_inject_silence_packet(struct hws_pcie_dev *pdx, int dwAudioCh,
 	 */
 	hws_audio_arm_publish_timer(drv);
 
-	if (hws_diag_enabled()) {
+	if (dwAudioCh >= 0 && dwAudioCh < MAX_VID_CHANNELS) {
 		if (reason == HWS_AUDIO_SILENCE_NO_VIDEO)
 			atomic64_inc(&hws_audio_diag[dwAudioCh].no_video_silence_injects);
 		else if (reason == HWS_AUDIO_SILENCE_TIMER)
@@ -3004,7 +3210,7 @@ static void hws_audio_silence_fallback_work(struct work_struct *work)
 	struct hws_audio *drv = container_of(dwork, struct hws_audio, silence_work);
 	struct hws_pcie_dev *pdx = drv->dev;
 	int ch = drv->index;
-	bool diag = hws_diag_enabled();
+	bool diag = ch >= 0 && ch < MAX_VID_CHANNELS;
 	u32 packet_bytes;
 	u64 packet_ns;
 	u64 now_ns;
@@ -3052,7 +3258,7 @@ static void audio_data_process(struct work_struct *p_work)
 	unsigned int budget;
 	unsigned int processed = 0;
 	unsigned long flags;
-	bool diag = hws_diag_enabled();
+	bool diag = true;
 
 	dwAudioCh = drv->index;
 	if (dwAudioCh < 0 || dwAudioCh >= MAX_VID_CHANNELS)
@@ -4740,17 +4946,94 @@ static unsigned int hws_pending_consumer_count(struct hws_video *videodev)
     return count;
 }
 
+static enum hws_video_signal_state hws_video_signal_state_now(struct hws_video *videodev,
+							      u64 now_ns)
+{
+	u64 reference_ns;
+	u64 timeout_ns;
+
+	if (READ_ONCE(videodev->dev->m_curr_No_Video[videodev->index]))
+		return HWS_VIDEO_SIGNAL_NO_SIGNAL;
+
+	timeout_ns = (u64)clamp(video_stall_timeout_ms, 100, 5000) * NSEC_PER_MSEC;
+	reference_ns = READ_ONCE(videodev->last_source_complete_ns);
+	if (!reference_ns)
+		reference_ns = READ_ONCE(videodev->stream_start_ns);
+	if (reference_ns && now_ns > reference_ns &&
+	    now_ns - reference_ns > timeout_ns)
+		return HWS_VIDEO_SIGNAL_STALLED;
+
+	return HWS_VIDEO_SIGNAL_LIVE;
+}
+
+static void hws_video_diag_record_fallback_tick(struct hws_video *videodev,
+						enum hws_video_fallback_cadence_reason reason)
+{
+	int ch = videodev->index;
+
+	WRITE_ONCE(videodev->fallback_cadence_reason, reason);
+	if (ch < 0 || ch >= MAX_VID_CHANNELS)
+		return;
+
+	switch (reason) {
+	case HWS_VIDEO_CADENCE_LAST_STABLE:
+		atomic64_inc(&hws_diag[ch].fallback_last_stable_ticks);
+		break;
+	case HWS_VIDEO_CADENCE_REQUESTED:
+		atomic64_inc(&hws_diag[ch].fallback_requested_ticks);
+		break;
+	case HWS_VIDEO_CADENCE_DEFAULT_60:
+		atomic64_inc(&hws_diag[ch].fallback_default_60_ticks);
+		break;
+	default:
+		break;
+	}
+}
+
+static enum hrtimer_restart hws_video_fallback_timer_fn(struct hrtimer *timer)
+{
+	struct hws_video *videodev = container_of(timer, struct hws_video, fallback_timer);
+	enum hws_video_fallback_cadence_reason reason = HWS_VIDEO_CADENCE_NONE;
+	enum hws_video_signal_state state;
+	ktime_t interval;
+	u64 now_ns;
+
+	if (!READ_ONCE(videodev->fallback_timer_armed) ||
+	    !READ_ONCE(videodev->dev->m_bVCapStarted[videodev->index])) {
+		WRITE_ONCE(videodev->fallback_timer_armed, false);
+		return HRTIMER_NORESTART;
+	}
+
+	now_ns = ktime_get_ns();
+	state = hws_video_signal_state_now(videodev, now_ns);
+	hws_video_set_signal_state(videodev, state);
+	if (state != HWS_VIDEO_SIGNAL_LIVE) {
+		hws_video_fallback_fps(videodev, &reason);
+		hws_video_diag_record_fallback_tick(videodev, reason);
+		if (hws_has_pending_buffers(videodev))
+			queue_work(videodev->dev->wq, &videodev->videowork);
+	} else {
+		WRITE_ONCE(videodev->fallback_cadence_reason, HWS_VIDEO_CADENCE_NONE);
+	}
+
+	interval = hws_video_fallback_interval(videodev);
+	hrtimer_forward_now(timer, interval);
+	return HRTIMER_RESTART;
+}
+
 static u64 hws_next_frame_ts_ns(struct hws_video *videodev,
 				struct hws_vfh_ctx *ctx, u64 now_ns)
 {
 	u64 prev = ctx ? READ_ONCE(ctx->next_frame_ts_ns) :
 			 READ_ONCE(videodev->next_frame_ts_ns);
 	u64 interval_ns;
-	int fps = hws_policy_select_fps(videodev, 60);
+	int fps;
 
-	if (fps <= 0)
-		fps = 60;
-	interval_ns = DIV_ROUND_CLOSEST_ULL(HWS_NS_PER_SEC, (u64)fps);
+	if (READ_ONCE(videodev->signal_state) == HWS_VIDEO_SIGNAL_LIVE)
+		fps = hws_policy_select_fps(videodev, 60);
+	else
+		fps = hws_video_fallback_fps(videodev, NULL);
+	interval_ns = hws_video_interval_ns(fps);
 	if (interval_ns == 0)
 		interval_ns = 16666667ULL;
 
@@ -4784,9 +5067,13 @@ static void video_data_process(struct work_struct *p_work)
 	int interlace = 0;
 	int miss_freme = 0;
 	int curr_no_video;
+	int signal_state;
+	bool render_placeholder = false;
+	bool stalled_placeholder = false;
 	struct hws_pcie_dev *pdx = videodev->dev;
 	int nCh;
-	bool diag_on = !!diag_enable;
+	bool diag_on;
+	bool diag_timing_on = hws_diag_enabled();
 	u64 work_start_ns = 0;
 	u64 work_elapsed_ns = 0;
 	u64 memcopy_ns = 0;
@@ -4820,9 +5107,10 @@ static void video_data_process(struct work_struct *p_work)
 	nCopySize[2] = 0;
 	nCopySize[3] = 0;
 	nCh = videodev->index;
+	diag_on = nCh >= 0 && nCh < MAX_VID_CHANNELS;
 	budget = (video_work_budget > 0) ? (unsigned int)video_work_budget : 1U;
 
-	if (diag_on)
+	if (diag_timing_on)
 		work_start_ns = ktime_get_ns();
 
 	/* Hold the device lock only while selecting/snapshotting source buffers. */
@@ -4877,6 +5165,8 @@ static void video_data_process(struct work_struct *p_work)
 				u64 prev_avg = READ_ONCE(hws_source_interval_ns_avg[nCh]);
 				u64 new_avg = prev_avg ? ((prev_avg * 7) + source_interval_ns) / 8 : source_interval_ns;
 				WRITE_ONCE(hws_source_interval_ns_avg[nCh], new_avg);
+				WRITE_ONCE(videodev->last_stable_source_fps,
+					   hws_effective_source_fps(videodev));
 			}
 		} else {
 			no_fresh_frame = true;
@@ -4889,6 +5179,19 @@ static void video_data_process(struct work_struct *p_work)
 		videodev->last_complete_index = -1;
 	}
 	spin_unlock_irqrestore(&pdx->videoslock[nCh], devflags);
+
+	if (curr_no_video) {
+		hws_video_set_signal_state(videodev, HWS_VIDEO_SIGNAL_NO_SIGNAL);
+		render_placeholder = true;
+	} else if (nVindex >= 0 &&
+		   (!reused_complete_frame ||
+		    READ_ONCE(videodev->signal_state) != HWS_VIDEO_SIGNAL_STALLED)) {
+		hws_video_set_signal_state(videodev, HWS_VIDEO_SIGNAL_LIVE);
+	} else {
+		signal_state = READ_ONCE(videodev->signal_state);
+		stalled_placeholder = signal_state == HWS_VIDEO_SIGNAL_STALLED;
+		render_placeholder = stalled_placeholder;
+	}
 
 	out_width = videodev->current_out_width;
 	out_height = videodev->curren_out_height;
@@ -4930,7 +5233,7 @@ static void video_data_process(struct work_struct *p_work)
 	else
 		per_frame_budget *= output_frames_target;
 
-	if (curr_no_video == 0 && nVindex < 0)
+	if (!render_placeholder && nVindex < 0)
 		goto out_finish;
 
 	for (;;) {
@@ -4965,10 +5268,10 @@ static void video_data_process(struct work_struct *p_work)
 		}
 
 		dst_capacity = vb2_plane_size(&buf->vb.vb2_buf, 0);
-		required_size = (curr_no_video == 0 && !needs_scaler) ?
+		required_size = (!render_placeholder && !needs_scaler) ?
 			(unsigned int)in_vsize : (unsigned int)out_size;
 		if (dst_capacity < required_size) {
-			if (diag_on) {
+			if (diag_timing_on) {
 				pr_warn_ratelimited(
 					"hws: vb2 dst too small ch=%d cap=%u need=%u no_video=%d scaler=%d\n",
 					nCh, dst_capacity, required_size, curr_no_video, needs_scaler);
@@ -4978,30 +5281,30 @@ static void video_data_process(struct work_struct *p_work)
 			continue;
 		}
 
-		if (curr_no_video == 0) {
+		if (!render_placeholder) {
 			if (needs_scaler) {
 				if (!pdx->m_VideoInfo[nCh].m_pVideoScalerBuf) {
 					copy_ret = -ENOMEM;
 				} else {
-					copy_start = diag_on ? ktime_get_ns() : 0;
+					copy_start = diag_timing_on ? ktime_get_ns() : 0;
 					copy_ret = MemCopyFrame(nCh, pdx->m_VideoInfo[nCh].m_pVideoScalerBuf,
 						in_width, in_height, interlace, bBuf, nCopySize);
-					if (diag_on)
+					if (diag_timing_on)
 						memcopy_ns += ktime_get_ns() - copy_start;
 					if (!copy_ret) {
-						copy_start = diag_on ? ktime_get_ns() : 0;
+						copy_start = diag_timing_on ? ktime_get_ns() : 0;
 						VideoScaler(pdx->m_VideoInfo[nCh].m_pVideoScalerBuf, buf->mem,
 							in_width, in_height, out_width, out_height);
-						if (diag_on)
+						if (diag_timing_on)
 							scaler_ns += ktime_get_ns() - copy_start;
 						scaler_frames++;
 					}
 				}
 			} else {
-				copy_start = diag_on ? ktime_get_ns() : 0;
+				copy_start = diag_timing_on ? ktime_get_ns() : 0;
 				copy_ret = MemCopyFrame(nCh, buf->mem, in_width, in_height,
 					interlace, bBuf, nCopySize);
-				if (diag_on)
+				if (diag_timing_on)
 					memcopy_ns += ktime_get_ns() - copy_start;
 				if (!copy_ret)
 					copy_frames++;
@@ -5014,6 +5317,12 @@ static void video_data_process(struct work_struct *p_work)
 		} else {
 			SetNoVideoMem(buf->mem, out_width, out_height);
 			novideo_frames++;
+			if (diag_on) {
+				if (stalled_placeholder)
+					atomic64_inc(&hws_diag[nCh].stalled_placeholder_frames);
+				else
+					atomic64_inc(&hws_diag[nCh].no_signal_placeholder_frames);
+			}
 		}
 
 			if (ctx)
@@ -5066,7 +5375,8 @@ static void video_data_process(struct work_struct *p_work)
 
 out_finish:
 	if (diag_on) {
-		work_elapsed_ns = ktime_get_ns() - work_start_ns;
+		if (diag_timing_on)
+			work_elapsed_ns = ktime_get_ns() - work_start_ns;
 		atomic64_inc(&hws_diag[nCh].work_runs);
 		atomic64_add(work_elapsed_ns, &hws_diag[nCh].work_ns_total);
 		hws_diag_update_max(&hws_diag[nCh].work_ns_max, work_elapsed_ns);
@@ -5223,7 +5533,12 @@ static int hws_video_register(struct hws_pcie_dev *dev)
 		}
 		
 		INIT_WORK(&dev->video[i].videowork,video_data_process);
+		hws_hrtimer_init(&dev->video[i].fallback_timer,
+				 hws_video_fallback_timer_fn);
+		dev->video[i].fallback_timer_armed = false;
 		dev->video[i].last_complete_index = -1;
+		dev->video[i].signal_state = HWS_VIDEO_SIGNAL_LIVE;
+		dev->video[i].fallback_cadence_reason = HWS_VIDEO_CADENCE_NONE;
 		#if (LINUX_VERSION_CODE < KERNEL_VERSION(5,7,0))
 		err = video_register_device(vdev, VFL_TYPE_GRABBER,-1);
 		#else
@@ -5412,7 +5727,7 @@ static int hws_pcie_audio_close(struct snd_pcm_substream *substream)
 	WRITE_ONCE(drv->last_copy_ns, 0);
 	WRITE_ONCE(drv->last_progress_ns, 0);
 	WRITE_ONCE(drv->last_timer_fire_ns, 0);
-	if (hws_diag_enabled() && drv->index >= 0 && drv->index < MAX_VID_CHANNELS)
+	if (drv->index >= 0 && drv->index < MAX_VID_CHANNELS)
 		atomic64_set(&hws_audio_diag[drv->index].pcm_running, 0);
 	WRITE_ONCE(drv->substream, NULL);
 	return 0;
@@ -5497,7 +5812,7 @@ static int hws_pcie_audio_trigger(struct snd_pcm_substream *substream, int cmd)
 		WRITE_ONCE(chip->last_copy_ns, 0);
 		WRITE_ONCE(chip->last_progress_ns, ktime_get_ns());
 		WRITE_ONCE(chip->last_timer_fire_ns, 0);
-		if (hws_diag_enabled() && chip->index >= 0 && chip->index < MAX_VID_CHANNELS)
+		if (chip->index >= 0 && chip->index < MAX_VID_CHANNELS)
 			atomic64_set(&hws_audio_diag[chip->index].pcm_running, 1);
 		cancel_delayed_work(&chip->silence_work);
 		StartAudioCapture(dev, chip->index);
@@ -5512,7 +5827,7 @@ static int hws_pcie_audio_trigger(struct snd_pcm_substream *substream, int cmd)
 		//HWS_PCIE_WRITE(HWS_DMA_BASE(chip->index), HWS_DMA_START, 0x00000000);
 		//printk(KERN_INFO "SNDRV_PCM_TRIGGER_STOP index:%x\n",chip->index);
 		WRITE_ONCE(chip->pcm_running, false);
-		if (hws_diag_enabled() && chip->index >= 0 && chip->index < MAX_VID_CHANNELS)
+		if (chip->index >= 0 && chip->index < MAX_VID_CHANNELS)
 			atomic64_set(&hws_audio_diag[chip->index].pcm_running, 0);
 		StopAudioCapture(dev, chip->index);
 		/* Do not sleep in trigger path: can run under atomic constraints. */
@@ -5627,8 +5942,8 @@ static int hws_audio_register(struct hws_pcie_dev *dev)
 			dev->audio[i].publish_timer_armed = false;
 			dev->audio[i].pcm_running = false;
 			dev->audio[i].last_timer_fire_ns = 0;
-			hws_audio_publish_timer_init(&dev->audio[i].publish_timer,
-						     hws_audio_publish_timer_fn);
+			hws_hrtimer_init(&dev->audio[i].publish_timer,
+					 hws_audio_publish_timer_fn);
 			INIT_WORK(&dev->audio[i].audiowork,audio_data_process);
 			INIT_DELAYED_WORK(&dev->audio[i].silence_work, hws_audio_silence_fallback_work);
 			ret = snd_card_register(card);
@@ -6224,6 +6539,7 @@ static void hws_remove(struct pci_dev *pdev)
 		(struct hws_pcie_dev*) pci_get_drvdata(pdev);
 	//----------------------------
 	if(dev->map_bar0_addr == NULL) return;
+	hws_diag_remove_procfs();
 	hws_diag_remove_debugfs();
 	//StopSys(dev);
 	StopDevice(dev);
@@ -6256,6 +6572,8 @@ static void hws_remove(struct pci_dev *pdev)
 	}	
 	for(i=0;i<dev->m_nCurreMaxVideoChl;i++){
 		vdev = &dev->video[i].vdev;
+		hws_video_cancel_fallback_timer(&dev->video[i]);
+		cancel_work_sync(&dev->video[i].videowork);
 		video_unregister_device(vdev);
 		v4l2_device_unregister(&dev->video[i].v4l2_dev);
 	}
@@ -6614,6 +6932,10 @@ static int MemCopyVideoToSteam(struct hws_pcie_dev *pdx,int nDecoder)
 								pdx->m_VideoInfo[nDecoder].pStatusInfo[nIndex].byLock = MEM_LOCK;
 
 							spin_unlock_irqrestore(&pdx->videoslock[nDecoder], flags);
+							WRITE_ONCE(pdx->video[nDecoder].last_source_complete_ns,
+								   ktime_get_ns());
+							hws_video_set_signal_state(&pdx->video[nDecoder],
+									   HWS_VIDEO_SIGNAL_LIVE);
 					}
 						else
 						{
@@ -6678,7 +7000,7 @@ static int SetQuene(struct hws_pcie_dev  *pdx,int nDecoder)
 static int MemCopyAudioToSteam( struct hws_pcie_dev  *pdx,int dwAudioCh)
 {
 	int i=0;
-	bool diag = hws_diag_enabled();
+	bool diag;
 	BYTE *bBuf = NULL;
 	BYTE *pSrcBuf= NULL;
 	int nIndex = -1;
@@ -6689,6 +7011,7 @@ static int MemCopyAudioToSteam( struct hws_pcie_dev  *pdx,int dwAudioCh)
 	u64 last_irq_ns;
 	if (dwAudioCh < 0 || dwAudioCh >= MAX_VID_CHANNELS)
 		return -EINVAL;
+	diag = true;
 
 	if (pdx->m_dwAudioPTKSize <= 0 || pdx->m_dwAudioPTKSize > MAX_AUDIO_CAP_SIZE) {
 		if (diag)
@@ -8045,6 +8368,7 @@ static int hws_probe(struct pci_dev *pdev, const struct pci_device_id *pci_id)
 	gdev->auwq = create_singlethread_workqueue("hwsuhdx1-audio");
 	//----------------
 	hws_diag_reset();
+	hws_diag_init_procfs();
 	hws_diag_init_debugfs();
 	if( hws_video_register(gdev) )
 		goto err_mem_alloc;
@@ -8054,6 +8378,7 @@ static int hws_probe(struct pci_dev *pdev, const struct pci_device_id *pci_id)
 #endif	
 	return 0;
 err_mem_alloc:
+hws_diag_remove_procfs();
 hws_diag_remove_debugfs();
 	
 		 gdev->m_bBufferAllocate = TRUE;

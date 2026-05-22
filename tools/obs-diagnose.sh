@@ -239,12 +239,15 @@ sampler() {
       /usr/bin/cat /sys/module/${MODULE}/parameters/audio_period_bytes 2>/dev/null || true
       /usr/bin/cat /sys/module/${MODULE}/parameters/audio_periods 2>/dev/null || true
       /usr/bin/cat /sys/module/${MODULE}/parameters/fps_policy_mode 2>/dev/null || true
-      echo "-- debugfs video_diag --"
-      /usr/bin/cat /sys/kernel/debug/hwsuhdx1/video_diag 2>/dev/null || true
-      echo "-- debugfs audio_diag --"
-      /usr/bin/cat /sys/kernel/debug/hwsuhdx1/audio_diag 2>/dev/null || true
-      echo "-- debugfs source_cadence --"
-      /usr/bin/cat /sys/kernel/debug/hwsuhdx1/source_cadence 2>/dev/null || true
+      echo "-- hws diag video_diag --"
+      /usr/bin/cat /proc/hwsuhdx1/video_diag 2>/dev/null ||
+        /usr/bin/cat /sys/kernel/debug/hwsuhdx1/video_diag 2>/dev/null || true
+      echo "-- hws diag audio_diag --"
+      /usr/bin/cat /proc/hwsuhdx1/audio_diag 2>/dev/null ||
+        /usr/bin/cat /sys/kernel/debug/hwsuhdx1/audio_diag 2>/dev/null || true
+      echo "-- hws diag source_cadence --"
+      /usr/bin/cat /proc/hwsuhdx1/source_cadence 2>/dev/null ||
+        /usr/bin/cat /sys/kernel/debug/hwsuhdx1/source_cadence 2>/dev/null || true
       if [[ "${priv_available}" == "1" ]]; then
         echo "-- privileged helper sample --"
         sudo -n "${PRIV_HELPER}" --module "${MODULE}" --sample 2>/dev/null || true

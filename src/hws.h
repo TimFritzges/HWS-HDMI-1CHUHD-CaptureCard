@@ -340,6 +340,8 @@ struct hws_video{
 	int                     queryIndex;
 	int						index;
 	struct work_struct		videowork;
+	struct hrtimer			fallback_timer;
+	bool				fallback_timer_armed;
 	int						Interlaced;
 	//------------------------
 	int m_Curr_Brightness;
@@ -355,6 +357,11 @@ struct hws_video{
 	u64 next_frame_ts_ns;
 	u32 output_rate_accum;
 	int last_complete_index;
+	u64 stream_start_ns;
+	u64 last_source_complete_ns;
+	int last_stable_source_fps;
+	int signal_state;
+	int fallback_cadence_reason;
 };
 	
 struct hws_audio{

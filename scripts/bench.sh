@@ -8,6 +8,7 @@ RUN_TAG="${RUN_TAG:-safe-bench}"
 MODULE="${MODULE:-HwsUHDX1Capture}"
 SIZE="${SIZE:-1920x1080}"
 FPS="${FPS:-60}"
+DIAG_ROOT="${DIAG_ROOT:-}"
 
 usage() {
   cat <<'USAGE'
@@ -24,7 +25,7 @@ Options:
   -f <fps>       Requested fps (default: 60)
   -h             Show help
 
-Env overrides: DEVICE DURATION OUT_BASE RUN_TAG MODULE SIZE FPS
+Env overrides: DEVICE DURATION OUT_BASE RUN_TAG MODULE SIZE FPS DIAG_ROOT
 USAGE
 }
 
@@ -68,6 +69,14 @@ audio_diag_after="${outdir}/audio-diag.after.txt"
 source_cadence_before="${outdir}/source-cadence.before.txt"
 source_cadence_after="${outdir}/source-cadence.after.txt"
 
+if [[ -z "${DIAG_ROOT}" ]]; then
+  if [[ -r /proc/hwsuhdx1/video_diag ]]; then
+    DIAG_ROOT="/proc/hwsuhdx1"
+  else
+    DIAG_ROOT="/sys/kernel/debug/hwsuhdx1"
+  fi
+fi
+
 capture_debugfs_snapshot() {
   local node="${1}"
   local out="${2}"
@@ -106,9 +115,9 @@ diag_total_delta() {
   ' "${before}" "${after}"
 }
 
-capture_debugfs_snapshot /sys/kernel/debug/hwsuhdx1/video_diag "${video_diag_before}"
-capture_debugfs_snapshot /sys/kernel/debug/hwsuhdx1/audio_diag "${audio_diag_before}"
-capture_debugfs_snapshot /sys/kernel/debug/hwsuhdx1/source_cadence "${source_cadence_before}"
+capture_debugfs_snapshot "${DIAG_ROOT}/video_diag" "${video_diag_before}"
+capture_debugfs_snapshot "${DIAG_ROOT}/audio_diag" "${audio_diag_before}"
+capture_debugfs_snapshot "${DIAG_ROOT}/source_cadence" "${source_cadence_before}"
 
 if command -v v4l2-ctl >/dev/null 2>&1; then
   v4l2-ctl --device="${DEVICE}" --all > "${v4l2_all}" 2>&1 || true
@@ -138,9 +147,9 @@ else
   echo "journalctl not found" > "${journal_kern}"
 fi
 
-capture_debugfs_snapshot /sys/kernel/debug/hwsuhdx1/video_diag "${video_diag_after}"
-capture_debugfs_snapshot /sys/kernel/debug/hwsuhdx1/audio_diag "${audio_diag_after}"
-capture_debugfs_snapshot /sys/kernel/debug/hwsuhdx1/source_cadence "${source_cadence_after}"
+capture_debugfs_snapshot "${DIAG_ROOT}/video_diag" "${video_diag_after}"
+capture_debugfs_snapshot "${DIAG_ROOT}/audio_diag" "${audio_diag_after}"
+capture_debugfs_snapshot "${DIAG_ROOT}/source_cadence" "${source_cadence_after}"
 
 actual_frames=0
 if [[ "${backend}" == "ffmpeg" ]]; then
@@ -174,6 +183,13 @@ video_reused_no_fresh_delta="$(diag_total_delta "${video_diag_before}" "${video_
 video_reused_backpressure_delta="$(diag_total_delta "${video_diag_before}" "${video_diag_after}" reused_backpressure_runs)"
 video_ts_non_monotonic_delta="$(diag_total_delta "${video_diag_before}" "${video_diag_after}" ts_non_monotonic_events)"
 video_seq_non_monotonic_delta="$(diag_total_delta "${video_diag_before}" "${video_diag_after}" seq_non_monotonic_events)"
+video_signal_stalled_transitions_delta="$(diag_total_delta "${video_diag_before}" "${video_diag_after}" signal_stalled_transitions)"
+video_signal_no_signal_transitions_delta="$(diag_total_delta "${video_diag_before}" "${video_diag_after}" signal_no_signal_transitions)"
+video_no_signal_placeholder_frames_delta="$(diag_total_delta "${video_diag_before}" "${video_diag_after}" no_signal_placeholder_frames)"
+video_stalled_placeholder_frames_delta="$(diag_total_delta "${video_diag_before}" "${video_diag_after}" stalled_placeholder_frames)"
+video_fallback_last_stable_ticks_delta="$(diag_total_delta "${video_diag_before}" "${video_diag_after}" fallback_last_stable_ticks)"
+video_fallback_requested_ticks_delta="$(diag_total_delta "${video_diag_before}" "${video_diag_after}" fallback_requested_ticks)"
+video_fallback_default_60_ticks_delta="$(diag_total_delta "${video_diag_before}" "${video_diag_after}" fallback_default_60_ticks)"
 source_truth_mismatch_flag=0
 source_truth_active_fps=0
 if [[ -s "${source_cadence_after}" ]]; then
@@ -201,6 +217,7 @@ fi
   echo "diag_available=${diag_available}"
   echo "audio_diag_available=${audio_diag_available}"
   echo "source_cadence_available=${source_cadence_available}"
+  echo "diag_root=${DIAG_ROOT}"
   echo "source_truth_active_fps=${source_truth_active_fps}"
   echo "source_truth_mismatch_flag=${source_truth_mismatch_flag}"
   echo "audio_source_lost_periods_delta=${audio_source_lost_periods_delta}"
@@ -214,6 +231,13 @@ fi
   echo "video_reused_backpressure_delta=${video_reused_backpressure_delta}"
   echo "video_ts_non_monotonic_delta=${video_ts_non_monotonic_delta}"
   echo "video_seq_non_monotonic_delta=${video_seq_non_monotonic_delta}"
+  echo "video_signal_stalled_transitions_delta=${video_signal_stalled_transitions_delta}"
+  echo "video_signal_no_signal_transitions_delta=${video_signal_no_signal_transitions_delta}"
+  echo "video_no_signal_placeholder_frames_delta=${video_no_signal_placeholder_frames_delta}"
+  echo "video_stalled_placeholder_frames_delta=${video_stalled_placeholder_frames_delta}"
+  echo "video_fallback_last_stable_ticks_delta=${video_fallback_last_stable_ticks_delta}"
+  echo "video_fallback_requested_ticks_delta=${video_fallback_requested_ticks_delta}"
+  echo "video_fallback_default_60_ticks_delta=${video_fallback_default_60_ticks_delta}"
   echo "v4l2_all=${v4l2_all}"
   echo "capture_log=${capture_log}"
   echo "journal_kernel_filtered=${journal_kern}"

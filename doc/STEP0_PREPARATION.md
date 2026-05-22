@@ -11,7 +11,7 @@ This step is non-invasive: it does not unload modules, install packages, or chan
   - device exists/readable
   - `modinfo` vs runtime `/sys/module/.../srcversion` match
   - diag parameter path readability
-  - debugfs diag file readability
+  - diag file readability (`/proc/hwsuhdx1` first, debugfs fallback)
   - holder sanity vs selected concurrent mode
 - `history-v4.csv` now includes:
   - `preflight_status`
@@ -20,7 +20,7 @@ This step is non-invasive: it does not unload modules, install packages, or chan
 ## Run
 ```bash
 cd /home/thecatgoesrawr/src/HWS-HDMI-1CHUHD-CaptureCard
-sudo -E ./tools/bench.sh -t 30 -g step0-check -c auto
+./tools/bench.sh -t 30 -g step0-check -c auto
 ```
 
 ## Verify expected output
@@ -35,7 +35,7 @@ sudo -E ./tools/bench.sh -t 30 -g step0-check -c auto
 - Inspect warning file first.
 - Common fixes:
   - srcversion mismatch: verify DKMS + initramfs flow.
-  - diag unreadable: check debugfs mount and permissions.
+  - diag unreadable: use a driver build with `/proc/hwsuhdx1` exports, or check privileged debugfs fallback.
   - unexpected holders in solo mode: rerun with `-c shared`.
 
 ## Rollback

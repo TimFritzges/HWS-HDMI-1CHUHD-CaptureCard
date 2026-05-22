@@ -9,8 +9,12 @@ OUTDIR_BASE="${OUTDIR_BASE:-./bench-results}"
 MODULE="${MODULE:-HwsUHDX1Capture}"
 RUN_TAG="${RUN_TAG:-}"
 PRETEST_SECONDS="${PRETEST_SECONDS:-}"
-DIAG_FILE="${DIAG_FILE:-/sys/kernel/debug/hwsuhdx1/video_diag}"
-AUDIO_DIAG_FILE="${AUDIO_DIAG_FILE:-/sys/kernel/debug/hwsuhdx1/audio_diag}"
+DIAG_ROOT="${DIAG_ROOT:-/proc/hwsuhdx1}"
+if [[ ! -r "${DIAG_ROOT}/video_diag" ]]; then
+  DIAG_ROOT="/sys/kernel/debug/hwsuhdx1"
+fi
+DIAG_FILE="${DIAG_FILE:-${DIAG_ROOT}/video_diag}"
+AUDIO_DIAG_FILE="${AUDIO_DIAG_FILE:-${DIAG_ROOT}/audio_diag}"
 CONCURRENT_MODE="${CONCURRENT_MODE:-auto}"
 SAVE_RAW="${SAVE_RAW:-0}"
 SAVE_MKV="${SAVE_MKV:-0}"
@@ -245,7 +249,7 @@ run_preflight() {
     warning_count=$((warning_count + 1))
   fi
   if [[ "${diag_data_readable}" -ne 1 ]]; then
-    echo "diag_debugfs_unreadable:${diag_data_path}" >> "${warnings_file}"
+    echo "diag_data_unreadable:${diag_data_path}" >> "${warnings_file}"
     warning_count=$((warning_count + 1))
   fi
   if [[ "${mode_hint}" == "solo" && "${holder_lines}" -gt 0 ]]; then
@@ -1068,11 +1072,25 @@ video_reused_no_fresh_delta=0
 video_reused_backpressure_delta=0
 video_ts_non_monotonic_delta=0
 video_seq_non_monotonic_delta=0
+video_signal_stalled_transitions_delta=0
+video_signal_no_signal_transitions_delta=0
+video_no_signal_placeholder_frames_delta=0
+video_stalled_placeholder_frames_delta=0
+video_fallback_last_stable_ticks_delta=0
+video_fallback_requested_ticks_delta=0
+video_fallback_default_60_ticks_delta=0
 if [[ -s "${diag_delta_file}" ]]; then
   video_reused_no_fresh_delta="$(awk 'NR==1 {for(i=1;i<=NF;i++) if($i=="delta_reused_no_fresh_runs") c=i; next} c {sum+=$c} END{print sum+0}' "${diag_delta_file}")"
   video_reused_backpressure_delta="$(awk 'NR==1 {for(i=1;i<=NF;i++) if($i=="delta_reused_backpressure_runs") c=i; next} c {sum+=$c} END{print sum+0}' "${diag_delta_file}")"
   video_ts_non_monotonic_delta="$(awk 'NR==1 {for(i=1;i<=NF;i++) if($i=="delta_ts_non_monotonic_events") c=i; next} c {sum+=$c} END{print sum+0}' "${diag_delta_file}")"
   video_seq_non_monotonic_delta="$(awk 'NR==1 {for(i=1;i<=NF;i++) if($i=="delta_seq_non_monotonic_events") c=i; next} c {sum+=$c} END{print sum+0}' "${diag_delta_file}")"
+  video_signal_stalled_transitions_delta="$(awk 'NR==1 {for(i=1;i<=NF;i++) if($i=="delta_signal_stalled_transitions") c=i; next} c {sum+=$c} END{print sum+0}' "${diag_delta_file}")"
+  video_signal_no_signal_transitions_delta="$(awk 'NR==1 {for(i=1;i<=NF;i++) if($i=="delta_signal_no_signal_transitions") c=i; next} c {sum+=$c} END{print sum+0}' "${diag_delta_file}")"
+  video_no_signal_placeholder_frames_delta="$(awk 'NR==1 {for(i=1;i<=NF;i++) if($i=="delta_no_signal_placeholder_frames") c=i; next} c {sum+=$c} END{print sum+0}' "${diag_delta_file}")"
+  video_stalled_placeholder_frames_delta="$(awk 'NR==1 {for(i=1;i<=NF;i++) if($i=="delta_stalled_placeholder_frames") c=i; next} c {sum+=$c} END{print sum+0}' "${diag_delta_file}")"
+  video_fallback_last_stable_ticks_delta="$(awk 'NR==1 {for(i=1;i<=NF;i++) if($i=="delta_fallback_last_stable_ticks") c=i; next} c {sum+=$c} END{print sum+0}' "${diag_delta_file}")"
+  video_fallback_requested_ticks_delta="$(awk 'NR==1 {for(i=1;i<=NF;i++) if($i=="delta_fallback_requested_ticks") c=i; next} c {sum+=$c} END{print sum+0}' "${diag_delta_file}")"
+  video_fallback_default_60_ticks_delta="$(awk 'NR==1 {for(i=1;i<=NF;i++) if($i=="delta_fallback_default_60_ticks") c=i; next} c {sum+=$c} END{print sum+0}' "${diag_delta_file}")"
 fi
 audio_starvation_intervals=$((audio_source_lost_periods_delta + audio_timer_silence_injects_delta))
 if [[ "${audio_source_lost_periods_delta}" -gt 0 ]]; then
@@ -1198,6 +1216,13 @@ fi
   echo "video_reused_backpressure_delta=${video_reused_backpressure_delta}"
   echo "video_ts_non_monotonic_delta=${video_ts_non_monotonic_delta}"
   echo "video_seq_non_monotonic_delta=${video_seq_non_monotonic_delta}"
+  echo "video_signal_stalled_transitions_delta=${video_signal_stalled_transitions_delta}"
+  echo "video_signal_no_signal_transitions_delta=${video_signal_no_signal_transitions_delta}"
+  echo "video_no_signal_placeholder_frames_delta=${video_no_signal_placeholder_frames_delta}"
+  echo "video_stalled_placeholder_frames_delta=${video_stalled_placeholder_frames_delta}"
+  echo "video_fallback_last_stable_ticks_delta=${video_fallback_last_stable_ticks_delta}"
+  echo "video_fallback_requested_ticks_delta=${video_fallback_requested_ticks_delta}"
+  echo "video_fallback_default_60_ticks_delta=${video_fallback_default_60_ticks_delta}"
   echo "source_truth_health_verdict=${source_truth_health_verdict}"
   echo "retire_capture_urb_events=${retire_capture_urb_events}"
   echo "callbacks_suppressed_events=${callbacks_suppressed_events}"

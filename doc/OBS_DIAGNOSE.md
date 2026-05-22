@@ -12,7 +12,7 @@ This adds a launch wrapper that starts OBS and records long-session diagnostics 
 ## What gets captured per run
 
 - Module identity: `modinfo`, `dkms status`, `lsmod`
-- Driver/runtime: HWS module params, debugfs diag snapshots (if readable)
+- Driver/runtime: HWS module params, `/proc/hwsuhdx1` diag snapshots (debugfs fallback)
 - System/runtime: periodic `ps`, `loadavg`, filtered `/proc/interrupts`
 - Journals:
   - live kernel follow log
@@ -48,7 +48,9 @@ tools/obs-diagnose.sh -g stream-session
 
 ## Optional privileged diagnostics (passwordless sudo)
 
-This enables root-only data collection (debugfs diag, unrestricted kernel journal) without prompting for password during OBS session.
+New driver builds expose read-only driver diagnostics at `/proc/hwsuhdx1` so the
+wrapper can sample them without sudo. This helper still enables unrestricted
+kernel journal reads and debugfs fallback on older driver builds.
 
 Install helper + tight sudoers rule:
 

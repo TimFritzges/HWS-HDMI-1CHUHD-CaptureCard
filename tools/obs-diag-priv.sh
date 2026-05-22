@@ -89,10 +89,12 @@ if [[ "${MODE}" == "sample" ]]; then
     echo "module_srcversion=$(cat "/sys/module/${MODULE}/srcversion" 2>/dev/null || true)"
   fi
 
-  echo "-- hws debugfs video_diag --"
-  cat /sys/kernel/debug/hwsuhdx1/video_diag 2>/dev/null || true
-  echo "-- hws debugfs audio_diag --"
-  cat /sys/kernel/debug/hwsuhdx1/audio_diag 2>/dev/null || true
+  echo "-- hws diag video_diag --"
+  cat /proc/hwsuhdx1/video_diag 2>/dev/null ||
+    cat /sys/kernel/debug/hwsuhdx1/video_diag 2>/dev/null || true
+  echo "-- hws diag audio_diag --"
+  cat /proc/hwsuhdx1/audio_diag 2>/dev/null ||
+    cat /sys/kernel/debug/hwsuhdx1/audio_diag 2>/dev/null || true
 
   echo "-- dmesg filtered tail (driver/perf) --"
   dmesg --ctime 2>/dev/null | rg -i 'HwsUHDX1Capture|videobuf2|uvcvideo|retire_capture_urb|callbacks suppressed|timeout|reset|error|BUG:|Oops|soft lockup' | tail -n 80 || true
