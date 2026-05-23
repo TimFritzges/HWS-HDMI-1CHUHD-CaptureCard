@@ -394,7 +394,11 @@ struct hws_audio{
 	    u64                         last_copy_ns;
 	    u64                         last_progress_ns;
 	    u64                         last_timer_fire_ns;
+	int                         last_dma_half_index;
+	bool                        last_dma_half_valid;
 	u32                         sample_rate_out;
+	u32                         runtime_rate_hz;
+	u32                         last_effective_packet_bytes;
     u16                         channels;
     u16                         bits_per_sample;
     unsigned int                period_bytes_choices[4];
