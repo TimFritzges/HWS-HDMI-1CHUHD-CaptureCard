@@ -175,6 +175,7 @@ struct hws_audio_diag_stats {
 	atomic64_t runtime_rate_hz;
 	atomic64_t sample_rate_out_hz;
 	atomic64_t effective_packet_bytes;
+	atomic64_t packet_runtime_mismatch;
 };
 
 struct hws_diag_stats {
@@ -211,6 +212,10 @@ struct hws_diag_stats {
 	atomic64_t drop_copy_failed;
 	atomic64_t copy_mode_direct;
 	atomic64_t copy_mode_scaled;
+	atomic64_t drop_copy_src_invalid;
+	atomic64_t drop_copy_size_mismatch;
+	atomic64_t drop_copy_memfault;
+	atomic64_t copy_fail_placeholder_done;
 };
 
 static struct hws_diag_stats hws_diag[MAX_VID_CHANNELS];
@@ -269,6 +274,10 @@ static inline void hws_diag_reset(void)
 			atomic64_set(&hws_diag[i].drop_copy_failed, 0);
 			atomic64_set(&hws_diag[i].copy_mode_direct, 0);
 			atomic64_set(&hws_diag[i].copy_mode_scaled, 0);
+			atomic64_set(&hws_diag[i].drop_copy_src_invalid, 0);
+			atomic64_set(&hws_diag[i].drop_copy_size_mismatch, 0);
+			atomic64_set(&hws_diag[i].drop_copy_memfault, 0);
+			atomic64_set(&hws_diag[i].copy_fail_placeholder_done, 0);
 		hws_diag_last_fresh_ns[i] = 0;
 		hws_source_interval_ns_avg[i] = 0;
 		hws_diag_last_ts_ns[i] = 0;
@@ -331,6 +340,7 @@ static inline void hws_diag_reset(void)
 				atomic64_set(&hws_audio_diag[i].runtime_rate_hz, 0);
 				atomic64_set(&hws_audio_diag[i].sample_rate_out_hz, 0);
 				atomic64_set(&hws_audio_diag[i].effective_packet_bytes, 0);
+				atomic64_set(&hws_audio_diag[i].packet_runtime_mismatch, 0);
 			}
 		}
 
@@ -396,27 +406,19 @@ static inline u32 hws_audio_frame_bytes(const struct hws_audio *drv)
 	return 2U * (u32)drv->channels;
 }
 
-static u32 hws_audio_effective_packet_bytes(struct hws_audio *drv, u32 requested_bytes)
+static u32 hws_audio_normalize_packet_bytes(struct hws_audio *drv, u32 packet_bytes, bool *clamped_out)
 {
 	u32 frame_bytes;
-	u32 packet_bytes;
 	u32 original_packet_bytes;
 	bool clamped = false;
-	int ch;
 
 	if (!drv)
 		return 0;
-
 	frame_bytes = hws_audio_frame_bytes(drv);
-	ch = drv->index;
-	packet_bytes = requested_bytes;
-	if (!packet_bytes && drv->dev)
-		packet_bytes = READ_ONCE(drv->dev->m_dwAudioPTKSize);
-	if (!packet_bytes && frame_bytes)
-		packet_bytes = READ_ONCE(drv->period_size_byframes) * frame_bytes;
-	original_packet_bytes = packet_bytes;
 	if (!frame_bytes || !packet_bytes)
 		return 0;
+
+	original_packet_bytes = packet_bytes;
 	if (packet_bytes > MAX_DMA_AUDIO_PK_SIZE) {
 		packet_bytes = MAX_DMA_AUDIO_PK_SIZE;
 		clamped = true;
@@ -425,16 +427,67 @@ static u32 hws_audio_effective_packet_bytes(struct hws_audio *drv, u32 requested
 		packet_bytes = MAX_AUDIO_CAP_SIZE;
 		clamped = true;
 	}
-
 	packet_bytes -= packet_bytes % frame_bytes;
 	if (packet_bytes != original_packet_bytes)
 		clamped = true;
+	if (clamped_out)
+		*clamped_out = clamped;
+	return packet_bytes;
+}
+
+static u32 hws_audio_effective_packet_bytes(struct hws_audio *drv, u32 requested_bytes)
+{
+	u32 packet_bytes;
+	u32 publish_bytes;
+	bool clamped = false;
+	int ch;
+
+	if (!drv)
+		return 0;
+
+	ch = drv->index;
+	packet_bytes = requested_bytes;
+	if (!packet_bytes) {
+		/*
+		 * For scheduler/runtime decisions, prefer ALSA period bytes once
+		 * available. Hardware DMA packet bytes are handled separately.
+		 */
+		publish_bytes = READ_ONCE(drv->publish_chunk_bytes);
+		if (publish_bytes)
+			packet_bytes = publish_bytes;
+	}
+	if (!packet_bytes) {
+		u32 frame_bytes = hws_audio_frame_bytes(drv);
+		if (frame_bytes)
+			packet_bytes = READ_ONCE(drv->period_size_byframes) * frame_bytes;
+	}
+	if (!packet_bytes && drv->dev)
+		packet_bytes = READ_ONCE(drv->dev->m_dwAudioPTKSize);
+
+	packet_bytes = hws_audio_normalize_packet_bytes(drv, packet_bytes, &clamped);
 	WRITE_ONCE(drv->last_effective_packet_bytes, packet_bytes);
 	if (ch >= 0 && ch < MAX_VID_CHANNELS) {
 		atomic64_set(&hws_audio_diag[ch].effective_packet_bytes, packet_bytes);
 		if (clamped)
 			atomic64_inc(&hws_audio_diag[ch].packet_bytes_clamped);
 	}
+	return packet_bytes;
+}
+
+static u32 hws_audio_dma_packet_bytes(struct hws_audio *drv, u32 requested_bytes)
+{
+	u32 packet_bytes = requested_bytes;
+	bool clamped = false;
+	int ch;
+
+	if (!drv)
+		return 0;
+	if (!packet_bytes && drv->dev)
+		packet_bytes = READ_ONCE(drv->dev->m_dwAudioPTKSize);
+	packet_bytes = hws_audio_normalize_packet_bytes(drv, packet_bytes, &clamped);
+	ch = drv->index;
+	if (ch >= 0 && ch < MAX_VID_CHANNELS && clamped)
+		atomic64_inc(&hws_audio_diag[ch].packet_bytes_clamped);
 	return packet_bytes;
 }
 
@@ -845,10 +898,10 @@ static int hws_diag_show(struct seq_file *m, void *unused)
 {
 	int i;
 
-	seq_puts(m, "ch work_runs work_ns_total work_ns_max buf_processed buf_done buf_error copy_frames scaler_frames novideo_frames miss_fallbacks memcopy_ns_total scaler_ns_total fresh_runs nofresh_runs src_interval_ns_total src_interval_ns_max src_interval_samples reused_no_fresh_runs reused_backpressure_runs ts_non_monotonic_events seq_non_monotonic_events signal_live_transitions signal_stalled_transitions signal_no_signal_transitions no_signal_placeholder_frames stalled_placeholder_frames fallback_last_stable_ticks fallback_requested_ticks fallback_default_60_ticks drop_dst_too_small_negotiated drop_copy_failed copy_mode_direct copy_mode_scaled\n");
+	seq_puts(m, "ch work_runs work_ns_total work_ns_max buf_processed buf_done buf_error copy_frames scaler_frames novideo_frames miss_fallbacks memcopy_ns_total scaler_ns_total fresh_runs nofresh_runs src_interval_ns_total src_interval_ns_max src_interval_samples reused_no_fresh_runs reused_backpressure_runs ts_non_monotonic_events seq_non_monotonic_events signal_live_transitions signal_stalled_transitions signal_no_signal_transitions no_signal_placeholder_frames stalled_placeholder_frames fallback_last_stable_ticks fallback_requested_ticks fallback_default_60_ticks drop_dst_too_small_negotiated drop_copy_failed copy_mode_direct copy_mode_scaled drop_copy_src_invalid drop_copy_size_mismatch drop_copy_memfault copy_fail_placeholder_done\n");
 	for (i = 0; i < MAX_VID_CHANNELS; i++) {
 		seq_printf(m,
-				"%d %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld\n",
+				"%d %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld\n",
 			i,
 			(long long)atomic64_read(&hws_diag[i].work_runs),
 			(long long)atomic64_read(&hws_diag[i].work_ns_total),
@@ -882,7 +935,11 @@ static int hws_diag_show(struct seq_file *m, void *unused)
 				(long long)atomic64_read(&hws_diag[i].drop_dst_too_small_negotiated),
 				(long long)atomic64_read(&hws_diag[i].drop_copy_failed),
 				(long long)atomic64_read(&hws_diag[i].copy_mode_direct),
-				(long long)atomic64_read(&hws_diag[i].copy_mode_scaled));
+				(long long)atomic64_read(&hws_diag[i].copy_mode_scaled),
+				(long long)atomic64_read(&hws_diag[i].drop_copy_src_invalid),
+				(long long)atomic64_read(&hws_diag[i].drop_copy_size_mismatch),
+				(long long)atomic64_read(&hws_diag[i].drop_copy_memfault),
+				(long long)atomic64_read(&hws_diag[i].copy_fail_placeholder_done));
 	}
 
 	return 0;
@@ -897,13 +954,13 @@ static int hws_audio_diag_show(struct seq_file *m, void *unused)
 {
 	int i;
 
-	seq_puts(m, "ch work_runs buffers_found delivered_bytes delivered_frames period_elapsed oversized_packets drop_no_substream drop_bad_runtime drop_ring_not_ready no_video_silence_injects fallback_silence_injects timer_silence_injects no_free_queue_slots memcopy_failures bad_packet_sizes workqueue_requeues stream_not_running timer_runs irq_to_copy_ns_total irq_to_copy_ns_max irq_to_copy_samples copy_to_deliver_ns_total copy_to_deliver_ns_max copy_to_deliver_samples irq_to_deliver_ns_total irq_to_deliver_ns_max irq_to_deliver_samples queue_free_slots_min queue_free_slots_max queue_free_slots_total queue_free_slots_samples delivery_errors real_periods silence_periods underrun_periods source_lost_periods staged_overruns staged_bytes_dropped timer_late_events timer_late_ns_max pcm_running staged_fill_bytes_min staged_fill_bytes_max source_ok_transitions source_starved_transitions recovery_transitions source_starved_periods recovery_periods silence_source_starved silence_worker_lag packet_bytes_clamped duplicate_half_seen runtime_rate_hz sample_rate_out_hz effective_packet_bytes source_state\n");
+	seq_puts(m, "ch work_runs buffers_found delivered_bytes delivered_frames period_elapsed oversized_packets drop_no_substream drop_bad_runtime drop_ring_not_ready no_video_silence_injects fallback_silence_injects timer_silence_injects no_free_queue_slots memcopy_failures bad_packet_sizes workqueue_requeues stream_not_running timer_runs irq_to_copy_ns_total irq_to_copy_ns_max irq_to_copy_samples copy_to_deliver_ns_total copy_to_deliver_ns_max copy_to_deliver_samples irq_to_deliver_ns_total irq_to_deliver_ns_max irq_to_deliver_samples queue_free_slots_min queue_free_slots_max queue_free_slots_total queue_free_slots_samples delivery_errors real_periods silence_periods underrun_periods source_lost_periods staged_overruns staged_bytes_dropped timer_late_events timer_late_ns_max pcm_running staged_fill_bytes_min staged_fill_bytes_max source_ok_transitions source_starved_transitions recovery_transitions source_starved_periods recovery_periods silence_source_starved silence_worker_lag packet_bytes_clamped duplicate_half_seen runtime_rate_hz sample_rate_out_hz effective_packet_bytes packet_runtime_mismatch source_state\n");
 	for (i = 0; i < MAX_VID_CHANNELS; i++) {
 		long long staged_min = atomic64_read(&hws_audio_diag[i].staged_fill_bytes_min);
 		if (staged_min == S64_MAX) {
 			staged_min = 0;
 		}
-		seq_printf(m, "%d %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %d\n",
+		seq_printf(m, "%d %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %d\n",
 			i,
 			(long long)atomic64_read(&hws_audio_diag[i].work_runs),
 			(long long)atomic64_read(&hws_audio_diag[i].buffers_found),
@@ -960,6 +1017,7 @@ static int hws_audio_diag_show(struct seq_file *m, void *unused)
 				(long long)atomic64_read(&hws_audio_diag[i].runtime_rate_hz),
 				(long long)atomic64_read(&hws_audio_diag[i].sample_rate_out_hz),
 				(long long)atomic64_read(&hws_audio_diag[i].effective_packet_bytes),
+				(long long)atomic64_read(&hws_audio_diag[i].packet_runtime_mismatch),
 				hws_audio_source_state[i]);
 	}
 
@@ -5059,7 +5117,31 @@ static unsigned int hws_pending_consumer_count(struct hws_video *videodev)
     }
     spin_unlock_irqrestore(&videodev->consumers_lock, flags);
 
-    return count;
+	return count;
+}
+
+static int hws_validate_copy_inputs(int in_width, int in_height, BYTE *bBuf[4], int nCopySize[4])
+{
+	int i;
+	u64 sum = 0;
+	u64 expected;
+
+	if (in_width <= 0 || in_height <= 0)
+		return -EINVAL;
+	expected = (u64)in_width * (u64)in_height * 2ULL;
+	if (!expected || expected > MAX_MM_VIDEO_SIZE)
+		return -E2BIG;
+
+	for (i = 0; i < 4; i++) {
+		if (!bBuf[i] || nCopySize[i] < 0)
+			return -EINVAL;
+		sum += (u64)nCopySize[i];
+	}
+
+	if (sum + (u64)(in_width * 4) < expected || sum > expected + (u64)(in_width * 4))
+		return -EMSGSIZE;
+
+	return 0;
 }
 
 static enum hws_video_signal_state hws_video_signal_state_now(struct hws_video *videodev,
@@ -5355,6 +5437,7 @@ static void video_data_process(struct work_struct *p_work)
 	for (;;) {
 		struct hwsvideo_buffer *buf;
 		int copy_ret = 0;
+		int copy_input_ret = 0;
 		u64 copy_start;
 		unsigned int dst_capacity;
 		unsigned int required_size;
@@ -5398,8 +5481,25 @@ static void video_data_process(struct work_struct *p_work)
 			continue;
 		}
 
-			if (!render_placeholder) {
-				if (needs_scaler) {
+		if (!render_placeholder) {
+			copy_input_ret = hws_validate_copy_inputs(in_width, in_height, bBuf, nCopySize);
+			if (copy_input_ret) {
+				if (diag_on) {
+					if (copy_input_ret == -EINVAL)
+						atomic64_inc(&hws_diag[nCh].drop_copy_src_invalid);
+					else if (copy_input_ret == -EMSGSIZE)
+						atomic64_inc(&hws_diag[nCh].drop_copy_size_mismatch);
+					else
+						atomic64_inc(&hws_diag[nCh].drop_copy_memfault);
+					atomic64_inc(&hws_diag[nCh].drop_copy_failed);
+				}
+				SetNoVideoMem(buf->mem, out_width, out_height);
+				novideo_frames++;
+				if (diag_on)
+					atomic64_inc(&hws_diag[nCh].copy_fail_placeholder_done);
+				goto finish_buffer;
+			}
+			if (needs_scaler) {
 					if (diag_on)
 						atomic64_inc(&hws_diag[nCh].copy_mode_scaled);
 					if (!pdx->m_VideoInfo[nCh].m_pVideoScalerBuf) {
@@ -5430,13 +5530,16 @@ static void video_data_process(struct work_struct *p_work)
 				if (!copy_ret)
 					copy_frames++;
 			}
-				if (copy_ret) {
-					vb2_buffer_done(&buf->vb.vb2_buf, VB2_BUF_STATE_ERROR);
-					buf_error++;
-					if (diag_on)
-						atomic64_inc(&hws_diag[nCh].drop_copy_failed);
-					continue;
+			if (copy_ret) {
+				if (diag_on) {
+					atomic64_inc(&hws_diag[nCh].drop_copy_failed);
+					atomic64_inc(&hws_diag[nCh].drop_copy_memfault);
 				}
+				SetNoVideoMem(buf->mem, out_width, out_height);
+				novideo_frames++;
+				if (diag_on)
+					atomic64_inc(&hws_diag[nCh].copy_fail_placeholder_done);
+			}
 		} else {
 			SetNoVideoMem(buf->mem, out_width, out_height);
 			novideo_frames++;
@@ -5448,15 +5551,18 @@ static void video_data_process(struct work_struct *p_work)
 			}
 		}
 
-			if (ctx)
+finish_buffer:
+			vb2_set_plane_payload(&buf->vb.vb2_buf, 0, required_size);
+			if (ctx) {
 				buf->vb.sequence = ctx->seqnr++;
-			else
+			} else {
 				buf->vb.sequence = videodev->seqnr++;
+			}
 			if (diag_on) {
-				bool last_seq_valid = ctx ? ctx->last_seqnr_valid :
-							   hws_diag_last_seq_valid[nCh];
-				bool last_ts_valid = ctx ? ctx->last_frame_ts_valid :
-							  hws_diag_last_ts_valid[nCh];
+					bool last_seq_valid = ctx ? ctx->last_seqnr_valid :
+								   hws_diag_last_seq_valid[nCh];
+					bool last_ts_valid = ctx ? ctx->last_frame_ts_valid :
+								  hws_diag_last_ts_valid[nCh];
 				u32 last_seq = ctx ? ctx->last_seqnr : hws_diag_last_seq[nCh];
 				u64 last_ts = ctx ? ctx->last_frame_ts_ns : hws_diag_last_ts_ns[nCh];
 
@@ -7155,8 +7261,8 @@ static int MemCopyAudioToSteam( struct hws_pcie_dev  *pdx,int dwAudioCh)
 		return -EINVAL;
 	diag = true;
 
-	packet_bytes = hws_audio_effective_packet_bytes(&pdx->audio[dwAudioCh],
-							READ_ONCE(pdx->m_dwAudioPTKSize));
+	packet_bytes = hws_audio_dma_packet_bytes(&pdx->audio[dwAudioCh],
+						  READ_ONCE(pdx->m_dwAudioPTKSize));
 	if (!packet_bytes) {
 		if (diag)
 			atomic64_inc(&hws_audio_diag[dwAudioCh].bad_packet_sizes);
@@ -7165,6 +7271,10 @@ static int MemCopyAudioToSteam( struct hws_pcie_dev  *pdx,int dwAudioCh)
 				     dwAudioCh, READ_ONCE(pdx->m_dwAudioPTKSize));
 		return -EINVAL;
 	}
+	if (READ_ONCE(pdx->audio[dwAudioCh].publish_chunk_bytes) &&
+	    packet_bytes != READ_ONCE(pdx->audio[dwAudioCh].publish_chunk_bytes) &&
+	    dwAudioCh >= 0 && dwAudioCh < MAX_VID_CHANNELS)
+		atomic64_inc(&hws_audio_diag[dwAudioCh].packet_runtime_mismatch);
 	//printk("MemCopyAudioToSteam =%d",dwAudioCh);
 	if(pdx->m_nAudioBufferIndex[dwAudioCh]== 0)
 	{
@@ -7285,6 +7395,9 @@ static int SetAudioQuene( struct hws_pcie_dev *pdx,int dwAudioCh)
 	int status =-1;
 	int current_half;
 	u32 packet_bytes;
+	u64 packet_ns;
+	u64 now_ns;
+	u64 last_copy_ns;
 	//int i;
 	//BYTE *bBuf = NULL;
 	//BYTE *pSrcBuf= NULL;
@@ -7297,14 +7410,27 @@ static int SetAudioQuene( struct hws_pcie_dev *pdx,int dwAudioCh)
 	{
 		  return -1 ;
 	}
-	packet_bytes = hws_audio_effective_packet_bytes(&pdx->audio[dwAudioCh],
-							READ_ONCE(pdx->m_dwAudioPTKSize));
+	packet_bytes = hws_audio_dma_packet_bytes(&pdx->audio[dwAudioCh],
+						  READ_ONCE(pdx->m_dwAudioPTKSize));
+	if (!packet_bytes)
+		packet_bytes = hws_audio_effective_packet_bytes(&pdx->audio[dwAudioCh], 0);
 	if (!packet_bytes)
 		packet_bytes = MAX_DMA_AUDIO_PK_SIZE;
 	current_half = READ_ONCE(pdx->m_nAudioBufferIndex[dwAudioCh]) & 0x1;
 	if (pdx->audio[dwAudioCh].last_dma_half_valid &&
 	    pdx->audio[dwAudioCh].last_dma_half_index == current_half) {
+		packet_ns = hws_audio_packet_duration_ns(&pdx->audio[dwAudioCh], packet_bytes);
+		now_ns = ktime_get_ns();
+		last_copy_ns = READ_ONCE(pdx->audio[dwAudioCh].last_copy_ns);
 		atomic64_inc(&hws_audio_diag[dwAudioCh].duplicate_half_seen);
+		if (last_copy_ns && packet_ns && now_ns > last_copy_ns &&
+		    now_ns - last_copy_ns < (packet_ns / 2)) {
+			if (hws_audio_trace_enabled())
+				trace_printk("hws_audio_drop ch=%d reason=duplicate_half_guard half=%d\n",
+					     dwAudioCh, current_half);
+			pdx->m_nAudioBusy[dwAudioCh] = 0;
+			return 0;
+		}
 		if (hws_audio_trace_enabled())
 			trace_printk("hws_audio_warn ch=%d duplicate_half_seen half=%d keep_packet=1\n",
 				     dwAudioCh, current_half);
