@@ -326,13 +326,11 @@ struct hws_video{
 	int                     fileindex;
 	int                     startstreamIndex;
 	unsigned				seqnr;
-	struct mutex			video_lock;
 	struct mutex			queue_lock;
 	/* B1: multi-consumer */
 	spinlock_t			consumers_lock;
 	struct list_head		consumers;
 	atomic_t			engine_users;
-	struct v4l2_ctrl_handler	ctrl_handler;
 	spinlock_t				slock;
 	v4l2_std_id				std;  //V4L2_STD_NTSC_M
 	u32						pixfmt; //V4L2_PIX_FMT_YUYV(fourcc)

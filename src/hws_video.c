@@ -1626,6 +1626,9 @@ static const framegrabber_pixfmt_t *framegrabber_g_support_pixelfmt_by_fourcc(u3
 	return &support_pixfmts[pixfmt_index];
 }
 
+#define HWS_VIDEO_DEVICE_CAPS	(V4L2_CAP_VIDEO_CAPTURE | V4L2_CAP_STREAMING | \
+				 V4L2_CAP_TIMEPERFRAME)
+
 static int hws_vidioc_querycap(struct file *file, void *priv, struct v4l2_capability *cap)
 {
 	struct hws_video *videodev = video_drvdata(file);
@@ -1637,8 +1640,7 @@ static int hws_vidioc_querycap(struct file *file, void *priv, struct v4l2_capabi
 	scnprintf(cap->card, sizeof(cap->card), "%s %d", HWS_VIDEO_NAME, vi_index);
 	scnprintf(cap->bus_info, sizeof(cap->bus_info), "PCI:%s",
 		  pci_name(dev->pdev));
-	cap->device_caps = V4L2_CAP_VIDEO_CAPTURE | V4L2_CAP_STREAMING |
-			   V4L2_CAP_TIMEPERFRAME;
+	cap->device_caps = HWS_VIDEO_DEVICE_CAPS;
 	cap->capabilities = cap->device_caps | V4L2_CAP_DEVICE_CAPS;
 	//printk( "%s(IN END  )\n", __func__);
 	return 0;
@@ -2028,11 +2030,6 @@ static int hws_vidioc_log_status(struct file *file, void *priv)
 static inline struct hws_vfh_ctx *hws_ctx_from_file(struct file *file)
 {
     return container_of(file->private_data, struct hws_vfh_ctx, fh);
-}
-
-static inline struct hws_vfh_ctx *hws_ctx_from_priv(void *priv)
-{
-    return container_of(priv, struct hws_vfh_ctx, fh);
 }
 
 static ssize_t hws_read(struct file *file, char __user *buf, size_t count,
@@ -2693,50 +2690,50 @@ static int hws_vidioc_s_parm(struct file *file, void *fh, struct v4l2_streamparm
 static int hws_vidioc_reqbufs_multi(struct file *file, void *priv,
 				    struct v4l2_requestbuffers *p)
 {
-	return vb2_reqbufs(&hws_ctx_from_priv(priv)->vbq, p);
+	return vb2_reqbufs(&hws_ctx_from_file(file)->vbq, p);
 }
 
 static int hws_vidioc_create_bufs_multi(struct file *file, void *priv,
 					struct v4l2_create_buffers *p)
 {
-	return vb2_create_bufs(&hws_ctx_from_priv(priv)->vbq, p);
+	return vb2_create_bufs(&hws_ctx_from_file(file)->vbq, p);
 }
 
 static int hws_vidioc_prepare_buf_multi(struct file *file, void *priv,
 					struct v4l2_buffer *p)
 {
-	return vb2_prepare_buf(&hws_ctx_from_priv(priv)->vbq, NULL, p);
+	return vb2_prepare_buf(&hws_ctx_from_file(file)->vbq, NULL, p);
 }
 
 static int hws_vidioc_querybuf_multi(struct file *file, void *priv,
 				     struct v4l2_buffer *p)
 {
-	return vb2_querybuf(&hws_ctx_from_priv(priv)->vbq, p);
+	return vb2_querybuf(&hws_ctx_from_file(file)->vbq, p);
 }
 
 static int hws_vidioc_qbuf_multi(struct file *file, void *priv,
 				 struct v4l2_buffer *p)
 {
-	return vb2_qbuf(&hws_ctx_from_priv(priv)->vbq, NULL, p);
+	return vb2_qbuf(&hws_ctx_from_file(file)->vbq, NULL, p);
 }
 
 static int hws_vidioc_dqbuf_multi(struct file *file, void *priv,
 				  struct v4l2_buffer *p)
 {
-	return vb2_dqbuf(&hws_ctx_from_priv(priv)->vbq, p,
+	return vb2_dqbuf(&hws_ctx_from_file(file)->vbq, p,
 			 file->f_flags & O_NONBLOCK);
 }
 
 static int hws_vidioc_streamon_multi(struct file *file, void *priv,
 				     enum v4l2_buf_type type)
 {
-	return vb2_streamon(&hws_ctx_from_priv(priv)->vbq, type);
+	return vb2_streamon(&hws_ctx_from_file(file)->vbq, type);
 }
 
 static int hws_vidioc_streamoff_multi(struct file *file, void *priv,
 				      enum v4l2_buf_type type)
 {
-	return vb2_streamoff(&hws_ctx_from_priv(priv)->vbq, type);
+	return vb2_streamoff(&hws_ctx_from_file(file)->vbq, type);
 }
 
 static long hws_unlocked_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
@@ -5745,15 +5742,18 @@ static int hws_video_register(struct hws_pcie_dev *dev)
 		dev->video[i].m_Curr_Saturation = SaturationDefault;
 		dev->video[i].m_Curr_Hue = HueDefault; 
 		//-------------------
-		vdev->device_caps = V4L2_CAP_VIDEO_CAPTURE | V4L2_CAP_STREAMING;
+		vdev->device_caps = HWS_VIDEO_DEVICE_CAPS;
 		vdev->v4l2_dev = &(dev->video[i].v4l2_dev);
-		vdev->lock = &(dev->video[i].video_lock);
+		/*
+		 * Buffer queues are per file handle. A device-wide ioctl mutex
+		 * can otherwise hold a blocking DQBUF against STREAMOFF/close.
+		 */
+		vdev->lock = NULL;
 		vdev->fops = &hws_fops;
 		strscpy(vdev->name, KBUILD_MODNAME, sizeof(vdev->name));
 		vdev->release = video_device_release_empty;
 		vdev->vfl_dir = VFL_DIR_RX;
 		vdev->ioctl_ops = &hws_ioctl_fops;
-		mutex_init(&(dev->video[i].video_lock));
 		mutex_init(&(dev->video[i].queue_lock));
 		spin_lock_init(&dev->video[i].consumers_lock);
 		INIT_LIST_HEAD(&dev->video[i].consumers);
