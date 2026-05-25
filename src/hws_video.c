@@ -1635,8 +1635,10 @@ static int hws_vidioc_querycap(struct file *file, void *priv, struct v4l2_capabi
 	//printk( "%s\n", __func__);
 	strscpy(cap->driver, KBUILD_MODNAME, sizeof(cap->driver));
 	scnprintf(cap->card, sizeof(cap->card), "%s %d", HWS_VIDEO_NAME, vi_index);
-	strscpy(cap->bus_info, "HWS", sizeof(cap->bus_info));
-	cap->device_caps =	V4L2_CAP_VIDEO_CAPTURE |V4L2_CAP_STREAMING;
+	scnprintf(cap->bus_info, sizeof(cap->bus_info), "PCI:%s",
+		  pci_name(dev->pdev));
+	cap->device_caps = V4L2_CAP_VIDEO_CAPTURE | V4L2_CAP_STREAMING |
+			   V4L2_CAP_TIMEPERFRAME;
 	cap->capabilities = cap->device_caps | V4L2_CAP_DEVICE_CAPS;
 	//printk( "%s(IN END  )\n", __func__);
 	return 0;
@@ -1856,7 +1858,7 @@ static int vidioc_s_fmt_vid_cap(struct file *file, void *priv,struct v4l2_format
 	spin_unlock_irqrestore(&pdx->videoslock[videodev->index], flags);
 		return 0;
 }
-static int hws_vidioc_g_std(struct file *file, void *priv, v4l2_std_id *tvnorms)
+static int __maybe_unused hws_vidioc_g_std(struct file *file, void *priv, v4l2_std_id *tvnorms)
 {
 	struct hws_video *videodev = video_drvdata(file);
 	//printk( "%s()\n", __func__);
@@ -1864,7 +1866,7 @@ static int hws_vidioc_g_std(struct file *file, void *priv, v4l2_std_id *tvnorms)
 	return 0;
 }
 
-static int hws_vidioc_s_std(struct file *file, void *priv,v4l2_std_id tvnorms)
+static int __maybe_unused hws_vidioc_s_std(struct file *file, void *priv,v4l2_std_id tvnorms)
 {
 	struct hws_video *videodev = video_drvdata(file);
 	//printk( "%s()\n", __func__);
@@ -1954,7 +1956,8 @@ static int hws_vidioc_enum_input(struct file *file, void *priv,struct v4l2_input
 	}
 	i->type = V4L2_INPUT_TYPE_CAMERA;
 	strscpy(i->name, KBUILD_MODNAME, sizeof(i->name));
-	i->std = V4L2_STD_NTSC_M;
+	/* HDMI input is digital; analog TV standards do not apply. */
+	i->std = 0;
 	i->capabilities = 0;
 	i->status=0;
 	
@@ -2022,30 +2025,23 @@ static int hws_vidioc_log_status(struct file *file, void *priv)
 	return 0;
 }
 
-static ssize_t hws_read(struct file *file, char __user *buf, size_t count, loff_t *ppos)
-{
-	//printk( "%s()\n", __func__);
-	return -1;
-		
-}
-
 static inline struct hws_vfh_ctx *hws_ctx_from_file(struct file *file)
 {
     return container_of(file->private_data, struct hws_vfh_ctx, fh);
 }
 
-static bool hws_cmd_requires_exclusive_owner(unsigned int cmd)
+static inline struct hws_vfh_ctx *hws_ctx_from_priv(void *priv)
 {
-    switch (cmd) {
-    case VIDIOC_S_FMT:
-    case VIDIOC_REQBUFS:
-    case VIDIOC_CREATE_BUFS:
-    case VIDIOC_STREAMON:
-    case VIDIOC_STREAMOFF:
-        return true;
-    default:
-        return false;
-    }
+    return container_of(priv, struct hws_vfh_ctx, fh);
+}
+
+static ssize_t hws_read(struct file *file, char __user *buf, size_t count,
+			loff_t *ppos)
+{
+	struct hws_vfh_ctx *ctx = hws_ctx_from_file(file);
+
+	return vb2_read(&ctx->vbq, buf, count, ppos,
+			file->f_flags & O_NONBLOCK);
 }
 
 /* B1 multi-consumer vb2 ops (per-file queue). Defined later in this file. */
@@ -2144,15 +2140,6 @@ static int hws_release(struct file *file)
     spin_lock_irqsave(&videodev->consumers_lock, flags);
     list_del(&ctx->node);
     spin_unlock_irqrestore(&videodev->consumers_lock, flags);
-
-    /*
-     * Single-owner mode: if this fd owned stream-affecting ioctls, release
-     * ownership on close so a later opener can claim it.
-     */
-    mutex_lock(&videodev->ioctl_lock);
-    if (videodev->ioctl_owner == ctx)
-        videodev->ioctl_owner = NULL;
-    mutex_unlock(&videodev->ioctl_lock);
 
     /* release vb2 queue resources */
     vb2_queue_release(&ctx->vbq);
@@ -2702,21 +2689,60 @@ static int hws_vidioc_s_parm(struct file *file, void *fh, struct v4l2_streamparm
 	return 0;
 }
 
-/* --- B1 multi-consumer: per-file vb2_queue switching wrappers --- */
+/* --- B1 multi-consumer: direct per-file vb2 queue wrappers --- */
+static int hws_vidioc_reqbufs_multi(struct file *file, void *priv,
+				    struct v4l2_requestbuffers *p)
+{
+	return vb2_reqbufs(&hws_ctx_from_priv(priv)->vbq, p);
+}
+
+static int hws_vidioc_create_bufs_multi(struct file *file, void *priv,
+					struct v4l2_create_buffers *p)
+{
+	return vb2_create_bufs(&hws_ctx_from_priv(priv)->vbq, p);
+}
+
+static int hws_vidioc_prepare_buf_multi(struct file *file, void *priv,
+					struct v4l2_buffer *p)
+{
+	return vb2_prepare_buf(&hws_ctx_from_priv(priv)->vbq, NULL, p);
+}
+
+static int hws_vidioc_querybuf_multi(struct file *file, void *priv,
+				     struct v4l2_buffer *p)
+{
+	return vb2_querybuf(&hws_ctx_from_priv(priv)->vbq, p);
+}
+
+static int hws_vidioc_qbuf_multi(struct file *file, void *priv,
+				 struct v4l2_buffer *p)
+{
+	return vb2_qbuf(&hws_ctx_from_priv(priv)->vbq, NULL, p);
+}
+
+static int hws_vidioc_dqbuf_multi(struct file *file, void *priv,
+				  struct v4l2_buffer *p)
+{
+	return vb2_dqbuf(&hws_ctx_from_priv(priv)->vbq, p,
+			 file->f_flags & O_NONBLOCK);
+}
+
+static int hws_vidioc_streamon_multi(struct file *file, void *priv,
+				     enum v4l2_buf_type type)
+{
+	return vb2_streamon(&hws_ctx_from_priv(priv)->vbq, type);
+}
+
+static int hws_vidioc_streamoff_multi(struct file *file, void *priv,
+				      enum v4l2_buf_type type)
+{
+	return vb2_streamoff(&hws_ctx_from_priv(priv)->vbq, type);
+}
+
 static long hws_unlocked_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 {
-    struct v4l2_fh *fh = file->private_data;
-    struct hws_vfh_ctx *ctx;
-    struct hws_video *videodev;
-    struct vb2_queue *oldq;
-    bool needs_owner;
-    bool owner_claimed = false;
-    long ret;
-
-    if (!fh)
+    if (!file->private_data)
         return -EINVAL;
-    ctx = container_of(fh, struct hws_vfh_ctx, fh);
-    videodev = ctx->video;
 
     /*
      * Some userspace stacks aggressively call VIDIOC_LOG_STATUS and can flood
@@ -2725,84 +2751,27 @@ static long hws_unlocked_ioctl(struct file *file, unsigned int cmd, unsigned lon
     if (cmd == VIDIOC_LOG_STATUS && !hws_diag_enabled())
         return -ENOTTY;
 
-    mutex_lock(&videodev->ioctl_lock);
-
-    needs_owner = hws_cmd_requires_exclusive_owner(cmd);
-    if (needs_owner) {
-        if (videodev->ioctl_owner && videodev->ioctl_owner != ctx) {
-            ret = -EBUSY;
-            goto out_unlock;
-        }
-        if (!videodev->ioctl_owner) {
-            videodev->ioctl_owner = ctx;
-            owner_claimed = true;
-        }
-    }
-
-    oldq = videodev->vdev.queue;
-    videodev->vdev.queue = &ctx->vbq;
-    ret = video_ioctl2(file, cmd, arg);
-    videodev->vdev.queue = oldq;
-
-    /*
-     * If a first claim fails immediately, do not keep stale ownership.
-     * STREAMOFF (or close) releases ownership after a successful stop.
-     */
-    if (ret && owner_claimed)
-        videodev->ioctl_owner = NULL;
-    else if (!ret && cmd == VIDIOC_STREAMOFF && videodev->ioctl_owner == ctx)
-        videodev->ioctl_owner = NULL;
-
-out_unlock:
-    mutex_unlock(&videodev->ioctl_lock);
-
-    return ret;
+    return video_ioctl2(file, cmd, arg);
 }
 
 static __poll_t hws_poll(struct file *file, struct poll_table_struct *wait)
 {
-    struct v4l2_fh *fh = file->private_data;
     struct hws_vfh_ctx *ctx;
-    struct hws_video *videodev;
-    struct vb2_queue *oldq;
-    __poll_t ret;
 
-    if (!fh)
+    if (!file->private_data)
         return EPOLLERR;
-    ctx = container_of(fh, struct hws_vfh_ctx, fh);
-    videodev = ctx->video;
-
-    mutex_lock(&videodev->ioctl_lock);
-    oldq = videodev->vdev.queue;
-    videodev->vdev.queue = &ctx->vbq;
-    ret = vb2_fop_poll(file, wait);
-    videodev->vdev.queue = oldq;
-    mutex_unlock(&videodev->ioctl_lock);
-
-    return ret;
+    ctx = hws_ctx_from_file(file);
+    return vb2_poll(&ctx->vbq, file, wait);
 }
 
 static int hws_mmap(struct file *file, struct vm_area_struct *vma)
 {
-    struct v4l2_fh *fh = file->private_data;
     struct hws_vfh_ctx *ctx;
-    struct hws_video *videodev;
-    struct vb2_queue *oldq;
-    int ret;
 
-    if (!fh)
+    if (!file->private_data)
         return -EINVAL;
-    ctx = container_of(fh, struct hws_vfh_ctx, fh);
-    videodev = ctx->video;
-
-    mutex_lock(&videodev->ioctl_lock);
-    oldq = videodev->vdev.queue;
-    videodev->vdev.queue = &ctx->vbq;
-    ret = vb2_fop_mmap(file, vma);
-    videodev->vdev.queue = oldq;
-    mutex_unlock(&videodev->ioctl_lock);
-
-    return ret;
+    ctx = hws_ctx_from_file(file);
+    return vb2_mmap(&ctx->vbq, vma);
 }
 
 /* forward declaration */
@@ -2824,16 +2793,14 @@ static const struct v4l2_ioctl_ops hws_ioctl_fops = {
 	.vidioc_g_fmt_vid_cap = hws_vidioc_g_fmt_vid_cap,
 	.vidioc_s_fmt_vid_cap = vidioc_s_fmt_vid_cap,
 	.vidioc_try_fmt_vid_cap = hws_vidioc_try_fmt_vid_cap,
-	.vidioc_reqbufs       = vb2_ioctl_reqbufs,
-	.vidioc_prepare_buf   = vb2_ioctl_prepare_buf,
-	.vidioc_create_bufs   = vb2_ioctl_create_bufs,
-	.vidioc_querybuf      = vb2_ioctl_querybuf,
-	.vidioc_qbuf          = vb2_ioctl_qbuf,
-	.vidioc_dqbuf         = vb2_ioctl_dqbuf,
-	.vidioc_streamon      = vb2_ioctl_streamon,
-	.vidioc_streamoff     = vb2_ioctl_streamoff,
-	.vidioc_g_std = hws_vidioc_g_std,
-	.vidioc_s_std = hws_vidioc_s_std,
+	.vidioc_reqbufs       = hws_vidioc_reqbufs_multi,
+	.vidioc_prepare_buf   = hws_vidioc_prepare_buf_multi,
+	.vidioc_create_bufs   = hws_vidioc_create_bufs_multi,
+	.vidioc_querybuf      = hws_vidioc_querybuf_multi,
+	.vidioc_qbuf          = hws_vidioc_qbuf_multi,
+	.vidioc_dqbuf         = hws_vidioc_dqbuf_multi,
+	.vidioc_streamon      = hws_vidioc_streamon_multi,
+	.vidioc_streamoff     = hws_vidioc_streamoff_multi,
 	.vidioc_enum_framesizes   	= hws_vidioc_enum_framesizes,
 	.vidioc_enum_frameintervals = hws_vidioc_enum_frameintervals,
 	#if LINUX_VERSION_CODE < KERNEL_VERSION(6,13,0)
@@ -5177,11 +5144,13 @@ static int hws_validate_copy_inputs(int in_width, int in_height, BYTE *bBuf[4], 
 	int i;
 	u64 sum = 0;
 	u64 expected;
+	u64 max_expected;
 
 	if (in_width <= 0 || in_height <= 0)
 		return -EINVAL;
 	expected = (u64)in_width * (u64)in_height * 2ULL;
-	if (!expected || expected > MAX_MM_VIDEO_SIZE)
+	max_expected = (u64)MAX_VIDEO_HW_W * (u64)MAX_VIDEO_HW_H * 2ULL;
+	if (!expected || expected > max_expected)
 		return -E2BIG;
 
 	for (i = 0; i < 4; i++) {
@@ -5787,8 +5756,6 @@ static int hws_video_register(struct hws_pcie_dev *dev)
 		mutex_init(&(dev->video[i].video_lock));
 		mutex_init(&(dev->video[i].queue_lock));
 		spin_lock_init(&dev->video[i].consumers_lock);
-		mutex_init(&dev->video[i].ioctl_lock);
-		dev->video[i].ioctl_owner = NULL;
 		INIT_LIST_HEAD(&dev->video[i].consumers);
 		atomic_set(&dev->video[i].engine_users, 0);
 
@@ -7342,9 +7309,16 @@ static int MemCopyAudioToSteam( struct hws_pcie_dev  *pdx,int dwAudioCh)
 		return -EINVAL;
 	}
 	if (READ_ONCE(pdx->audio[dwAudioCh].publish_chunk_bytes) &&
-	    packet_bytes != READ_ONCE(pdx->audio[dwAudioCh].publish_chunk_bytes) &&
-	    dwAudioCh >= 0 && dwAudioCh < MAX_VID_CHANNELS)
-		atomic64_inc(&hws_audio_diag[dwAudioCh].packet_runtime_mismatch);
+	    dwAudioCh >= 0 && dwAudioCh < MAX_VID_CHANNELS) {
+		u32 publish_bytes = READ_ONCE(pdx->audio[dwAudioCh].publish_chunk_bytes);
+		/*
+		 * Runtime publish and DMA packet bytes may differ by an integer ratio
+		 * (for example 4096-byte DMA bursts published as four 1024-byte ALSA
+		 * periods). Treat only non-divisible combinations as mismatch.
+		 */
+		if (!publish_bytes || (packet_bytes % publish_bytes) != 0)
+			atomic64_inc(&hws_audio_diag[dwAudioCh].packet_runtime_mismatch);
+	}
 	//printk("MemCopyAudioToSteam =%d",dwAudioCh);
 	if(pdx->m_nAudioBufferIndex[dwAudioCh]== 0)
 	{
