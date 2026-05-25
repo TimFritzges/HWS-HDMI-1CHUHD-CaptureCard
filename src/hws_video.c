@@ -2993,8 +2993,8 @@ static void hws_stop_streaming(struct vb2_queue *q)
 	videodev->signal_live_debounce_count = 0;
 	videodev->signal_no_video_debounce_count = 0;
 	hws_video_set_signal_state(videodev, HWS_VIDEO_SIGNAL_LIVE);
+	/* Retain the measured cadence for post-capture diagnostics. */
 	hws_diag_last_fresh_ns[videodev->index] = 0;
-	hws_source_interval_ns_avg[videodev->index] = 0;
 	videodev->startstreamIndex --;
 	if(videodev->startstreamIndex<0) videodev->startstreamIndex=0;
 	if(videodev->startstreamIndex == 0)
@@ -3164,8 +3164,8 @@ static void hws_stop_streaming_multi(struct vb2_queue *q)
         videodev->signal_live_debounce_count = 0;
         videodev->signal_no_video_debounce_count = 0;
         hws_video_set_signal_state(videodev, HWS_VIDEO_SIGNAL_LIVE);
+        /* Retain the measured cadence for post-capture diagnostics. */
         hws_diag_last_fresh_ns[videodev->index] = 0;
-        hws_source_interval_ns_avg[videodev->index] = 0;
         StopVideoCapture(videodev->dev, videodev->index);
     }
 }
@@ -5310,6 +5310,7 @@ static void video_data_process(struct work_struct *p_work)
 	u64 scaler_frames = 0;
 	u64 novideo_frames = 0;
 	unsigned int budget;
+	unsigned int pending_consumers;
 	unsigned int processed_in_run = 0;
 	bool budget_exhausted = false;
 	unsigned int per_frame_budget = 1;
@@ -5432,11 +5433,14 @@ static void video_data_process(struct work_struct *p_work)
 	out_size = out_width * out_height * 2;
 	needs_scaler = (in_vsize != out_size);
 	frame_ts_ns = 0;
-	per_frame_budget = hws_pending_consumer_count(videodev);
+	pending_consumers = hws_pending_consumer_count(videodev);
+	per_frame_budget = pending_consumers;
 	if (per_frame_budget == 0)
 		per_frame_budget = 1;
-	if (per_frame_budget > budget)
+	if (per_frame_budget > budget) {
+		budget_exhausted = true;
 		per_frame_budget = budget;
+	}
 
 	source_fps = hws_effective_source_fps(videodev);
 	target_fps = videodev->current_out_framerate;
@@ -5479,10 +5483,8 @@ static void video_data_process(struct work_struct *p_work)
 		unsigned int required_size;
 		struct hws_vfh_ctx *ctx;
 
-		if (processed_in_run >= per_frame_budget) {
-			budget_exhausted = true;
+		if (processed_in_run >= per_frame_budget)
 			break;
-		}
 
 		buf = hws_pop_any_buffer(videodev);
 		if (!buf)
