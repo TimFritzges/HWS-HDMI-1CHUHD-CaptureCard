@@ -19,10 +19,13 @@ This adds a launch wrapper that starts OBS and records long-session diagnostics 
   - live kernel filtered log (`HwsUHDX1Capture`, `videobuf2`, `uvcvideo`, timeout/reset/error patterns)
   - kernel since run-start (+ filtered copy)
 - OBS logs generated during run (`~/.config/obs-studio/logs`)
+- PipeWire graph and timing evidence (`pw-dump`, `pw-top`, `pw-profiler`)
 - Optional coredumps since run start
 - Automatic diag toggle:
   - `diag_enable` is set to `1` on wrapper start and restored to previous value on exit
   - controlled by `DIAG_AUTO_TOGGLE=0|1` (default `1`)
+  - PipeWire evidence is controlled by `CAPTURE_PIPEWIRE=0|1` and
+    `PW_PROFILER_ENABLE=0|1` (both default `1`)
 
 Output is versioned by UTC timestamp + module srcversion:
 - `~/obs-diag-results/<timestamp>-<tag>-HwsUHDX1Capture-<srcversion>/`

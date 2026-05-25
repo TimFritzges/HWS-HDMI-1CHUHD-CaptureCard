@@ -362,6 +362,9 @@ struct hws_video{
 	int last_stable_source_fps;
 	int signal_state;
 	int fallback_cadence_reason;
+	u8 signal_live_debounce_count;
+	u8 signal_no_video_debounce_count;
+	u8 signal_transition_reason;
 };
 	
 struct hws_audio{
@@ -466,6 +469,12 @@ struct hws_pcie_dev {
 	
 	struct task_struct *mMain_tsk; 
 	int m_curr_No_Video[MAX_VID_CHANNELS];
+	u32 m_signal_status_reg[MAX_VID_CHANNELS];
+	u32 m_signal_size_reg[MAX_VID_CHANNELS];
+	u16 m_signal_detected_width[MAX_VID_CHANNELS];
+	u16 m_signal_detected_height[MAX_VID_CHANNELS];
+	u8 m_signal_active_bit[MAX_VID_CHANNELS];
+	u8 m_signal_interlace_bit[MAX_VID_CHANNELS];
 	int m_VideoInHWmode[MAX_VID_CHANNELS];
 	//------------------
 	dma_addr_t   		m_pbyAudio_phys[MAX_VID_CHANNELS] ;

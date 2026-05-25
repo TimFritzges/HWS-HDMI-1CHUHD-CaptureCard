@@ -101,6 +101,13 @@ enum hws_video_fallback_cadence_reason {
 	HWS_VIDEO_CADENCE_DEFAULT_60,
 };
 
+enum hws_video_signal_transition_reason {
+	HWS_SIGNAL_REASON_NONE = 0,
+	HWS_SIGNAL_REASON_ACTIVE_CONFIRMED = 1,
+	HWS_SIGNAL_REASON_INACTIVE_CONFIRMED = 2,
+	HWS_SIGNAL_REASON_STALL_TIMEOUT = 3,
+};
+
 static int fps_policy_mode = HWS_FPS_POLICY_SOURCE_TRUTH;
 module_param_named(fps_policy_mode, fps_policy_mode, int, 0644);
 MODULE_PARM_DESC(fps_policy_mode, "FPS policy: 1=source-truth, 2=userspace-convert, 3=driver-convert (experimental), 4=auto-profile");
@@ -216,12 +223,22 @@ struct hws_diag_stats {
 	atomic64_t drop_copy_size_mismatch;
 	atomic64_t drop_copy_memfault;
 	atomic64_t copy_fail_placeholder_done;
+	atomic64_t signal_active_debounce_confirms;
+	atomic64_t signal_inactive_debounce_confirms;
+	atomic64_t signal_stall_timeout_events;
 };
 
 static struct hws_diag_stats hws_diag[MAX_VID_CHANNELS];
 static struct hws_audio_diag_stats hws_audio_diag[MAX_VID_CHANNELS];
 static struct dentry *hws_diag_root;
 static struct proc_dir_entry *hws_diag_proc_root;
+static u32 hws_diag_signal_status_reg[MAX_VID_CHANNELS];
+static u32 hws_diag_signal_size_reg[MAX_VID_CHANNELS];
+static u16 hws_diag_signal_detected_width[MAX_VID_CHANNELS];
+static u16 hws_diag_signal_detected_height[MAX_VID_CHANNELS];
+static u8 hws_diag_signal_active_bit[MAX_VID_CHANNELS];
+static u8 hws_diag_signal_interlace_bit[MAX_VID_CHANNELS];
+static u8 hws_diag_signal_transition_reason[MAX_VID_CHANNELS];
 static u64 hws_diag_last_fresh_ns[MAX_VID_CHANNELS];
 static u64 hws_source_interval_ns_avg[MAX_VID_CHANNELS];
 static u64 hws_diag_last_ts_ns[MAX_VID_CHANNELS];
@@ -267,17 +284,27 @@ static inline void hws_diag_reset(void)
 		atomic64_set(&hws_diag[i].signal_no_signal_transitions, 0);
 		atomic64_set(&hws_diag[i].no_signal_placeholder_frames, 0);
 		atomic64_set(&hws_diag[i].stalled_placeholder_frames, 0);
-			atomic64_set(&hws_diag[i].fallback_last_stable_ticks, 0);
-			atomic64_set(&hws_diag[i].fallback_requested_ticks, 0);
-			atomic64_set(&hws_diag[i].fallback_default_60_ticks, 0);
-			atomic64_set(&hws_diag[i].drop_dst_too_small_negotiated, 0);
-			atomic64_set(&hws_diag[i].drop_copy_failed, 0);
-			atomic64_set(&hws_diag[i].copy_mode_direct, 0);
-			atomic64_set(&hws_diag[i].copy_mode_scaled, 0);
-			atomic64_set(&hws_diag[i].drop_copy_src_invalid, 0);
-			atomic64_set(&hws_diag[i].drop_copy_size_mismatch, 0);
-			atomic64_set(&hws_diag[i].drop_copy_memfault, 0);
-			atomic64_set(&hws_diag[i].copy_fail_placeholder_done, 0);
+		atomic64_set(&hws_diag[i].fallback_last_stable_ticks, 0);
+		atomic64_set(&hws_diag[i].fallback_requested_ticks, 0);
+		atomic64_set(&hws_diag[i].fallback_default_60_ticks, 0);
+		atomic64_set(&hws_diag[i].drop_dst_too_small_negotiated, 0);
+		atomic64_set(&hws_diag[i].drop_copy_failed, 0);
+		atomic64_set(&hws_diag[i].copy_mode_direct, 0);
+		atomic64_set(&hws_diag[i].copy_mode_scaled, 0);
+		atomic64_set(&hws_diag[i].drop_copy_src_invalid, 0);
+		atomic64_set(&hws_diag[i].drop_copy_size_mismatch, 0);
+		atomic64_set(&hws_diag[i].drop_copy_memfault, 0);
+		atomic64_set(&hws_diag[i].copy_fail_placeholder_done, 0);
+		atomic64_set(&hws_diag[i].signal_active_debounce_confirms, 0);
+		atomic64_set(&hws_diag[i].signal_inactive_debounce_confirms, 0);
+		atomic64_set(&hws_diag[i].signal_stall_timeout_events, 0);
+		WRITE_ONCE(hws_diag_signal_status_reg[i], 0);
+		WRITE_ONCE(hws_diag_signal_size_reg[i], 0);
+		WRITE_ONCE(hws_diag_signal_detected_width[i], 0);
+		WRITE_ONCE(hws_diag_signal_detected_height[i], 0);
+		WRITE_ONCE(hws_diag_signal_active_bit[i], 0);
+		WRITE_ONCE(hws_diag_signal_interlace_bit[i], 0);
+		WRITE_ONCE(hws_diag_signal_transition_reason[i], HWS_SIGNAL_REASON_NONE);
 		hws_diag_last_fresh_ns[i] = 0;
 		hws_source_interval_ns_avg[i] = 0;
 		hws_diag_last_ts_ns[i] = 0;
@@ -898,10 +925,10 @@ static int hws_diag_show(struct seq_file *m, void *unused)
 {
 	int i;
 
-	seq_puts(m, "ch work_runs work_ns_total work_ns_max buf_processed buf_done buf_error copy_frames scaler_frames novideo_frames miss_fallbacks memcopy_ns_total scaler_ns_total fresh_runs nofresh_runs src_interval_ns_total src_interval_ns_max src_interval_samples reused_no_fresh_runs reused_backpressure_runs ts_non_monotonic_events seq_non_monotonic_events signal_live_transitions signal_stalled_transitions signal_no_signal_transitions no_signal_placeholder_frames stalled_placeholder_frames fallback_last_stable_ticks fallback_requested_ticks fallback_default_60_ticks drop_dst_too_small_negotiated drop_copy_failed copy_mode_direct copy_mode_scaled drop_copy_src_invalid drop_copy_size_mismatch drop_copy_memfault copy_fail_placeholder_done\n");
+	seq_puts(m, "ch work_runs work_ns_total work_ns_max buf_processed buf_done buf_error copy_frames scaler_frames novideo_frames miss_fallbacks memcopy_ns_total scaler_ns_total fresh_runs nofresh_runs src_interval_ns_total src_interval_ns_max src_interval_samples reused_no_fresh_runs reused_backpressure_runs ts_non_monotonic_events seq_non_monotonic_events signal_live_transitions signal_stalled_transitions signal_no_signal_transitions no_signal_placeholder_frames stalled_placeholder_frames fallback_last_stable_ticks fallback_requested_ticks fallback_default_60_ticks drop_dst_too_small_negotiated drop_copy_failed copy_mode_direct copy_mode_scaled drop_copy_src_invalid drop_copy_size_mismatch drop_copy_memfault copy_fail_placeholder_done signal_active_debounce_confirms signal_inactive_debounce_confirms signal_stall_timeout_events signal_status_reg signal_size_reg signal_active_bit signal_interlace_bit signal_detected_width signal_detected_height signal_transition_reason\n");
 	for (i = 0; i < MAX_VID_CHANNELS; i++) {
 		seq_printf(m,
-				"%d %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld\n",
+				"%d %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld 0x%x 0x%x %u %u %u %u %u\n",
 			i,
 			(long long)atomic64_read(&hws_diag[i].work_runs),
 			(long long)atomic64_read(&hws_diag[i].work_ns_total),
@@ -939,7 +966,17 @@ static int hws_diag_show(struct seq_file *m, void *unused)
 				(long long)atomic64_read(&hws_diag[i].drop_copy_src_invalid),
 				(long long)atomic64_read(&hws_diag[i].drop_copy_size_mismatch),
 				(long long)atomic64_read(&hws_diag[i].drop_copy_memfault),
-				(long long)atomic64_read(&hws_diag[i].copy_fail_placeholder_done));
+				(long long)atomic64_read(&hws_diag[i].copy_fail_placeholder_done),
+				(long long)atomic64_read(&hws_diag[i].signal_active_debounce_confirms),
+				(long long)atomic64_read(&hws_diag[i].signal_inactive_debounce_confirms),
+				(long long)atomic64_read(&hws_diag[i].signal_stall_timeout_events),
+				READ_ONCE(hws_diag_signal_status_reg[i]),
+				READ_ONCE(hws_diag_signal_size_reg[i]),
+				READ_ONCE(hws_diag_signal_active_bit[i]),
+				READ_ONCE(hws_diag_signal_interlace_bit[i]),
+				READ_ONCE(hws_diag_signal_detected_width[i]),
+				READ_ONCE(hws_diag_signal_detected_height[i]),
+				READ_ONCE(hws_diag_signal_transition_reason[i]));
 	}
 
 	return 0;
@@ -1441,6 +1478,7 @@ static void hws_video_set_signal_state(struct hws_video *videodev,
 {
 	int prev;
 	int ch;
+	int reason;
 
 	if (!videodev)
 		return;
@@ -1450,10 +1488,12 @@ static void hws_video_set_signal_state(struct hws_video *videodev,
 		return;
 
 	WRITE_ONCE(videodev->signal_state, state);
+	reason = READ_ONCE(videodev->signal_transition_reason);
 
 	ch = videodev->index;
 	if (ch < 0 || ch >= MAX_VID_CHANNELS)
 		return;
+	WRITE_ONCE(hws_diag_signal_transition_reason[ch], (u8)reason);
 
 	switch (state) {
 	case HWS_VIDEO_SIGNAL_LIVE:
@@ -1466,6 +1506,14 @@ static void hws_video_set_signal_state(struct hws_video *videodev,
 		atomic64_inc(&hws_diag[ch].signal_no_signal_transitions);
 		break;
 	}
+
+	pr_info_ratelimited(
+		"hws: signal transition ch=%d %d->%d reason=%d active=%u size=%ux%u interlace=%u\n",
+		ch, prev, state, reason,
+		(unsigned int)READ_ONCE(videodev->dev->m_signal_active_bit[ch]),
+		(unsigned int)READ_ONCE(videodev->dev->m_signal_detected_width[ch]),
+		(unsigned int)READ_ONCE(videodev->dev->m_signal_detected_height[ch]),
+		(unsigned int)READ_ONCE(videodev->dev->m_signal_interlace_bit[ch]));
 }
 
 static int hws_video_fallback_fps(struct hws_video *videodev,
@@ -2935,6 +2983,10 @@ static int hws_start_streaming(struct vb2_queue *q, unsigned int count)
 	WRITE_ONCE(videodev->last_source_complete_ns, 0);
 	WRITE_ONCE(videodev->last_stable_source_fps, 0);
 	WRITE_ONCE(videodev->fallback_cadence_reason, HWS_VIDEO_CADENCE_NONE);
+	WRITE_ONCE(videodev->signal_transition_reason, HWS_SIGNAL_REASON_NONE);
+	WRITE_ONCE(hws_diag_signal_transition_reason[videodev->index], HWS_SIGNAL_REASON_NONE);
+	videodev->signal_live_debounce_count = 0;
+	videodev->signal_no_video_debounce_count = 0;
 	hws_video_set_signal_state(videodev, HWS_VIDEO_SIGNAL_LIVE);
 	hws_diag_last_fresh_ns[videodev->index] = 0;
 	hws_source_interval_ns_avg[videodev->index] = 0;
@@ -2984,6 +3036,10 @@ static void hws_stop_streaming(struct vb2_queue *q)
 	WRITE_ONCE(videodev->last_source_complete_ns, 0);
 	WRITE_ONCE(videodev->last_stable_source_fps, 0);
 	WRITE_ONCE(videodev->fallback_cadence_reason, HWS_VIDEO_CADENCE_NONE);
+	WRITE_ONCE(videodev->signal_transition_reason, HWS_SIGNAL_REASON_NONE);
+	WRITE_ONCE(hws_diag_signal_transition_reason[videodev->index], HWS_SIGNAL_REASON_NONE);
+	videodev->signal_live_debounce_count = 0;
+	videodev->signal_no_video_debounce_count = 0;
 	hws_video_set_signal_state(videodev, HWS_VIDEO_SIGNAL_LIVE);
 	hws_diag_last_fresh_ns[videodev->index] = 0;
 	hws_source_interval_ns_avg[videodev->index] = 0;
@@ -3101,6 +3157,10 @@ static int hws_start_streaming_multi(struct vb2_queue *q, unsigned int count)
         WRITE_ONCE(videodev->last_source_complete_ns, 0);
         WRITE_ONCE(videodev->last_stable_source_fps, 0);
         WRITE_ONCE(videodev->fallback_cadence_reason, HWS_VIDEO_CADENCE_NONE);
+        WRITE_ONCE(videodev->signal_transition_reason, HWS_SIGNAL_REASON_NONE);
+        WRITE_ONCE(hws_diag_signal_transition_reason[videodev->index], HWS_SIGNAL_REASON_NONE);
+        videodev->signal_live_debounce_count = 0;
+        videodev->signal_no_video_debounce_count = 0;
         hws_video_set_signal_state(videodev, HWS_VIDEO_SIGNAL_LIVE);
         hws_diag_last_fresh_ns[videodev->index] = 0;
         hws_source_interval_ns_avg[videodev->index] = 0;
@@ -3147,6 +3207,10 @@ static void hws_stop_streaming_multi(struct vb2_queue *q)
         WRITE_ONCE(videodev->last_source_complete_ns, 0);
         WRITE_ONCE(videodev->last_stable_source_fps, 0);
         WRITE_ONCE(videodev->fallback_cadence_reason, HWS_VIDEO_CADENCE_NONE);
+        WRITE_ONCE(videodev->signal_transition_reason, HWS_SIGNAL_REASON_NONE);
+        WRITE_ONCE(hws_diag_signal_transition_reason[videodev->index], HWS_SIGNAL_REASON_NONE);
+        videodev->signal_live_debounce_count = 0;
+        videodev->signal_no_video_debounce_count = 0;
         hws_video_set_signal_state(videodev, HWS_VIDEO_SIGNAL_LIVE);
         hws_diag_last_fresh_ns[videodev->index] = 0;
         hws_source_interval_ns_avg[videodev->index] = 0;
@@ -5149,6 +5213,7 @@ static enum hws_video_signal_state hws_video_signal_state_now(struct hws_video *
 {
 	u64 reference_ns;
 	u64 timeout_ns;
+	int ch = videodev->index;
 
 	if (READ_ONCE(videodev->dev->m_curr_No_Video[videodev->index]))
 		return HWS_VIDEO_SIGNAL_NO_SIGNAL;
@@ -5158,8 +5223,17 @@ static enum hws_video_signal_state hws_video_signal_state_now(struct hws_video *
 	if (!reference_ns)
 		reference_ns = READ_ONCE(videodev->stream_start_ns);
 	if (reference_ns && now_ns > reference_ns &&
-	    now_ns - reference_ns > timeout_ns)
+	    now_ns - reference_ns > timeout_ns) {
+		if (READ_ONCE(videodev->signal_state) != HWS_VIDEO_SIGNAL_STALLED) {
+			WRITE_ONCE(videodev->signal_transition_reason, HWS_SIGNAL_REASON_STALL_TIMEOUT);
+			if (ch >= 0 && ch < MAX_VID_CHANNELS) {
+				WRITE_ONCE(hws_diag_signal_transition_reason[ch],
+					   HWS_SIGNAL_REASON_STALL_TIMEOUT);
+				atomic64_inc(&hws_diag[ch].signal_stall_timeout_events);
+			}
+		}
 		return HWS_VIDEO_SIGNAL_STALLED;
+	}
 
 	return HWS_VIDEO_SIGNAL_LIVE;
 }
@@ -5252,7 +5326,6 @@ static void video_data_process(struct work_struct *p_work)
 	struct hws_video *videodev = container_of(p_work, struct hws_video, videowork);
 	unsigned long devflags;
 	int nVindex = -1;
-	int i;
 	int in_width;
 	int in_height;
 	int in_vsize;
@@ -5351,6 +5424,19 @@ static void video_data_process(struct work_struct *p_work)
 		}
 		if (nVindex == -1)
 			miss_freme = 1;
+	} else if (videodev->last_complete_index >= 0 &&
+		   pdx->m_VideoInfo[nCh].pStatusInfo[videodev->last_complete_index].byLock == MEM_LOCK) {
+		nVindex = videodev->last_complete_index;
+		bBuf[0] = pdx->m_VideoInfo[nCh].m_pVideoBufData[nVindex];
+		bBuf[1] = pdx->m_VideoInfo[nCh].m_pVideoBufData1[nVindex];
+		bBuf[2] = pdx->m_VideoInfo[nCh].m_pVideoBufData2[nVindex];
+		bBuf[3] = pdx->m_VideoInfo[nCh].m_pVideoBufData3[nVindex];
+		nCopySize[0] = pdx->m_VideoInfo[nCh].m_VideoBufferSize[0];
+		nCopySize[1] = pdx->m_VideoInfo[nCh].m_VideoBufferSize[1];
+		nCopySize[2] = pdx->m_VideoInfo[nCh].m_VideoBufferSize[2];
+		nCopySize[3] = pdx->m_VideoInfo[nCh].m_VideoBufferSize[3];
+		interlace = pdx->m_VideoInfo[nCh].pStatusInfo[nVindex].dwinterlace;
+		reused_complete_frame = true;
 	}
 	if (curr_no_video == 0) {
 		if (nVindex >= 0 && !reused_complete_frame) {
@@ -5370,17 +5456,13 @@ static void video_data_process(struct work_struct *p_work)
 			no_fresh_frame = true;
 		}
 	} else {
-		for (i = 0; i < MAX_VIDEO_QUEUE; i++) {
-			if (pdx->m_VideoInfo[nCh].pStatusInfo[i].byLock != MEM_UNLOCK)
-				pdx->m_VideoInfo[nCh].pStatusInfo[i].byLock = MEM_UNLOCK;
-		}
-		videodev->last_complete_index = -1;
+		no_fresh_frame = true;
 	}
 	spin_unlock_irqrestore(&pdx->videoslock[nCh], devflags);
 
 	if (curr_no_video) {
 		hws_video_set_signal_state(videodev, HWS_VIDEO_SIGNAL_NO_SIGNAL);
-		render_placeholder = true;
+		render_placeholder = !reused_complete_frame;
 	} else if (nVindex >= 0 &&
 		   (!reused_complete_frame ||
 		    READ_ONCE(videodev->signal_state) != HWS_VIDEO_SIGNAL_STALLED)) {
@@ -5707,6 +5789,9 @@ static int hws_video_register(struct hws_pcie_dev *dev)
 		dev->video[i].dev = dev;
 		dev->video[i].fileindex =0;
 		dev->video[i].startstreamIndex=0;
+		dev->video[i].signal_live_debounce_count = 0;
+		dev->video[i].signal_no_video_debounce_count = 0;
+		dev->video[i].signal_transition_reason = HWS_SIGNAL_REASON_NONE;
 		dev->video[i].std = V4L2_STD_NTSC_M;
 		dev->video[i].pixfmt = V4L2_PIX_FMT_YUYV;
 		//-------------------
@@ -8028,7 +8113,13 @@ static void ChangeVideoSize(struct hws_pcie_dev *pdx,int ch,int w,int h,int inte
 	int j;
 	int halfframeLength[4];
 	unsigned long flags;
-	if(ch != 0) return;
+	if (!pdx)
+		return;
+	if (ch < 0 || ch >= pdx->m_nCurreMaxVideoChl) {
+		pr_warn_ratelimited("hws: ChangeVideoSize invalid channel ch=%d max=%d\n",
+				    ch, pdx->m_nCurreMaxVideoChl);
+		return;
+	}
 	if(SetVideoFormteSize(pdx,ch,w,h) != 1)
 	{
 		return;		
@@ -8064,23 +8155,41 @@ static int Get_Video_Status(struct hws_pcie_dev *pdx,unsigned int  ch)
 	int interlace=0;
 	int offset;
 	int no_video;
+	u32 size_reg = 0;
 	value =  READ_REGISTER_ULONG(pdx,(DWORD)(CVBS_IN_BASE + (5*PCIE_BARADDROFSIZE)));
 	//printk("[MV]check NoVideo End: [%d] %X\n",ch,value);
 	active_video = ((value&0xFF)>>ch)&0x01;
 	interlace = value>>8;
 	interlace = ((interlace&0xFF)>>ch)&0x01;
+	if (ch < MAX_VID_CHANNELS) {
+		WRITE_ONCE(pdx->m_signal_status_reg[ch], (u32)value);
+		WRITE_ONCE(pdx->m_signal_active_bit[ch], (u8)active_video);
+		WRITE_ONCE(pdx->m_signal_interlace_bit[ch], (u8)interlace);
+		WRITE_ONCE(hws_diag_signal_status_reg[ch], (u32)value);
+		WRITE_ONCE(hws_diag_signal_active_bit[ch], (u8)active_video);
+		WRITE_ONCE(hws_diag_signal_interlace_bit[ch], (u8)interlace);
+	}
 	//printk("[MV][%d] active_video %d\n",ch,active_video);
 	if(active_video >0)
 	{
 			offset = 90 + ch*2;
 			//DbgPrint("[MV][%d] active_video %d\n",ch,interlace);
 			value =  READ_REGISTER_ULONG(pdx,(DWORD)(CVBS_IN_BASE + (offset*PCIE_BARADDROFSIZE)));
+			size_reg = (u32)value;
 			res_w = value&0xFFFF;
 			res_h = (value>>16)&0xFFFF;
 			if(pdx->m_DeviceHW_Version==0)
 			{
 				if(res_w>3840) res_w = 3840;
 				if(res_h>2160) res_h = 2160;
+			}
+			if (ch < MAX_VID_CHANNELS) {
+				WRITE_ONCE(pdx->m_signal_size_reg[ch], size_reg);
+				WRITE_ONCE(pdx->m_signal_detected_width[ch], (u16)res_w);
+				WRITE_ONCE(pdx->m_signal_detected_height[ch], (u16)res_h);
+				WRITE_ONCE(hws_diag_signal_size_reg[ch], size_reg);
+				WRITE_ONCE(hws_diag_signal_detected_width[ch], (u16)res_w);
+				WRITE_ONCE(hws_diag_signal_detected_height[ch], (u16)res_h);
 			}
 			if(((res_w <=MAX_VIDEO_HW_W) &&(res_h<=MAX_VIDEO_HW_H)&&(interlace==0))||((res_w <=MAX_VIDEO_HW_W) &&(res_h*2<=MAX_VIDEO_HW_H)&&(interlace==1)))
 			{
@@ -8096,6 +8205,14 @@ static int Get_Video_Status(struct hws_pcie_dev *pdx,unsigned int  ch)
 	}
 	else
 	{
+		if (ch < MAX_VID_CHANNELS) {
+			WRITE_ONCE(pdx->m_signal_size_reg[ch], 0);
+			WRITE_ONCE(pdx->m_signal_detected_width[ch], 0);
+			WRITE_ONCE(pdx->m_signal_detected_height[ch], 0);
+			WRITE_ONCE(hws_diag_signal_size_reg[ch], 0);
+			WRITE_ONCE(hws_diag_signal_detected_width[ch], 0);
+			WRITE_ONCE(hws_diag_signal_detected_height[ch], 0);
+		}
 		no_video = 1;
 	}
 	
@@ -8107,6 +8224,10 @@ static void CheckVideFmt (struct hws_pcie_dev *pdx)
 {
 	//PAGED_CODE();
 	int i;
+	int raw_no_video;
+	int curr_no_video;
+	const int live_confirm_threshold = 2;
+	const int no_video_confirm_threshold = 3;
 	//DWORD value;
 	//DWORD SetData;
 //	int ret=0;
@@ -8139,9 +8260,37 @@ static void CheckVideFmt (struct hws_pcie_dev *pdx)
 				
 			}
 			#endif 
-			pdx->m_curr_No_Video[i] = Get_Video_Status(pdx,i);
+			raw_no_video = Get_Video_Status(pdx,i);
+			curr_no_video = READ_ONCE(pdx->m_curr_No_Video[i]);
+			if (raw_no_video) {
+				pdx->video[i].signal_no_video_debounce_count++;
+				pdx->video[i].signal_live_debounce_count = 0;
+				if (pdx->video[i].signal_no_video_debounce_count >= no_video_confirm_threshold) {
+					if (!curr_no_video && i < MAX_VID_CHANNELS) {
+						atomic64_inc(&hws_diag[i].signal_inactive_debounce_confirms);
+					}
+					WRITE_ONCE(pdx->m_curr_No_Video[i], 1);
+					WRITE_ONCE(pdx->video[i].signal_transition_reason,
+						   HWS_SIGNAL_REASON_INACTIVE_CONFIRMED);
+					WRITE_ONCE(hws_diag_signal_transition_reason[i],
+						   HWS_SIGNAL_REASON_INACTIVE_CONFIRMED);
+				}
+			} else {
+				pdx->video[i].signal_live_debounce_count++;
+				pdx->video[i].signal_no_video_debounce_count = 0;
+				if (pdx->video[i].signal_live_debounce_count >= live_confirm_threshold) {
+					if (curr_no_video && i < MAX_VID_CHANNELS) {
+						atomic64_inc(&hws_diag[i].signal_active_debounce_confirms);
+					}
+					WRITE_ONCE(pdx->m_curr_No_Video[i], 0);
+					WRITE_ONCE(pdx->video[i].signal_transition_reason,
+						   HWS_SIGNAL_REASON_ACTIVE_CONFIRMED);
+					WRITE_ONCE(hws_diag_signal_transition_reason[i],
+						   HWS_SIGNAL_REASON_ACTIVE_CONFIRMED);
+				}
+			}
 			//---------------
-			if((pdx->m_curr_No_Video[i] ==0x1)&&(pdx->m_bVCapStarted[i]==TRUE))
+			if((READ_ONCE(pdx->m_curr_No_Video[i]) ==0x1)&&(pdx->m_bVCapStarted[i]==TRUE))
 			{
 				 //printk("[MV]check NoVideo End: [%d]\n",i);
 				 queue_work(pdx->wq,&pdx->video[i].videowork);	
@@ -8558,6 +8707,12 @@ static int hws_probe(struct pci_dev *pdev, const struct pci_device_id *pci_id)
 			gdev->m_nVideoBufferIndex[i] = 0;
 			gdev->m_nVideoHalfDone[i] =0;
 			gdev->m_pVideoEvent[i] = 0;
+			gdev->m_signal_status_reg[i] = 0;
+			gdev->m_signal_size_reg[i] = 0;
+			gdev->m_signal_detected_width[i] = 0;
+			gdev->m_signal_detected_height[i] = 0;
+			gdev->m_signal_active_bit[i] = 0;
+			gdev->m_signal_interlace_bit[i] = 0;
 			SetVideoFormteSize(gdev,i,1920,1080);
 			gdev->m_bVCapStarted[i] = 0;
 			gdev->m_bVideoStop[i]=0;

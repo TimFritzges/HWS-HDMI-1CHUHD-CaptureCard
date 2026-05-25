@@ -10,13 +10,15 @@ KVER="${KVER:-$(uname -r)}"
 SRC_DIR="${SRC_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/src}"
 RESULTS_BASE="${RESULTS_BASE:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/bench-results}"
 RUN_TAG="${RUN_TAG:-checkpoint}"
-INITRD="${INITRD:-/boot/initramfs-linux-lts.img}"
+INITRD="${INITRD:-detected-by-dkms-versioned-build}"
 DEVICE="${DEVICE:-/dev/video0}"
 DURATION="${DURATION:-60}"
 FPS="${FPS:-60}"
 SIZE="${SIZE:-1920x1080}"
 SKIP_DKMS="${SKIP_DKMS:-0}"
 SKIP_BENCH="${SKIP_BENCH:-0}"
+SKIP_STATIC_CHECK="${SKIP_STATIC_CHECK:-0}"
+ALLOW_LTS_TARGET="${ALLOW_LTS_TARGET:-0}"
 PENDING_FILE="${PENDING_FILE:-/var/tmp/hws-checkpoint-pending.env}"
 STALE_HOURS="${STALE_HOURS:-24}"
 PREPARE_REBOOT=0
@@ -38,6 +40,7 @@ Options:
   --size <WxH>         Bench frame size (default: 1920x1080)
   --skip-dkms          Skip DKMS command emission
   --skip-bench         Skip bench execution
+  --skip-static-check  Skip the non-privileged source build before DKMS emission
   --prepare-reboot     Create pending marker and emit reboot-resume commands
   --postboot-run       Resume from pending marker and finish checkpoint
   --pending-file PATH  Override pending marker path
@@ -45,7 +48,8 @@ Options:
   -h, --help           Show help
 
 Environment:
-  MODULE VERSION KVER SRC_DIR RESULTS_BASE RUN_TAG INITRD
+  MODULE VERSION KVER SRC_DIR RESULTS_BASE RUN_TAG INITRD ALLOW_LTS_TARGET
+  ALLOW_LTS_TARGET=1 explicitly permits preparing an LTS checkpoint.
 USAGE
 }
 
@@ -58,6 +62,7 @@ while (($#)); do
     --size) SIZE="${2:-}"; shift 2 ;;
     --skip-dkms) SKIP_DKMS=1; shift ;;
     --skip-bench) SKIP_BENCH=1; shift ;;
+    --skip-static-check) SKIP_STATIC_CHECK=1; shift ;;
     --prepare-reboot) PREPARE_REBOOT=1; shift ;;
     --postboot-run) POSTBOOT_RUN=1; shift ;;
     --pending-file) PENDING_FILE="${2:-}"; shift 2 ;;
@@ -69,6 +74,10 @@ done
 
 if ! [[ "${DURATION}" =~ ^[0-9]+$ ]] || [[ "${DURATION}" -lt 1 ]]; then
   echo "Invalid duration: ${DURATION}" >&2
+  exit 2
+fi
+if [[ "${ALLOW_LTS_TARGET}" != "0" && "${ALLOW_LTS_TARGET}" != "1" ]]; then
+  echo "Invalid ALLOW_LTS_TARGET: ${ALLOW_LTS_TARGET}" >&2
   exit 2
 fi
 
@@ -149,18 +158,25 @@ if [[ "${POSTBOOT_RUN}" == "1" ]]; then
 fi
 
 if [[ "${SKIP_DKMS}" == "0" ]]; then
+  if [[ "${KVER}" == *lts* && "${ALLOW_LTS_TARGET}" != "1" ]]; then
+    echo "Refusing to prepare a DKMS checkpoint for LTS fallback kernel ${KVER}." >&2
+    echo "Boot the non-LTS test kernel first, or set ALLOW_LTS_TARGET=1 deliberately." >&2
+    exit 2
+  fi
+  if [[ "${KVER}" != "$(uname -r)" ]]; then
+    echo "Refusing DKMS checkpoint preparation for non-running kernel ${KVER}." >&2
+    echo "The versioned workflow rebuilds only the running kernel initramfs safely." >&2
+    exit 2
+  fi
+  if [[ "${SKIP_STATIC_CHECK}" == "0" ]]; then
+    "${script_dir}/static-check.sh" -o "${RESULTS_BASE}" |
+      tee "${outdir}/static-check.stdout.txt"
+  fi
   cat > "${outdir}/dkms-commands.txt" <<CMDS
-# Run as root. This mirrors doc/DKMS_UPDATE_RUNBOOK.md.
-DKMS_SRC="/usr/src/${MODULE}-${VERSION}"
-rm -rf "\${DKMS_SRC}"
-install -d "\${DKMS_SRC}"
-rsync -a --delete "${SRC_DIR}/" "\${DKMS_SRC}/"
-dkms remove -m "${MODULE}" -v "${VERSION}" --all || true
-dkms add -m "${MODULE}" -v "${VERSION}"
-dkms build -m "${MODULE}" -v "${VERSION}" -k "${KVER}"
-dkms install -m "${MODULE}" -v "${VERSION}" -k "${KVER}" --force
-depmod -a
-dracut --force "${INITRD}" "${KVER}"
+# Run as root while booted into the intended non-LTS test kernel.
+# The versioned builder records source identity and detects the current dracut target.
+cd "$(cd "${script_dir}/.." && pwd)"
+sudo -E ./scripts/dkms-versioned-build.sh --kernels current --prune-others --dracut-current
 # reboot required before validation bench
 CMDS
   if [[ "${PREPARE_REBOOT}" == "1" ]]; then

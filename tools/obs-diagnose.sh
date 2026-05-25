@@ -9,6 +9,9 @@ OUT_BASE="${OUT_BASE:-$HOME/obs-diag-results}"
 CAPTURE_FULL_SYSTEM_JOURNAL="${CAPTURE_FULL_SYSTEM_JOURNAL:-0}"
 PRIV_HELPER="${PRIV_HELPER:-/usr/local/sbin/hws-obs-diag-priv}"
 DIAG_AUTO_TOGGLE="${DIAG_AUTO_TOGGLE:-1}"
+VIDEO_DEVICE="${VIDEO_DEVICE:-/dev/video0}"
+CAPTURE_PIPEWIRE="${CAPTURE_PIPEWIRE:-1}"
+PW_PROFILER_ENABLE="${PW_PROFILER_ENABLE:-1}"
 
 usage() {
   cat <<'USAGE'
@@ -31,6 +34,9 @@ Environment:
   CAPTURE_FULL_SYSTEM_JOURNAL=0|1
   PRIV_HELPER=/usr/local/sbin/hws-obs-diag-priv
   DIAG_AUTO_TOGGLE=0|1
+  VIDEO_DEVICE=/dev/video0
+  CAPTURE_PIPEWIRE=0|1
+  PW_PROFILER_ENABLE=0|1
 
 Examples:
   tools/obs-diagnose.sh
@@ -60,6 +66,12 @@ if [[ "${DIAG_AUTO_TOGGLE}" != "0" && "${DIAG_AUTO_TOGGLE}" != "1" ]]; then
   echo "Invalid DIAG_AUTO_TOGGLE: ${DIAG_AUTO_TOGGLE}" >&2
   exit 2
 fi
+for toggle in CAPTURE_PIPEWIRE PW_PROFILER_ENABLE; do
+  if [[ "${!toggle}" != "0" && "${!toggle}" != "1" ]]; then
+    echo "Invalid ${toggle}: ${!toggle}" >&2
+    exit 2
+  fi
+done
 
 obs_args=("$@")
 
@@ -93,6 +105,9 @@ kernel_filtered_log="${run_dir}/journal-kernel-filtered.log"
 system_journal_log="${run_dir}/journal-system-follow.log"
 obs_stdout_log="${run_dir}/obs-stdout.log"
 obs_profile_logs_dir="${run_dir}/obs-profile-logs"
+pw_dump_before="${run_dir}/pw-dump.before.json"
+pw_dump_after="${run_dir}/pw-dump.after.json"
+pw_profiler_log="${run_dir}/pw-profiler.json"
 mkdir -p "${obs_profile_logs_dir}"
 
 start_iso="$(date -u --iso-8601=seconds)"
@@ -110,6 +125,9 @@ start_epoch="$(date +%s)"
   echo "capture_full_system_journal=${CAPTURE_FULL_SYSTEM_JOURNAL}"
   echo "priv_helper=${PRIV_HELPER}"
   echo "diag_auto_toggle=${DIAG_AUTO_TOGGLE}"
+  echo "video_device=${VIDEO_DEVICE}"
+  echo "capture_pipewire=${CAPTURE_PIPEWIRE}"
+  echo "pw_profiler_enable=${PW_PROFILER_ENABLE}"
 } > "${meta}"
 
 if command -v modinfo >/dev/null 2>&1; then
@@ -122,8 +140,11 @@ if command -v lsmod >/dev/null 2>&1; then
   lsmod > "${run_dir}/lsmod.txt"
 fi
 if command -v v4l2-ctl >/dev/null 2>&1; then
-  v4l2-ctl -d /dev/video0 --all > "${run_dir}/v4l2-all.txt" 2>&1 || true
-  v4l2-ctl -d /dev/video0 --list-formats-ext > "${run_dir}/v4l2-formats.txt" 2>&1 || true
+  v4l2-ctl -d "${VIDEO_DEVICE}" --all > "${run_dir}/v4l2-all.txt" 2>&1 || true
+  v4l2-ctl -d "${VIDEO_DEVICE}" --list-formats-ext > "${run_dir}/v4l2-formats.txt" 2>&1 || true
+fi
+if [[ "${CAPTURE_PIPEWIRE}" == "1" ]] && command -v pw-dump >/dev/null 2>&1; then
+  pw-dump -N > "${pw_dump_before}" 2>&1 || true
 fi
 {
   echo "===== /proc/cmdline ====="
@@ -219,8 +240,12 @@ if command -v journalctl >/dev/null 2>&1; then
   fi
 fi
 
-if command -v pw-top >/dev/null 2>&1; then
+if [[ "${CAPTURE_PIPEWIRE}" == "1" ]] && command -v pw-top >/dev/null 2>&1; then
   start_bg bash -lc "pw-top -b > \"${run_dir}/pw-top-live.log\" 2>&1"
+fi
+if [[ "${CAPTURE_PIPEWIRE}" == "1" && "${PW_PROFILER_ENABLE}" == "1" ]] &&
+   command -v pw-profiler >/dev/null 2>&1; then
+  start_bg bash -lc "pw-profiler -J > \"${pw_profiler_log}\" 2>&1"
 fi
 
 sampler() {
@@ -296,6 +321,9 @@ fi
 if command -v coredumpctl >/dev/null 2>&1; then
   coredumpctl --since "${start_iso}" --no-pager > "${run_dir}/coredumps-since-start.txt" 2>&1 || true
 fi
+if [[ "${CAPTURE_PIPEWIRE}" == "1" ]] && command -v pw-dump >/dev/null 2>&1; then
+  pw-dump -N > "${pw_dump_after}" 2>&1 || true
+fi
 
 {
   echo "===== /proc/cmdline ====="
@@ -350,6 +378,9 @@ kernel_nvidia_gem_error_count="$(count_matches "${run_dir}/journal-kernel-since-
   echo "kernel_retire_suppressed_count=${kernel_retire_suppressed_count}"
   echo "kernel_hw_timeout_count=${kernel_hw_timeout_count}"
   echo "kernel_nvidia_gem_error_count=${kernel_nvidia_gem_error_count}"
+  echo "pw_dump_before=${pw_dump_before}"
+  echo "pw_dump_after=${pw_dump_after}"
+  echo "pw_profiler_log=${pw_profiler_log}"
   echo "obs_render_lag_line=${obs_render_lag_line}"
   echo "obs_encode_lag_line=${obs_encode_lag_line}"
   echo "obs_net_drop_line=${obs_net_drop_line}"

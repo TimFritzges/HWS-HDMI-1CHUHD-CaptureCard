@@ -9,6 +9,10 @@ MODULE="${MODULE:-HwsUHDX1Capture}"
 SIZE="${SIZE:-1920x1080}"
 FPS="${FPS:-60}"
 DIAG_ROOT="${DIAG_ROOT:-}"
+RUN_V4L2_COMPLIANCE="${RUN_V4L2_COMPLIANCE:-1}"
+V4L2_COMPLIANCE_STREAM_FRAMES="${V4L2_COMPLIANCE_STREAM_FRAMES:-0}"
+CAPTURE_PIPEWIRE="${CAPTURE_PIPEWIRE:-1}"
+PW_PROFILER_SAMPLES="${PW_PROFILER_SAMPLES:-0}"
 
 usage() {
   cat <<'USAGE'
@@ -26,6 +30,10 @@ Options:
   -h             Show help
 
 Env overrides: DEVICE DURATION OUT_BASE RUN_TAG MODULE SIZE FPS DIAG_ROOT
+  RUN_V4L2_COMPLIANCE=0|1             Run isolated API conformance check (default: 1)
+  V4L2_COMPLIANCE_STREAM_FRAMES=<n>   Stream frames during compliance (default: 0)
+  CAPTURE_PIPEWIRE=0|1                Capture PipeWire evidence (default: 1)
+  PW_PROFILER_SAMPLES=<n>             Profiler samples during capture (default: 0/off)
 USAGE
 }
 
@@ -51,6 +59,20 @@ if ! [[ "${FPS}" =~ ^[0-9]+$ ]] || [[ "${FPS}" -lt 1 ]]; then
   echo "Invalid fps: ${FPS}" >&2
   exit 2
 fi
+for toggle in RUN_V4L2_COMPLIANCE CAPTURE_PIPEWIRE; do
+  if [[ "${!toggle}" != "0" && "${!toggle}" != "1" ]]; then
+    echo "Invalid ${toggle}: ${!toggle} (expected 0 or 1)" >&2
+    exit 2
+  fi
+done
+if ! [[ "${V4L2_COMPLIANCE_STREAM_FRAMES}" =~ ^[0-9]+$ ]]; then
+  echo "Invalid V4L2_COMPLIANCE_STREAM_FRAMES: ${V4L2_COMPLIANCE_STREAM_FRAMES}" >&2
+  exit 2
+fi
+if ! [[ "${PW_PROFILER_SAMPLES}" =~ ^[0-9]+$ ]]; then
+  echo "Invalid PW_PROFILER_SAMPLES: ${PW_PROFILER_SAMPLES}" >&2
+  exit 2
+fi
 
 stamp="$(date -u +%Y%m%d-%H%M%S)"
 run_id="${stamp}-$(echo "${RUN_TAG}" | tr -cs 'A-Za-z0-9._-' '-')"
@@ -68,6 +90,11 @@ audio_diag_before="${outdir}/audio-diag.before.txt"
 audio_diag_after="${outdir}/audio-diag.after.txt"
 source_cadence_before="${outdir}/source-cadence.before.txt"
 source_cadence_after="${outdir}/source-cadence.after.txt"
+v4l2_compliance_log="${outdir}/v4l2-compliance.log"
+pw_dump_before="${outdir}/pw-dump.before.json"
+pw_dump_after="${outdir}/pw-dump.after.json"
+pw_top_log="${outdir}/pw-top.log"
+pw_profiler_log="${outdir}/pw-profiler.json"
 
 if [[ -z "${DIAG_ROOT}" ]]; then
   if [[ -r /proc/hwsuhdx1/video_diag ]]; then
@@ -115,14 +142,111 @@ diag_total_delta() {
   ' "${before}" "${after}"
 }
 
+diag_value_after() {
+  local after="${1}"
+  local field="${2}"
+  local channel="${3:-0}"
+
+  if [[ ! -s "${after}" ]]; then
+    echo 0
+    return
+  fi
+
+  awk -v field="${field}" -v channel="${channel}" '
+    FNR == 1 {
+      for (i = 1; i <= NF; i++) col[$i] = i
+      next
+    }
+    $1 == channel && col[field] {
+      print $(col[field])
+      found = 1
+      exit
+    }
+    END {
+      if (!found) print 0
+    }
+  ' "${after}"
+}
+
+active_source_channel() {
+  local src_file="${1}"
+  if [[ ! -s "${src_file}" ]]; then
+    echo 0
+    return
+  fi
+  awk '
+    NR == 1 { next }
+    $1 ~ /^[0-9]+$/ && $3 > 0 {
+      if ($3 > best_fps) {
+        best_fps = $3
+        best_ch = $1
+      }
+    }
+    END {
+      if (best_ch == "") best_ch = 0
+      print best_ch
+    }
+  ' "${src_file}"
+}
+
+capture_pw_dump() {
+  local out="${1}"
+
+  if [[ "${CAPTURE_PIPEWIRE}" == "1" ]] && command -v pw-dump >/dev/null 2>&1; then
+    pw-dump -N > "${out}" 2>&1 || true
+  fi
+}
+
 capture_debugfs_snapshot "${DIAG_ROOT}/video_diag" "${video_diag_before}"
 capture_debugfs_snapshot "${DIAG_ROOT}/audio_diag" "${audio_diag_before}"
 capture_debugfs_snapshot "${DIAG_ROOT}/source_cadence" "${source_cadence_before}"
+capture_pw_dump "${pw_dump_before}"
 
 if command -v v4l2-ctl >/dev/null 2>&1; then
   v4l2-ctl --device="${DEVICE}" --all > "${v4l2_all}" 2>&1 || true
 else
   echo "v4l2-ctl not found" > "${v4l2_all}"
+fi
+
+v4l2_compliance_status="disabled"
+if [[ "${RUN_V4L2_COMPLIANCE}" == "1" ]]; then
+  if command -v v4l2-compliance >/dev/null 2>&1; then
+    compliance_args=(--device "${DEVICE}" --no-progress --color never)
+    if [[ "${V4L2_COMPLIANCE_STREAM_FRAMES}" -gt 0 ]]; then
+      compliance_args+=(--streaming "${V4L2_COMPLIANCE_STREAM_FRAMES}")
+    fi
+    if v4l2-compliance "${compliance_args[@]}" > "${v4l2_compliance_log}" 2>&1; then
+      v4l2_compliance_status="pass"
+    else
+      v4l2_compliance_status="fail"
+    fi
+  else
+    v4l2_compliance_status="tool_missing"
+    echo "v4l2-compliance not found" > "${v4l2_compliance_log}"
+  fi
+fi
+
+declare -a monitor_pids=()
+start_monitor() {
+  "$@" &
+  monitor_pids+=("$!")
+}
+stop_monitors() {
+  local pid
+  for pid in "${monitor_pids[@]:-}"; do
+    kill "${pid}" >/dev/null 2>&1 || true
+    wait "${pid}" >/dev/null 2>&1 || true
+  done
+}
+trap stop_monitors EXIT
+
+if [[ "${CAPTURE_PIPEWIRE}" == "1" ]] && command -v pw-top >/dev/null 2>&1; then
+  start_monitor bash -c 'exec pw-top -b > "$1" 2>&1' _ "${pw_top_log}"
+fi
+if [[ "${CAPTURE_PIPEWIRE}" == "1" && "${PW_PROFILER_SAMPLES}" -gt 0 ]] &&
+   command -v pw-profiler >/dev/null 2>&1; then
+  start_monitor bash -c 'exec pw-profiler -J -n "$1" > "$2" 2>&1' _ \
+    "${PW_PROFILER_SAMPLES}" "${pw_profiler_log}"
 fi
 
 backend="none"
@@ -140,6 +264,8 @@ elif command -v v4l2-ctl >/dev/null 2>&1; then
 else
   echo "No capture backend found (ffmpeg or v4l2-ctl)" > "${capture_log}"
 fi
+stop_monitors
+trap - EXIT
 
 if command -v journalctl >/dev/null 2>&1; then
   journalctl -k -b --no-pager | rg -i "${MODULE}|videobuf2|dma|timeout|reset|error" > "${journal_kern}" || true
@@ -150,6 +276,7 @@ fi
 capture_debugfs_snapshot "${DIAG_ROOT}/video_diag" "${video_diag_after}"
 capture_debugfs_snapshot "${DIAG_ROOT}/audio_diag" "${audio_diag_after}"
 capture_debugfs_snapshot "${DIAG_ROOT}/source_cadence" "${source_cadence_after}"
+capture_pw_dump "${pw_dump_after}"
 
 actual_frames=0
 if [[ "${backend}" == "ffmpeg" ]]; then
@@ -190,21 +317,37 @@ video_stalled_placeholder_frames_delta="$(diag_total_delta "${video_diag_before}
 video_fallback_last_stable_ticks_delta="$(diag_total_delta "${video_diag_before}" "${video_diag_after}" fallback_last_stable_ticks)"
 video_fallback_requested_ticks_delta="$(diag_total_delta "${video_diag_before}" "${video_diag_after}" fallback_requested_ticks)"
 video_fallback_default_60_ticks_delta="$(diag_total_delta "${video_diag_before}" "${video_diag_after}" fallback_default_60_ticks)"
+video_signal_active_debounce_confirms_delta="$(diag_total_delta "${video_diag_before}" "${video_diag_after}" signal_active_debounce_confirms)"
+video_signal_inactive_debounce_confirms_delta="$(diag_total_delta "${video_diag_before}" "${video_diag_after}" signal_inactive_debounce_confirms)"
+video_signal_stall_timeout_events_delta="$(diag_total_delta "${video_diag_before}" "${video_diag_after}" signal_stall_timeout_events)"
+video_active_channel="$(active_source_channel "${source_cadence_after}")"
+video_signal_active_bit_ch0="$(diag_value_after "${video_diag_after}" signal_active_bit "${video_active_channel}")"
+video_signal_detected_width_ch0="$(diag_value_after "${video_diag_after}" signal_detected_width "${video_active_channel}")"
+video_signal_detected_height_ch0="$(diag_value_after "${video_diag_after}" signal_detected_height "${video_active_channel}")"
+video_signal_transition_reason_ch0="$(diag_value_after "${video_diag_after}" signal_transition_reason "${video_active_channel}")"
+persistent_no_signal_with_active_probe=0
+stalled_without_fresh_frames=0
+if [[ "${video_signal_active_bit_ch0}" -gt 0 && "${video_no_signal_placeholder_frames_delta}" -gt 0 ]]; then
+  persistent_no_signal_with_active_probe=1
+fi
+if [[ "${video_signal_stalled_transitions_delta}" -gt 0 && "${video_reused_no_fresh_delta}" -gt 0 ]]; then
+  stalled_without_fresh_frames=1
+fi
 source_truth_mismatch_flag=0
 source_truth_active_fps=0
 if [[ -s "${source_cadence_after}" ]]; then
-  source_truth_active_fps="$(awk 'NR > 1 && $1 == 0 { print $3; exit }' "${source_cadence_after}")"
+  source_truth_active_fps="$(awk -v ch="${video_active_channel}" 'NR > 1 && $1 == ch { print $3; exit }' "${source_cadence_after}")"
   source_truth_active_fps="${source_truth_active_fps:-0}"
   source_truth_mismatch_flag="$(awk -v req="${FPS}" -v src="${source_truth_active_fps}" 'BEGIN {
     if (req <= 0 || src <= 0) { print 0; exit }
     diff = req - src
     if (diff < 0) diff = -diff
-    print diff > (src * 0.10) ? 1 : 0
+    print (diff > (src * 0.10)) ? 1 : 0
   }')"
 fi
 
 {
-  echo "artifact_schema=safe-bench-v2"
+  echo "artifact_schema=safe-bench-v3"
   echo "run_id=${run_id}"
   echo "timestamp_utc=$(date -u --iso-8601=seconds)"
   echo "module=${MODULE}"
@@ -238,7 +381,26 @@ fi
   echo "video_fallback_last_stable_ticks_delta=${video_fallback_last_stable_ticks_delta}"
   echo "video_fallback_requested_ticks_delta=${video_fallback_requested_ticks_delta}"
   echo "video_fallback_default_60_ticks_delta=${video_fallback_default_60_ticks_delta}"
+  echo "video_signal_active_debounce_confirms_delta=${video_signal_active_debounce_confirms_delta}"
+  echo "video_signal_inactive_debounce_confirms_delta=${video_signal_inactive_debounce_confirms_delta}"
+  echo "video_signal_stall_timeout_events_delta=${video_signal_stall_timeout_events_delta}"
+  echo "video_active_channel=${video_active_channel}"
+  echo "video_signal_active_bit_ch0=${video_signal_active_bit_ch0}"
+  echo "video_signal_detected_width_ch0=${video_signal_detected_width_ch0}"
+  echo "video_signal_detected_height_ch0=${video_signal_detected_height_ch0}"
+  echo "video_signal_transition_reason_ch0=${video_signal_transition_reason_ch0}"
+  echo "persistent_no_signal_with_active_probe=${persistent_no_signal_with_active_probe}"
+  echo "stalled_without_fresh_frames=${stalled_without_fresh_frames}"
+  echo "v4l2_compliance_status=${v4l2_compliance_status}"
+  echo "v4l2_compliance_stream_frames=${V4L2_COMPLIANCE_STREAM_FRAMES}"
+  echo "capture_pipewire=${CAPTURE_PIPEWIRE}"
+  echo "pw_profiler_samples=${PW_PROFILER_SAMPLES}"
   echo "v4l2_all=${v4l2_all}"
+  echo "v4l2_compliance_log=${v4l2_compliance_log}"
+  echo "pw_dump_before=${pw_dump_before}"
+  echo "pw_dump_after=${pw_dump_after}"
+  echo "pw_top_log=${pw_top_log}"
+  echo "pw_profiler_log=${pw_profiler_log}"
   echo "capture_log=${capture_log}"
   echo "journal_kernel_filtered=${journal_kern}"
   echo "outdir=${outdir}"

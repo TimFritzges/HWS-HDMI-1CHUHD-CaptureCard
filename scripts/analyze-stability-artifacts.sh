@@ -43,6 +43,8 @@ FAIL_SOURCE_TRUTH_MISMATCH_MIN="${FAIL_SOURCE_TRUTH_MISMATCH_MIN:-1}"
 FAIL_VIDEO_LONG_GAP_MIN="${FAIL_VIDEO_LONG_GAP_MIN:-1}"
 FAIL_VIDEO_SEQ_GAP_MIN="${FAIL_VIDEO_SEQ_GAP_MIN:-1}"
 FAIL_VIDEO_MONOTONIC_MIN="${FAIL_VIDEO_MONOTONIC_MIN:-1}"
+FAIL_ACTIVE_PROBE_PLACEHOLDER_MIN="${FAIL_ACTIVE_PROBE_PLACEHOLDER_MIN:-1}"
+FAIL_STALLED_NO_FRESH_MIN="${FAIL_STALLED_NO_FRESH_MIN:-1}"
 FAIL_REGRESSION_SCORE_MIN="${FAIL_REGRESSION_SCORE_MIN:-100}"
 WARN_REGRESSION_SCORE_MIN="${WARN_REGRESSION_SCORE_MIN:-20}"
 
@@ -51,7 +53,7 @@ if [[ -r "${PROFILE}" ]]; then
   source "${PROFILE}"
 fi
 
-echo -e "run_type\trun_id\taudio_source_lost_periods\taudio_timer_silence_injects\taudio_workqueue_requeues\taudio_memcopy_failures\taudio_queue_free_slots_min\taudio_queue_free_slots_max\tvideo_long_gap_events\tvideo_seq_gap_frames\tvideo_fallback_frames\tobs_select_timeout\tkernel_timeout\tsource_truth_mismatch\tregression_score\tverdict\tverdict_reason\tsource_path\tartifact_status\tvideo_ts_non_monotonic\tvideo_seq_non_monotonic\tvideo_reused_no_fresh\tvideo_reused_backpressure\taudio_source_starved_transitions\taudio_recovery_transitions\taudio_timer_late_events\tvideo_no_signal_placeholders\tvideo_stalled_placeholders\tvideo_fallback_last_stable_ticks\tvideo_fallback_requested_ticks\tvideo_fallback_default_60_ticks" > "${OUT}"
+echo -e "run_type\trun_id\taudio_source_lost_periods\taudio_timer_silence_injects\taudio_workqueue_requeues\taudio_memcopy_failures\taudio_queue_free_slots_min\taudio_queue_free_slots_max\tvideo_long_gap_events\tvideo_seq_gap_frames\tvideo_fallback_frames\tobs_select_timeout\tkernel_timeout\tsource_truth_mismatch\tregression_score\tverdict\tverdict_reason\tsource_path\tartifact_status\tvideo_ts_non_monotonic\tvideo_seq_non_monotonic\tvideo_reused_no_fresh\tvideo_reused_backpressure\taudio_source_starved_transitions\taudio_recovery_transitions\taudio_timer_late_events\tvideo_no_signal_placeholders\tvideo_stalled_placeholders\tvideo_fallback_last_stable_ticks\tvideo_fallback_requested_ticks\tvideo_fallback_default_60_ticks\tpersistent_no_signal_with_active_probe\tstalled_without_fresh_frames\tv4l2_compliance_status" > "${OUT}"
 
 verdict_for() {
   local memcopy="${1}"
@@ -62,6 +64,9 @@ verdict_for() {
   local ts_nonmono="${6}"
   local seq_nonmono="${7}"
   local artifact_status="${8}"
+  local active_probe_placeholder="${9:-0}"
+  local stalled_no_fresh="${10:-0}"
+  local compliance_status="${11:-unknown}"
   if [[ "${artifact_status}" != "complete" ]]; then
     echo "invalid ${artifact_status}"
     return
@@ -80,6 +85,22 @@ verdict_for() {
   fi
   if [[ "${ts_nonmono}" -ge "${FAIL_VIDEO_MONOTONIC_MIN}" || "${seq_nonmono}" -ge "${FAIL_VIDEO_MONOTONIC_MIN}" ]]; then
     echo "fail video_non_monotonic"
+    return
+  fi
+  if [[ "${active_probe_placeholder}" -ge "${FAIL_ACTIVE_PROBE_PLACEHOLDER_MIN}" ]]; then
+    echo "fail active_signal_placeholder"
+    return
+  fi
+  if [[ "${stalled_no_fresh}" -ge "${FAIL_STALLED_NO_FRESH_MIN}" ]]; then
+    echo "fail stalled_without_fresh"
+    return
+  fi
+  if [[ "${compliance_status}" == "fail" ]]; then
+    echo "fail v4l2_compliance"
+    return
+  fi
+  if [[ "${compliance_status}" == "tool_missing" ]]; then
+    echo "invalid missing_v4l2_compliance"
     return
   fi
   if [[ "${score}" -ge "${FAIL_REGRESSION_SCORE_MIN}" ]]; then
@@ -223,7 +244,7 @@ parse_obs_run() {
   score="$(awk -v a="${src_lost}" -v b="${timer_silence}" -v c="${requeues}" -v d="${memcopy}" -v e="${kern_timeout}" -v f="${obs_timeout}" -v g="${long_gap}" -v h="${fallback}" -v i="${ts_nonmono}" -v j="${seq_nonmono}" -v k="${timer_late}" -v m="${mismatch}" 'BEGIN{print a*5 + b*3 + c + d*4 + e*2 + f*2 + g*4 + h + i*10 + j*10 + k + m*10}')"
 
   read -r verdict verdict_reason < <(verdict_for "${memcopy}" "${mismatch}" "${score}" "${long_gap}" "${seq_gap}" "${ts_nonmono}" "${seq_nonmono}" "${artifact_status}")
-  echo -e "obs\t${run_id}\t${src_lost}\t${timer_silence}\t${requeues}\t${memcopy}\t${qmin}\t${qmax}\t${long_gap}\t${seq_gap}\t${fallback}\t${obs_timeout}\t${kern_timeout}\t${mismatch}\t${score}\t${verdict}\t${verdict_reason}\t${run_dir}\t${artifact_status}\t${ts_nonmono}\t${seq_nonmono}\t${reused_no_fresh}\t${reused_backpressure}\t${starved_transitions}\t${recovery_transitions}\t${timer_late}\t${no_signal_placeholders}\t${stalled_placeholders}\t${fallback_last}\t${fallback_requested}\t${fallback_default}"
+  echo -e "obs\t${run_id}\t${src_lost}\t${timer_silence}\t${requeues}\t${memcopy}\t${qmin}\t${qmax}\t${long_gap}\t${seq_gap}\t${fallback}\t${obs_timeout}\t${kern_timeout}\t${mismatch}\t${score}\t${verdict}\t${verdict_reason}\t${run_dir}\t${artifact_status}\t${ts_nonmono}\t${seq_nonmono}\t${reused_no_fresh}\t${reused_backpressure}\t${starved_transitions}\t${recovery_transitions}\t${timer_late}\t${no_signal_placeholders}\t${stalled_placeholders}\t${fallback_last}\t${fallback_requested}\t${fallback_default}\t0\t0\tnot_run"
 }
 
 parse_bench_run() {
@@ -236,6 +257,7 @@ parse_bench_run() {
   local src_lost timer_silence requeues memcopy qmin qmax seq_gap fallback mismatch long_gap obs_timeout kern_timeout
   local ts_nonmono seq_nonmono reused_no_fresh reused_backpressure starved_transitions recovery_transitions timer_late
   local no_signal_placeholders stalled_placeholders fallback_last fallback_requested fallback_default
+  local active_probe_placeholder stalled_no_fresh compliance_status
   local diag_available audio_diag_available artifact_status
   src_lost="$(awk -F= '/^audio_source_lost_periods_delta=/{print $2}' "${summary}" | tail -n1)"
   timer_silence="$(awk -F= '/^audio_timer_silence_injects_delta=/{print $2}' "${summary}" | tail -n1)"
@@ -259,6 +281,9 @@ parse_bench_run() {
   fallback_last="$(awk -F= '/^video_fallback_last_stable_ticks_delta=/{print $2}' "${summary}" | tail -n1)"
   fallback_requested="$(awk -F= '/^video_fallback_requested_ticks_delta=/{print $2}' "${summary}" | tail -n1)"
   fallback_default="$(awk -F= '/^video_fallback_default_60_ticks_delta=/{print $2}' "${summary}" | tail -n1)"
+  active_probe_placeholder="$(awk -F= '/^persistent_no_signal_with_active_probe=/{print $2}' "${summary}" | tail -n1)"
+  stalled_no_fresh="$(awk -F= '/^stalled_without_fresh_frames=/{print $2}' "${summary}" | tail -n1)"
+  compliance_status="$(awk -F= '/^v4l2_compliance_status=/{print $2}' "${summary}" | tail -n1)"
   diag_available="$(awk -F= '/^diag_(after_captured|available)=/{print $2}' "${summary}" | tail -n1)"
   audio_diag_available="$(awk -F= '/^(audio_diag_after_captured|audio_diag_available)=/{print $2}' "${summary}" | tail -n1)"
 
@@ -270,6 +295,8 @@ parse_bench_run() {
   starved_transitions="${starved_transitions:-0}"; recovery_transitions="${recovery_transitions:-0}"; timer_late="${timer_late:-0}"
   no_signal_placeholders="${no_signal_placeholders:-0}"; stalled_placeholders="${stalled_placeholders:-0}"
   fallback_last="${fallback_last:-0}"; fallback_requested="${fallback_requested:-0}"; fallback_default="${fallback_default:-0}"
+  active_probe_placeholder="${active_probe_placeholder:-0}"; stalled_no_fresh="${stalled_no_fresh:-0}"
+  compliance_status="${compliance_status:-not_recorded}"
   artifact_status="complete"
   if [[ "${diag_available:-0}" != "1" ]]; then
     artifact_status="missing_video_diag"
@@ -278,10 +305,10 @@ parse_bench_run() {
   fi
 
   local score
-  score="$(awk -v a="${src_lost}" -v b="${timer_silence}" -v c="${requeues}" -v d="${memcopy}" -v e="${seq_gap}" -v f="${long_gap}" -v g="${fallback}" -v h="${ts_nonmono}" -v i="${seq_nonmono}" -v j="${timer_late}" -v m="${mismatch}" 'BEGIN{print a*5 + b*3 + c + d*4 + e*2 + f*4 + g + h*10 + i*10 + j + m*10}')"
+  score="$(awk -v a="${src_lost}" -v b="${timer_silence}" -v c="${requeues}" -v d="${memcopy}" -v e="${seq_gap}" -v f="${long_gap}" -v g="${fallback}" -v h="${ts_nonmono}" -v i="${seq_nonmono}" -v j="${timer_late}" -v m="${mismatch}" -v p="${active_probe_placeholder}" -v s="${stalled_no_fresh}" 'BEGIN{print a*5 + b*3 + c + d*4 + e*2 + f*4 + g + h*10 + i*10 + j + m*10 + p*10 + s*10}')"
 
-  read -r verdict verdict_reason < <(verdict_for "${memcopy}" "${mismatch}" "${score}" "${long_gap}" "${seq_gap}" "${ts_nonmono}" "${seq_nonmono}" "${artifact_status}")
-  echo -e "bench\t${run_id}\t${src_lost}\t${timer_silence}\t${requeues}\t${memcopy}\t${qmin}\t${qmax}\t${long_gap}\t${seq_gap}\t${fallback}\t${obs_timeout}\t${kern_timeout}\t${mismatch}\t${score}\t${verdict}\t${verdict_reason}\t${run_dir}\t${artifact_status}\t${ts_nonmono}\t${seq_nonmono}\t${reused_no_fresh}\t${reused_backpressure}\t${starved_transitions}\t${recovery_transitions}\t${timer_late}\t${no_signal_placeholders}\t${stalled_placeholders}\t${fallback_last}\t${fallback_requested}\t${fallback_default}"
+  read -r verdict verdict_reason < <(verdict_for "${memcopy}" "${mismatch}" "${score}" "${long_gap}" "${seq_gap}" "${ts_nonmono}" "${seq_nonmono}" "${artifact_status}" "${active_probe_placeholder}" "${stalled_no_fresh}" "${compliance_status}")
+  echo -e "bench\t${run_id}\t${src_lost}\t${timer_silence}\t${requeues}\t${memcopy}\t${qmin}\t${qmax}\t${long_gap}\t${seq_gap}\t${fallback}\t${obs_timeout}\t${kern_timeout}\t${mismatch}\t${score}\t${verdict}\t${verdict_reason}\t${run_dir}\t${artifact_status}\t${ts_nonmono}\t${seq_nonmono}\t${reused_no_fresh}\t${reused_backpressure}\t${starved_transitions}\t${recovery_transitions}\t${timer_late}\t${no_signal_placeholders}\t${stalled_placeholders}\t${fallback_last}\t${fallback_requested}\t${fallback_default}\t${active_probe_placeholder}\t${stalled_no_fresh}\t${compliance_status}"
 }
 
 if [[ -z "${BENCH_SUMMARY}" && -d "${OBS_BASE}" ]]; then
