@@ -6,14 +6,19 @@ remains reboot-gated.
 
 ## Scope
 
-- `scripts/static-check.sh` builds the module without privilege and optionally
-  runs `sparse` before a DKMS install is prepared.
+- `scripts/static-check.sh` rebuilds the module without privilege and runs
+  installed `sparse`/`smatch` analyzers before a DKMS install is prepared.
+  It cleans generated module objects before analyzer passes so checks cannot be
+  silently skipped by an up-to-date build cache.
 - `scripts/bench.sh` captures V4L2 compliance results, video/audio driver
   diagnostics, filtered kernel messages, and synchronized PipeWire snapshots.
+- `scripts/postboot-diagnose.sh` runs the complete non-privileged validation
+  suite after a module installation and reboot.
 - `scripts/trace-session.sh` explicitly wraps one reproduction in `trace-cmd`
   collection. It is not enabled automatically because tracing changes timing.
-- `tools/obs-diagnose.sh` captures `pw-dump`, `pw-top`, and `pw-profiler`
-  evidence while OBS owns the device.
+- `tools/obs-diagnose.sh` captures snapshots, `pw-dump`, `pw-top`,
+  `pw-profiler`, `perf`, and restricted helper-backed kernel tracing while OBS
+  owns the device.
 
 `vivid` or `vimc` may be used separately to verify OBS/V4L2 userspace behavior.
 They do not reproduce the PCI DMA, interrupt, or HDMI signal path in this driver.
@@ -25,17 +30,31 @@ cd /home/thecatgoesrawr/src/HWS-HDMI-1CHUHD-CaptureCard
 scripts/static-check.sh
 ```
 
-Expected output includes `build_status=pass`. If `sparse` is not installed,
-the default result is `sparse_status=tool_missing_optional`; compilation still
-acts as the required gate. After installing `sparse`, require it with:
+Expected output includes `build_status=pass`, `sparse_status=pass`, and either
+`smatch_status=pass` or `smatch_status=pass_with_style_warnings`. The latter
+is accepted only when `smatch_actionable_warning_count=0` and
+`smatch_error_count=0`; the current source retains an indentation-only legacy
+backlog. Both analyzers are installed on this host and must be required before
+a DKMS checkpoint:
 
 ```bash
-scripts/static-check.sh --sparse yes
+scripts/static-check.sh --sparse yes --smatch yes
+```
+
+`coccinelle`/`spatch` is installed but is intentionally opt-in because the
+semantic patch suite is expensive:
+
+```bash
+scripts/static-check.sh --sparse yes --smatch yes --cocci yes
 ```
 
 `scripts/checkpoint-run.sh --prepare-reboot` now runs this check before writing
 the DKMS command artifact. Use `--skip-static-check` only when diagnosing the
 check script itself.
+
+`static-check.sh` serializes its Kbuild output with a per-user `flock` lock.
+Concurrent postboot/checkpoint/manual checks therefore wait rather than
+cleaning or rebuilding the same source tree underneath another analyzer run.
 
 ## Isolated Short Bench
 
@@ -74,12 +93,22 @@ tools/obs-diagnose.sh -g obs-repro
 ```
 
 The OBS wrapper records PipeWire topology before and after the session and runs
-`pw-profiler` during the session by default. Set `CAPTURE_PIPEWIRE=0` or
-`PW_PROFILER_ENABLE=0` only when measuring profiling overhead.
+bounded `pw-profiler`, `perf`, module diagnostic toggles, and the fixed-event
+kernel trace during the first bounded 30 seconds of the session by default.
+Reinstall the privileged helper once after updating the repository:
+
+```bash
+sudo ./tools/install-obs-diag-priv.sh --user thecatgoesrawr
+sudo -n /usr/local/sbin/hws-obs-diag-priv --trace-capable
+```
+
+Set `CAPTURE_PIPEWIRE=0`, `PW_PROFILER_ENABLE=0`, `PERF_AUTO=0`,
+`AUDIO_TRACE_AUTO=0`, or `KERNEL_TRACE_AUTO=0` only when measuring the
+diagnostic overhead itself.
 
 ## Targeted Kernel Trace
 
-Install `trace-cmd` and grant tracefs access according to host policy, then run:
+For a standalone short trace, use direct tracefs access if configured:
 
 ```bash
 scripts/trace-session.sh -- scripts/bench.sh -t 10 -g trace-video
@@ -94,6 +123,23 @@ TRACE_FUNCTIONS=1 scripts/trace-session.sh -- scripts/bench.sh -t 10 -g trace-au
 
 The trace artifact is `bench-results/<run>/trace.dat`; renderable text is
 written to `trace.report.txt`.
+
+On this host tracefs currently requires privilege. The OBS workflow handles
+that through `tools/obs-diag-priv.sh` rather than granting general tracefs
+access or making arbitrary commands passwordless.
+
+## Autonomous Post-Reboot Test
+
+Close OBS, then run:
+
+```bash
+scripts/postboot-diagnose.sh -d /dev/video0 -t 60 -g installed-check
+```
+
+The command requires `sparse`, captures full pre/post state, runs a streaming
+V4L2 compliance pass and profiled benchmark, compares on-disk/runtime module
+identity, and writes a stability verdict. It exits non-zero if any required
+check fails.
 
 ## Build And Install Checkpoint
 
@@ -115,7 +161,7 @@ After reboot:
 ```bash
 modinfo HwsUHDX1Capture | rg -n "filename|srcversion|version"
 /usr/bin/cat /sys/module/HwsUHDX1Capture/srcversion
-scripts/bench.sh -t 60 -g installed-check
+scripts/postboot-diagnose.sh -t 60 -g installed-check
 ```
 
 Expected result: the on-disk and runtime `srcversion` values match, and the

@@ -12,6 +12,13 @@ DIAG_AUTO_TOGGLE="${DIAG_AUTO_TOGGLE:-1}"
 VIDEO_DEVICE="${VIDEO_DEVICE:-/dev/video0}"
 CAPTURE_PIPEWIRE="${CAPTURE_PIPEWIRE:-1}"
 PW_PROFILER_ENABLE="${PW_PROFILER_ENABLE:-1}"
+PW_PROFILER_SAMPLES="${PW_PROFILER_SAMPLES:-600}"
+AUDIO_TRACE_AUTO="${AUDIO_TRACE_AUTO:-1}"
+KERNEL_TRACE_AUTO="${KERNEL_TRACE_AUTO:-1}"
+KERNEL_TRACE_FUNCTIONS="${KERNEL_TRACE_FUNCTIONS:-0}"
+KERNEL_TRACE_SECONDS="${KERNEL_TRACE_SECONDS:-30}"
+PERF_AUTO="${PERF_AUTO:-1}"
+SNAPSHOT_AUTO="${SNAPSHOT_AUTO:-1}"
 
 usage() {
   cat <<'USAGE'
@@ -37,6 +44,13 @@ Environment:
   VIDEO_DEVICE=/dev/video0
   CAPTURE_PIPEWIRE=0|1
   PW_PROFILER_ENABLE=0|1
+  PW_PROFILER_SAMPLES=<n>
+  AUDIO_TRACE_AUTO=0|1
+  KERNEL_TRACE_AUTO=0|1
+  KERNEL_TRACE_FUNCTIONS=0|1
+  KERNEL_TRACE_SECONDS=1..600
+  PERF_AUTO=0|1
+  SNAPSHOT_AUTO=0|1
 
 Examples:
   tools/obs-diagnose.sh
@@ -62,11 +76,21 @@ if ! [[ "${SAMPLE_SEC}" =~ ^[0-9]+$ ]] || [[ "${SAMPLE_SEC}" -lt 1 ]]; then
   echo "Invalid sample interval: ${SAMPLE_SEC}" >&2
   exit 2
 fi
+if ! [[ "${KERNEL_TRACE_SECONDS}" =~ ^[0-9]+$ ]] ||
+   [[ "${KERNEL_TRACE_SECONDS}" -lt 1 ]] || [[ "${KERNEL_TRACE_SECONDS}" -gt 600 ]]; then
+  echo "Invalid KERNEL_TRACE_SECONDS: ${KERNEL_TRACE_SECONDS} (expected 1-600)" >&2
+  exit 2
+fi
+if ! [[ "${PW_PROFILER_SAMPLES}" =~ ^[0-9]+$ ]] || [[ "${PW_PROFILER_SAMPLES}" -lt 1 ]]; then
+  echo "Invalid PW_PROFILER_SAMPLES: ${PW_PROFILER_SAMPLES}" >&2
+  exit 2
+fi
 if [[ "${DIAG_AUTO_TOGGLE}" != "0" && "${DIAG_AUTO_TOGGLE}" != "1" ]]; then
   echo "Invalid DIAG_AUTO_TOGGLE: ${DIAG_AUTO_TOGGLE}" >&2
   exit 2
 fi
-for toggle in CAPTURE_PIPEWIRE PW_PROFILER_ENABLE; do
+for toggle in CAPTURE_PIPEWIRE PW_PROFILER_ENABLE AUDIO_TRACE_AUTO \
+  KERNEL_TRACE_AUTO KERNEL_TRACE_FUNCTIONS PERF_AUTO SNAPSHOT_AUTO; do
   if [[ "${!toggle}" != "0" && "${!toggle}" != "1" ]]; then
     echo "Invalid ${toggle}: ${!toggle}" >&2
     exit 2
@@ -108,6 +132,12 @@ obs_profile_logs_dir="${run_dir}/obs-profile-logs"
 pw_dump_before="${run_dir}/pw-dump.before.json"
 pw_dump_after="${run_dir}/pw-dump.after.json"
 pw_profiler_log="${run_dir}/pw-profiler.json"
+trace_dat="${run_dir}/kernel-trace.dat"
+trace_report="${run_dir}/kernel-trace.report.txt"
+trace_recorder_log="${run_dir}/kernel-trace.recorder.log"
+perf_stat_log="${run_dir}/perf-obs.stat.txt"
+repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+snapshot_tool="${repo_root}/tools/collect-evidence.sh"
 mkdir -p "${obs_profile_logs_dir}"
 
 start_iso="$(date -u --iso-8601=seconds)"
@@ -128,6 +158,13 @@ start_epoch="$(date +%s)"
   echo "video_device=${VIDEO_DEVICE}"
   echo "capture_pipewire=${CAPTURE_PIPEWIRE}"
   echo "pw_profiler_enable=${PW_PROFILER_ENABLE}"
+  echo "pw_profiler_samples=${PW_PROFILER_SAMPLES}"
+  echo "audio_trace_auto=${AUDIO_TRACE_AUTO}"
+  echo "kernel_trace_auto=${KERNEL_TRACE_AUTO}"
+  echo "kernel_trace_functions=${KERNEL_TRACE_FUNCTIONS}"
+  echo "kernel_trace_seconds=${KERNEL_TRACE_SECONDS}"
+  echo "perf_auto=${PERF_AUTO}"
+  echo "snapshot_auto=${SNAPSHOT_AUTO}"
 } > "${meta}"
 
 if command -v modinfo >/dev/null 2>&1; then
@@ -146,6 +183,10 @@ fi
 if [[ "${CAPTURE_PIPEWIRE}" == "1" ]] && command -v pw-dump >/dev/null 2>&1; then
   pw-dump -N > "${pw_dump_before}" 2>&1 || true
 fi
+if [[ "${SNAPSHOT_AUTO}" == "1" && -x "${snapshot_tool}" ]]; then
+  "${snapshot_tool}" --out "${run_dir}" --phase pre --module "${MODULE}" \
+    --device "${VIDEO_DEVICE}" > "${run_dir}/snapshot.pre.stdout.txt" 2>&1 || true
+fi
 {
   echo "===== /proc/cmdline ====="
   /usr/bin/cat /proc/cmdline 2>/dev/null || true
@@ -161,11 +202,22 @@ if command -v sudo >/dev/null 2>&1 && [[ -x "${PRIV_HELPER}" ]]; then
   fi
 fi
 echo "privileged_capture_available=${priv_available}" >> "${meta}"
+trace_capable=0
+if [[ "${priv_available}" == "1" && "${KERNEL_TRACE_AUTO}" == "1" ]]; then
+  if sudo -n "${PRIV_HELPER}" --trace-capable >/dev/null 2>&1; then
+    trace_capable=1
+  fi
+fi
+echo "kernel_trace_capable=${trace_capable}" >> "${meta}"
 
 diag_initial="unknown"
 diag_set_on_start=0
 diag_restore_on_exit=0
 diag_restore_target=""
+audio_trace_initial="unknown"
+audio_trace_set_on_start=0
+audio_trace_restore_on_exit=0
+audio_trace_restore_target=""
 
 read_diag() {
   if [[ "${priv_available}" == "1" ]]; then
@@ -184,10 +236,36 @@ write_diag() {
   fi
 }
 
+read_audio_trace() {
+  if [[ "${priv_available}" == "1" ]]; then
+    sudo -n "${PRIV_HELPER}" --module "${MODULE}" --get-audio-trace 2>/dev/null || true
+  else
+    /usr/bin/cat "/sys/module/${MODULE}/parameters/audio_trace_enable" 2>/dev/null || true
+  fi
+}
+
+write_audio_trace() {
+  local v="$1"
+  if [[ "${priv_available}" == "1" ]]; then
+    sudo -n "${PRIV_HELPER}" --module "${MODULE}" --set-audio-trace "${v}" >/dev/null 2>&1
+  else
+    return 1
+  fi
+}
+
 restore_diag_once() {
   if [[ "${diag_set_on_start}" == "1" && "${diag_restore_on_exit}" == "0" && -n "${diag_restore_target}" ]]; then
     if write_diag "${diag_restore_target}"; then
       diag_restore_on_exit=1
+    fi
+  fi
+}
+
+restore_audio_trace_once() {
+  if [[ "${audio_trace_set_on_start}" == "1" && "${audio_trace_restore_on_exit}" == "0" &&
+        -n "${audio_trace_restore_target}" ]]; then
+    if write_audio_trace "${audio_trace_restore_target}"; then
+      audio_trace_restore_on_exit=1
     fi
   fi
 }
@@ -207,20 +285,55 @@ if [[ "${DIAG_AUTO_TOGGLE}" == "1" ]]; then
   fi
 fi
 echo "diag_set_on_start=${diag_set_on_start}" >> "${meta}"
+audio_trace_initial="$(read_audio_trace | tr -d '[:space:]')"
+if [[ -z "${audio_trace_initial}" ]]; then
+  audio_trace_initial="unknown"
+fi
+echo "audio_trace_initial=${audio_trace_initial}" >> "${meta}"
+if [[ "${AUDIO_TRACE_AUTO}" == "1" ]]; then
+  if [[ "${audio_trace_initial}" == "0" || "${audio_trace_initial}" == "1" ]]; then
+    audio_trace_restore_target="${audio_trace_initial}"
+    if write_audio_trace "1"; then
+      audio_trace_set_on_start=1
+    fi
+  fi
+fi
+echo "audio_trace_set_on_start=${audio_trace_set_on_start}" >> "${meta}"
 
 declare -a bg_pids=()
+declare -a bg_group_pids=()
+bg_collectors_stopped=0
 
 start_bg() {
-  "$@" &
-  bg_pids+=("$!")
+  setsid "$@" &
+  bg_group_pids+=("$!")
+}
+
+stop_background_collectors_once() {
+  local p
+
+  if [[ "${bg_collectors_stopped}" == "1" ]]; then
+    return
+  fi
+  for p in "${bg_group_pids[@]:-}"; do
+    kill -TERM -- "-${p}" >/dev/null 2>&1 || kill "${p}" >/dev/null 2>&1 || true
+  done
+  for p in "${bg_pids[@]:-}"; do
+    kill "${p}" >/dev/null 2>&1 || true
+  done
+  for p in "${bg_group_pids[@]:-}" "${bg_pids[@]:-}"; do
+    wait "${p}" >/dev/null 2>&1 || true
+  done
+  bg_collectors_stopped=1
 }
 
 cleanup() {
   restore_diag_once
-  local p
-  for p in "${bg_pids[@]:-}"; do
-    kill "${p}" >/dev/null 2>&1 || true
-  done
+  restore_audio_trace_once
+  if [[ -n "${perf_pid:-}" ]]; then
+    kill -INT "${perf_pid}" >/dev/null 2>&1 || true
+  fi
+  stop_background_collectors_once
 }
 trap cleanup EXIT
 
@@ -245,7 +358,7 @@ if [[ "${CAPTURE_PIPEWIRE}" == "1" ]] && command -v pw-top >/dev/null 2>&1; then
 fi
 if [[ "${CAPTURE_PIPEWIRE}" == "1" && "${PW_PROFILER_ENABLE}" == "1" ]] &&
    command -v pw-profiler >/dev/null 2>&1; then
-  start_bg bash -lc "pw-profiler -J > \"${pw_profiler_log}\" 2>&1"
+  start_bg bash -lc "pw-profiler -J -n \"${PW_PROFILER_SAMPLES}\" > \"${pw_profiler_log}\" 2>&1"
 fi
 
 sampler() {
@@ -294,13 +407,66 @@ fi
 obs_pid=$!
 sampler &
 bg_pids+=("$!")
+trace_pid=""
+trace_status="disabled"
+if [[ "${KERNEL_TRACE_AUTO}" == "1" ]]; then
+  if [[ "${trace_capable}" == "1" ]]; then
+    trace_args=(--trace-until-pid "${run_id}" "${obs_pid}" "${KERNEL_TRACE_SECONDS}")
+    if [[ "${KERNEL_TRACE_FUNCTIONS}" == "1" ]]; then
+      trace_args+=(--trace-functions)
+    fi
+    sudo -n "${PRIV_HELPER}" "${trace_args[@]}" > "${trace_recorder_log}" 2>&1 &
+    trace_pid=$!
+    trace_status="recording"
+  elif [[ "${priv_available}" == "1" ]]; then
+    trace_status="helper_update_or_trace_access_required"
+  else
+    trace_status="privileged_helper_unavailable"
+  fi
+fi
+perf_pid=""
+perf_status="disabled"
+if [[ "${PERF_AUTO}" == "1" ]]; then
+  if command -v perf >/dev/null 2>&1; then
+    perf stat -p "${obs_pid}" -o "${perf_stat_log}" >/dev/null 2>&1 &
+    perf_pid=$!
+    perf_status="recording"
+  else
+    perf_status="tool_missing"
+  fi
+fi
 
 set +e
 wait "${obs_pid}"
 obs_exit=$?
 set -e
 
+stop_background_collectors_once
 restore_diag_once
+restore_audio_trace_once
+if [[ -n "${perf_pid}" ]]; then
+  kill -INT "${perf_pid}" >/dev/null 2>&1 || true
+  wait "${perf_pid}" >/dev/null 2>&1 || true
+  if [[ -s "${perf_stat_log}" ]]; then
+    perf_status="complete"
+  else
+    perf_status="no_artifact"
+  fi
+fi
+if [[ -n "${trace_pid}" ]]; then
+  set +e
+  wait "${trace_pid}"
+  trace_exit=$?
+  set -e
+  if [[ "${trace_exit}" == "0" ]] &&
+     sudo -n "${PRIV_HELPER}" --trace-export "${run_id}" > "${trace_dat}" 2>/dev/null &&
+     sudo -n "${PRIV_HELPER}" --trace-report "${run_id}" > "${trace_report}" 2>&1; then
+    trace_status="complete"
+  else
+    trace_status="failed"
+  fi
+  sudo -n "${PRIV_HELPER}" --trace-remove "${run_id}" >/dev/null 2>&1 || true
+fi
 
 end_iso="$(date -u --iso-8601=seconds)"
 end_epoch="$(date +%s)"
@@ -319,10 +485,14 @@ if [[ -d "${obs_log_dir}" ]]; then
 fi
 
 if command -v coredumpctl >/dev/null 2>&1; then
-  coredumpctl --since "${start_iso}" --no-pager > "${run_dir}/coredumps-since-start.txt" 2>&1 || true
+  timeout 15s coredumpctl --since "${start_iso}" --no-pager > "${run_dir}/coredumps-since-start.txt" 2>&1 || true
 fi
 if [[ "${CAPTURE_PIPEWIRE}" == "1" ]] && command -v pw-dump >/dev/null 2>&1; then
-  pw-dump -N > "${pw_dump_after}" 2>&1 || true
+  timeout 15s pw-dump -N > "${pw_dump_after}" 2>&1 || true
+fi
+if [[ "${SNAPSHOT_AUTO}" == "1" && -x "${snapshot_tool}" ]]; then
+  "${snapshot_tool}" --out "${run_dir}" --phase post --module "${MODULE}" \
+    --device "${VIDEO_DEVICE}" > "${run_dir}/snapshot.post.stdout.txt" 2>&1 || true
 fi
 
 {
@@ -373,6 +543,15 @@ kernel_nvidia_gem_error_count="$(count_matches "${run_dir}/journal-kernel-since-
     diag_final="unknown"
   fi
   echo "diag_final=${diag_final}"
+  echo "audio_trace_restore_on_exit=${audio_trace_restore_on_exit}"
+  echo "audio_trace_restore_target=${audio_trace_restore_target:-unknown}"
+  audio_trace_final="$(read_audio_trace | tr -d '[:space:]')"
+  echo "audio_trace_final=${audio_trace_final:-unknown}"
+  echo "kernel_trace_status=${trace_status}"
+  echo "kernel_trace_dat=${trace_dat}"
+  echo "kernel_trace_report=${trace_report}"
+  echo "perf_status=${perf_status}"
+  echo "perf_stat_log=${perf_stat_log}"
   echo "obs_v4l2_select_timeout_count=${obs_v4l2_select_timeout_count}"
   echo "obs_v4l2_failed_status_count=${obs_v4l2_failed_status_count}"
   echo "kernel_retire_suppressed_count=${kernel_retire_suppressed_count}"
@@ -386,7 +565,6 @@ kernel_nvidia_gem_error_count="$(count_matches "${run_dir}/journal-kernel-since-
   echo "obs_net_drop_line=${obs_net_drop_line}"
 } >> "${meta}"
 
-repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 baseline_parser="${repo_root}/scripts/analyze-stability-artifacts.sh"
 if [[ -x "${baseline_parser}" ]]; then
   "${baseline_parser}" -O "${OUT_BASE}" -B "${repo_root}/bench-results" -o "${run_dir}/stability-score.tsv" >/dev/null 2>&1 || true

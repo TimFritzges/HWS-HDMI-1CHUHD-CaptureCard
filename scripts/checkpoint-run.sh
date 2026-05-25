@@ -19,6 +19,7 @@ SKIP_DKMS="${SKIP_DKMS:-0}"
 SKIP_BENCH="${SKIP_BENCH:-0}"
 SKIP_STATIC_CHECK="${SKIP_STATIC_CHECK:-0}"
 ALLOW_LTS_TARGET="${ALLOW_LTS_TARGET:-0}"
+POSTBOOT_AUTONOMOUS="${POSTBOOT_AUTONOMOUS:-1}"
 PENDING_FILE="${PENDING_FILE:-/var/tmp/hws-checkpoint-pending.env}"
 STALE_HOURS="${STALE_HOURS:-24}"
 PREPARE_REBOOT=0
@@ -50,6 +51,7 @@ Options:
 Environment:
   MODULE VERSION KVER SRC_DIR RESULTS_BASE RUN_TAG INITRD ALLOW_LTS_TARGET
   ALLOW_LTS_TARGET=1 explicitly permits preparing an LTS checkpoint.
+  POSTBOOT_AUTONOMOUS=1 runs the complete profiled suite after reboot.
 USAGE
 }
 
@@ -78,6 +80,10 @@ if ! [[ "${DURATION}" =~ ^[0-9]+$ ]] || [[ "${DURATION}" -lt 1 ]]; then
 fi
 if [[ "${ALLOW_LTS_TARGET}" != "0" && "${ALLOW_LTS_TARGET}" != "1" ]]; then
   echo "Invalid ALLOW_LTS_TARGET: ${ALLOW_LTS_TARGET}" >&2
+  exit 2
+fi
+if [[ "${POSTBOOT_AUTONOMOUS}" != "0" && "${POSTBOOT_AUTONOMOUS}" != "1" ]]; then
+  echo "Invalid POSTBOOT_AUTONOMOUS: ${POSTBOOT_AUTONOMOUS}" >&2
   exit 2
 fi
 
@@ -148,6 +154,7 @@ mkdir -p "${outdir}"
   echo "fps=${FPS}"
   echo "size=${SIZE}"
   echo "initrd=${INITRD}"
+  echo "postboot_autonomous=${POSTBOOT_AUTONOMOUS}"
 } > "${outdir}/checkpoint.env"
 
 if [[ "${POSTBOOT_RUN}" == "1" ]]; then
@@ -169,7 +176,7 @@ if [[ "${SKIP_DKMS}" == "0" ]]; then
     exit 2
   fi
   if [[ "${SKIP_STATIC_CHECK}" == "0" ]]; then
-    "${script_dir}/static-check.sh" -o "${RESULTS_BASE}" |
+    "${script_dir}/static-check.sh" --sparse yes --smatch yes -o "${RESULTS_BASE}" |
       tee "${outdir}/static-check.stdout.txt"
   fi
   cat > "${outdir}/dkms-commands.txt" <<CMDS
@@ -190,11 +197,27 @@ fi
 
 bench_summary=""
 if [[ "${SKIP_BENCH}" == "0" ]]; then
-  bench_log="${outdir}/bench.stdout.txt"
-  "${script_dir}/bench.sh" \
-    -d "${DEVICE}" -t "${DURATION}" -f "${FPS}" -s "${SIZE}" -g "${checkpoint_id}" -o "${RESULTS_BASE}" |
-    tee "${bench_log}"
-  bench_summary="$(awk -F= '/^summary=/{print $2}' "${bench_log}" | tail -n1)"
+  if [[ "${POSTBOOT_RUN}" == "1" && "${POSTBOOT_AUTONOMOUS}" == "1" ]]; then
+    suite_log="${outdir}/postboot-diagnose.stdout.txt"
+    set +e
+    "${script_dir}/postboot-diagnose.sh" \
+      -d "${DEVICE}" -t "${DURATION}" -f "${FPS}" -s "${SIZE}" \
+      -g "${checkpoint_id}" -o "${RESULTS_BASE}" | tee "${suite_log}"
+    suite_exit="${PIPESTATUS[0]}"
+    set -e
+    suite_dir="$(awk -F= '/^suite_dir=/{print $2}' "${suite_log}" | tail -n1)"
+    if [[ -n "${suite_dir}" && -r "${suite_dir}/suite.env" ]]; then
+      bench_summary="$(awk -F= '/^bench_summary=/{print $2}' "${suite_dir}/suite.env" | tail -n1)"
+      printf 'postboot_suite_dir=%s\npostboot_suite_exit=%s\n' "${suite_dir}" "${suite_exit}" \
+        >> "${outdir}/checkpoint.env"
+    fi
+  else
+    bench_log="${outdir}/bench.stdout.txt"
+    "${script_dir}/bench.sh" \
+      -d "${DEVICE}" -t "${DURATION}" -f "${FPS}" -s "${SIZE}" -g "${checkpoint_id}" -o "${RESULTS_BASE}" |
+      tee "${bench_log}"
+    bench_summary="$(awk -F= '/^summary=/{print $2}' "${bench_log}" | tail -n1)"
+  fi
   if [[ -n "${bench_summary}" ]]; then
     printf 'bench_summary=%s\n' "${bench_summary}" >> "${outdir}/checkpoint.env"
   fi

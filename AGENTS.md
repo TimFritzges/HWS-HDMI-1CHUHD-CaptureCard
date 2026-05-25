@@ -13,10 +13,18 @@ Maintain the `HwsUHDX1Capture` Linux kernel module with a focus on:
   - Build steps (commands)
   - Test steps (commands + expected outputs)
   - Rollback steps
+- Preserve the LTS kernel as a fallback environment. Do not build/install this
+  driver into, or regenerate initramfs for, LTS unless the user explicitly
+  requests that specific LTS operation.
+- Treat live unload/reload as unavailable on this host because PipeWire holds
+  the device. Installed-driver validation is reboot-gated.
 
 ## Repo map (quick)
 - `src/` — kernel module source + `Makefile` + `dkms.conf`
 - `scripts/` — installer/uninstaller helpers (may use sudo; treat as privileged)
+- `scripts/postboot-diagnose.sh` — autonomous post-reboot validation suite
+- `tools/collect-evidence.sh` — non-privileged runtime evidence snapshot helper
+- `tools/obs-diagnose.sh` — OBS launch wrapper with automatic evidence capture
 - `play/` — smoke tests (GStreamer/xawtv helpers)
 - top-level `install.sh`, `dkms-install.sh`, `uninstall.sh` — wrappers into `scripts/`
 
@@ -28,6 +36,8 @@ A) `scripts/bench.sh`
   - `journalctl -k -b` filtered for: `HwsUHDX1Capture|videobuf2|dma|timeout|reset|error`
 - Must be safe-by-default (no installs, no unloads, no destructive actions).
 - Accept configuration via env vars/flags (device path, duration, output dir).
+- Must collect `v4l2-compliance`, pre/post HWS/PipeWire state snapshots, and
+  profiling artifacts when the respective installed tools are available.
 
 B) Fix `src/dkms.conf`
 - Remove deprecated features such as `CLEAN` / `REMAKE_INITRD`.
@@ -46,41 +56,32 @@ D) If performance differs across versions
 - Small, scoped commits; imperative subjects.
 - PR description must include: what/why, tested kernel(s), bench output, rollback.
 
-## Known-good DKMS update flow (validated 2026-02-15)
-Use this method exactly to avoid path split mistakes and stale initramfs loads.
+## Known-good DKMS update flow (updated 2026-05-25)
+Use the versioned script while booted into the intended non-LTS test kernel.
+It detects the appropriate current initramfs target, logs the source identity,
+and avoids the prior hard-coded LTS path hazard.
 
-- Variables:
-  - `KVER="$(uname -r)"`
-  - `SRC="/home/thecatgoesrawr/src/HWS-HDMI-1CHUHD-CaptureCard/src"`
-  - `DKMS_SRC="/usr/src/HwsUHDX1Capture-1.0.0.230324"`
-  - `INITRD="/boot/initramfs-linux-lts.img"`
-- Commands:
-  - `sudo rm -rf "$DKMS_SRC"`
-  - `sudo install -d "$DKMS_SRC"`
-  - `sudo rsync -a --delete "$SRC/" "$DKMS_SRC/"`
-  - `sudo dkms remove -m HwsUHDX1Capture -v 1.0.0.230324 --all || true`
-  - `sudo dkms add -m HwsUHDX1Capture -v 1.0.0.230324`
-  - `sudo dkms build -m HwsUHDX1Capture -v 1.0.0.230324 -k "$KVER"`
-  - `sudo dkms install -m HwsUHDX1Capture -v 1.0.0.230324 -k "$KVER" --force`
-  - `sudo depmod -a`
-  - `echo 'options HwsUHDX1Capture diag_enable=0' | sudo tee /etc/modprobe.d/hwsuhdx1capture.conf`
-  - `sudo dracut --force "$INITRD" "$KVER"`
+- Pre-install command:
+  - `scripts/static-check.sh --sparse yes --smatch yes`
+- Installation commands for the user to run:
+  - `uname -r` and confirm this is the non-LTS test kernel.
+  - `sudo -E ./scripts/dkms-versioned-build.sh --kernels current --prune-others --dracut-current`
   - `sudo reboot`
 - Post-reboot checks:
   - `modinfo HwsUHDX1Capture | rg -n "filename|srcversion|diag_enable"`
   - `/usr/bin/cat /sys/module/HwsUHDX1Capture/srcversion`
   - `/usr/bin/cat /sys/module/HwsUHDX1Capture/parameters/diag_enable`
+  - `scripts/postboot-diagnose.sh -d /dev/video0 -t 60 -g installed-check`
   - Expect `modinfo` and `/sys/module/.../srcversion` to match.
 
 Notes:
-- Keep `rsync` destination on the same command line: `"$DKMS_SRC/"`.
 - If shell `cat` is aliased to `bat`, use `/usr/bin/cat`.
 
 ## Initramfs policy (important)
 - Do not assume `mkinitcpio` or `dracut`; verify the host first.
 - On this machine, prefer `dracut` as the default workflow.
-- After DKMS install, rebuild initramfs for the running kernel:
-  - `sudo dracut --force "/boot/initramfs-linux-lts.img" "$(uname -r)"`
+- For routine testing, use `scripts/dkms-versioned-build.sh --kernels current
+  --dracut-current` only while booted into the non-LTS test kernel.
 - If a host is explicitly mkinitcpio-managed, use:
   - `sudo mkinitcpio -P`
 - Always verify post-reboot that loaded module matches on-disk module:
@@ -116,3 +117,32 @@ Notes:
 - Trace lines when `audio_trace_enable=1`:
   - `hws_audio_drop ... reason=bad_packet|no_free_queue|memcopy_fail|stream_not_running`
   - `hws_audio_silence ... reason=no_video|fallback|timer|source_lost|underrun`
+
+## Autonomous evidence workflow (2026-05-25)
+- Installed tools used automatically: `v4l-utils`, `ffmpeg`, `pipewire`,
+  `wireplumber`, `alsa-utils`, `sparse`, `trace-cmd`, and `perf`.
+- Installed tools available for focused manual investigation: `kernelshark`,
+  `bpftrace`, `makedumpfile`, and `kexec-tools`. Do not enable crash-dump or
+  tracing changes that affect boot without explicit user approval.
+- `scripts/postboot-diagnose.sh` is the default isolated post-reboot gate. Run
+  it only while OBS is closed because it opens the V4L2 node.
+- `scripts/static-check.sh --sparse yes --smatch yes` must report
+  `sparse_status=pass`, `smatch_actionable_warning_count=0`, and
+  `smatch_error_count=0`; `smatch_status=pass_with_style_warnings` is allowed
+  only for the existing indentation-only backlog.
+- Do not bypass the `static-check.sh` `flock` lock: compiler/sparse/smatch/
+  coccinelle passes share Kbuild outputs and concurrent runs invalidate results.
+- `tools/obs-diagnose.sh` is already used by the user's OBS desktop launcher.
+  It captures complete snapshots, PipeWire timing, `perf` statistics, driver
+  counters, automatic audio trace lines, and fixed-event `trace-cmd` output.
+  It must stop collector process groups immediately after OBS exits and bound
+  post-run probes so it cannot leave diagnostic monitors running.
+- Tracefs is not user-readable on this host. The source helper
+  `tools/obs-diag-priv.sh` exposes only fixed diagnostic modes and must be
+  reinstalled by the user after helper changes:
+  - `sudo ./tools/install-obs-diag-priv.sh --user thecatgoesrawr`
+  - `sudo -n /usr/local/sbin/hws-obs-diag-priv --trace-capable`
+- Higher-overhead OBS function tracing is opt-in via
+  `KERNEL_TRACE_FUNCTIONS=1`; default automatic trace collection records
+  scheduler, IRQ, timer, and workqueue events only, bounded by
+  `KERNEL_TRACE_SECONDS=30` unless a focused run overrides it.

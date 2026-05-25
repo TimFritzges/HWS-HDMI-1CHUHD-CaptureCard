@@ -1644,7 +1644,7 @@ static int hws_vidioc_querycap(struct file *file, void *priv, struct v4l2_capabi
 static int hws_vidioc_enum_fmt_vid_cap(struct file *file, void *priv_fh,struct v4l2_fmtdesc *f)
 {
 	struct hws_video *videodev = video_drvdata(file);
-	int index = f->index;
+	const framegrabber_pixfmt_t *pixfmt;
 	//printk( "%s(%d)\n", __func__,videodev->index);
 	//printk( "%s(f->index = %d)\n", __func__,f->index);
 	
@@ -1654,28 +1654,16 @@ static int hws_vidioc_enum_fmt_vid_cap(struct file *file, void *priv_fh,struct v
 			pr_info_ratelimited("hws: %s invalid buf type=%u\n", __func__, f->type);
 		return -EINVAL;
 	}
-	if(videodev)
-	{
-		const framegrabber_pixfmt_t *pixfmt;
-		if(f->index <0)
-		{
-			return -EINVAL;
-		}
-		if(f->index >= FRAMEGRABBER_PIXFMT_MAX)
-		{
-			return -EINVAL;
-		}
-		else
-		{
-			 pixfmt=v4l2_model_get_support_pixformat(f->index);
-			 if(pixfmt ==NULL) return -EINVAL;
-		    //printk("%s..pixfmt=%d.\n",__func__,f->index);
-		    f->index = index;
-		    f->type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-		    strscpy(f->description, pixfmt->name, sizeof(f->description));
-		    f->pixelformat=pixfmt->fourcc;
-		}
-	}
+	if (!videodev || f->index >= FRAMEGRABBER_PIXFMT_MAX)
+		return -EINVAL;
+
+	pixfmt = v4l2_model_get_support_pixformat(f->index);
+	if (!pixfmt)
+		return -EINVAL;
+
+	f->type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+	strscpy(f->description, pixfmt->name, sizeof(f->description));
+	f->pixelformat = pixfmt->fourcc;
 	return 0;
 }
 static const framegrabber_pixfmt_t *framegrabber_g_out_pixelfmt(struct hws_video *dev)
@@ -2034,7 +2022,7 @@ static int hws_vidioc_log_status(struct file *file, void *priv)
 	return 0;
 }
 
-static ssize_t hws_read(struct file *file,char *buf,size_t count, loff_t *ppos)
+static ssize_t hws_read(struct file *file, char __user *buf, size_t count, loff_t *ppos)
 {
 	//printk( "%s()\n", __func__);
 	return -1;
@@ -2280,7 +2268,7 @@ static const struct v4l2_queryctrl __maybe_unused *find_ctrl(unsigned int id)
 		if(g_hws_ctrls[i].id==id)
 			return &g_hws_ctrls[i];
 
-	return 0;
+	return NULL;
 }
 
 static const struct v4l2_queryctrl __maybe_unused *find_next_ctrl(unsigned int id)
@@ -3228,7 +3216,7 @@ static const struct vb2_ops hwspcie_video_multi_qops = {
     .stop_streaming = hws_stop_streaming_multi,
 };
 //-----------------------------------------
-const unsigned char  g_YUVColors [MAX_COLOR][3] = {
+static const unsigned char g_YUVColors[MAX_COLOR][3] = {
     {128, 16, 128},     // BLACK
     {128, 235 , 128},    // WHITE
     {16, 211, 146},     // YELLOW
@@ -5744,26 +5732,14 @@ static void hws_adapters_init(struct hws_pcie_dev *dev)
 		hws_get_video_param(dev,i);
 	}
 }
-static void hws_remove_deviceregister(struct hws_pcie_dev *dev)
-{
-	int i;
-	struct video_device *vdev ;
-	for(i=0;i<dev->m_nCurreMaxVideoChl;i++)
-	{
-		vdev = &(dev->video[i].vdev);
-		if(vdev)
-		{
-			v4l2_device_unregister(&dev->video[i].v4l2_dev);
-			vdev = NULL;
-		}
-	}
-}
 static int hws_video_register(struct hws_pcie_dev *dev)
 {
 	struct video_device *vdev ;
 	struct vb2_queue *q ;
 	int i;
 	int err=-1;
+	int v4l2_registered = 0;
+	int video_registered = 0;
 	//printk("hws_video_register Start\n");
 	for(i=0;i<dev->m_nCurreMaxVideoChl;i++)
 	{
@@ -5771,9 +5747,9 @@ static int hws_video_register(struct hws_pcie_dev *dev)
 			err = v4l2_device_register(&dev->pdev->dev, &dev->video[i].v4l2_dev);
 			if(err<0){
 				printk(KERN_ERR " v4l2_device_register 0 error! \n");
-				hws_remove_deviceregister(dev);
-				return -1;
+				goto fail;
 			}
+			v4l2_registered++;
 	}
 	//printk("v4l2_device_register end\n");
 	//----------------------------------------------------
@@ -5863,17 +5839,29 @@ static int hws_video_register(struct hws_pcie_dev *dev)
 			goto fail;
 		}else{
 			//printk(" video_register_device OK !!!!! \n");
+			video_registered++;
 		}
 	}
 	//printk("hws_video_register End\n");
 	return 0;
 fail:
-	for(i=0;i<dev->m_nCurreMaxVideoChl;i++){
-		vdev = &dev->video[i].vdev;
-		video_unregister_device(vdev);
+	for (i = 0; i < video_registered; i++)
+		video_unregister_device(&dev->video[i].vdev);
+	for (i = 0; i < v4l2_registered; i++)
+		v4l2_device_unregister(&dev->video[i].v4l2_dev);
+	return err;
+}
+
+static void hws_video_unregister(struct hws_pcie_dev *dev)
+{
+	int i;
+
+	for (i = 0; i < dev->m_nCurreMaxVideoChl; i++) {
+		hws_video_cancel_fallback_timer(&dev->video[i]);
+		cancel_work_sync(&dev->video[i].videowork);
+		video_unregister_device(&dev->video[i].vdev);
 		v4l2_device_unregister(&dev->video[i].v4l2_dev);
 	}
-	return err;
 }
 
 /* HDMI 0x39[3:0] - CS_DATA[27:24] 0 for reserved values*/
@@ -6193,7 +6181,7 @@ static snd_pcm_uframes_t hws_pcie_audio_pointer(struct snd_pcm_substream *substr
 	 return pos;
 }
 
-struct snd_pcm_ops hws_pcie_pcm_ops ={
+static const struct snd_pcm_ops hws_pcie_pcm_ops = {
 	.open =			hws_pcie_audio_open,
 	.close = 		hws_pcie_audio_close,
 	.ioctl =		snd_pcm_lib_ioctl,
@@ -6221,7 +6209,7 @@ static int hws_audio_register(struct hws_pcie_dev *dev)
 	   // ret = snd_card_new(&dev->pdev->dev, audio_index[i], audio_id[i], THIS_MODULE,	sizeof(struct hws_audio), &card);
 		if (ret < 0){
 			printk(KERN_ERR "%s() ERROR: snd_card_new failed <%d>\n",__func__, ret);
-			goto fail0;
+			goto fail1;
 		}
 		strscpy(card->driver, KBUILD_MODNAME, sizeof(card->driver));
 		strscpy(card->shortname, audioname, sizeof(card->shortname));
@@ -6298,8 +6286,27 @@ fail1:
 				dev->audio[i].resampled_buf = NULL;
 			}
 	}
-fail0:
 	return -1;
+}
+
+static void hws_audio_unregister(struct hws_pcie_dev *dev)
+{
+	int i;
+
+	for (i = 0; i < dev->m_nCurreMaxVideoChl; i++) {
+		cancel_delayed_work_sync(&dev->audio[i].silence_work);
+		cancel_work_sync(&dev->audio[i].audiowork);
+		hrtimer_cancel(&dev->audio[i].publish_timer);
+		hws_audio_reset_stage(&dev->audio[i]);
+		if (dev->audio[i].resampled_buf) {
+			vfree(dev->audio[i].resampled_buf);
+			dev->audio[i].resampled_buf = NULL;
+		}
+		if (dev->audio[i].card) {
+			snd_card_free(dev->audio[i].card);
+			dev->audio[i].card = NULL;
+		}
+	}
 }
 //-------------------
 //static unsigned long video_data[MAX_VID_CHANNELS];
@@ -6312,19 +6319,19 @@ fail0:
 static void  WRITE_REGISTER_ULONG (struct hws_pcie_dev *pdx,u32 RegisterOffset,u32 Value)
 {
 	//map_bar0_addr[RegisterOffset/4] = Value;
-	char *bar0;
-	bar0 = (char*)pdx->map_bar0_addr;
-	iowrite32(Value,bar0+RegisterOffset);
+	u8 __iomem *bar0 = pdx->map_bar0_addr;
+
+	iowrite32(Value, bar0 + RegisterOffset);
 	//map_bar0_addr[RegisterOffset/4] = Value;
 
 }
 
 static u32 READ_REGISTER_ULONG (struct hws_pcie_dev *pdx,u32 RegisterOffset)
 {
-	char *bar0;
-	bar0 = (char*)pdx->map_bar0_addr;
+	u8 __iomem *bar0 = pdx->map_bar0_addr;
+
 	//return(map_bar0_addr[RegisterOffset/4]);
-	return(ioread32(bar0+RegisterOffset));
+	return ioread32(bar0 + RegisterOffset);
 }
 //----------------------------------------------
 static int Check_Busy(struct hws_pcie_dev *pdx)
@@ -6826,7 +6833,6 @@ static void StopDevice(struct hws_pcie_dev *pdx)
 			}
 		}
 		//if(device_lost) return;
-		DmaMemFreePool(pdx);		 
 		//printk("StopDevice Done\n");
 
 		
@@ -6862,7 +6868,6 @@ static void StopKSThread(struct hws_pcie_dev *pdx)
 static void hws_remove(struct pci_dev *pdev)
 {
 	int i;
-	struct video_device *vdev;
 	struct hws_pcie_dev *dev = 
 		(struct hws_pcie_dev*) pci_get_drvdata(pdev);
 	//----------------------------
@@ -6870,10 +6875,10 @@ static void hws_remove(struct pci_dev *pdev)
 	hws_diag_remove_procfs();
 	hws_diag_remove_debugfs();
 	//StopSys(dev);
-	StopDevice(dev);
-	/* disable interrupts */
-	irq_teardown(dev);
 	StopKSThread(dev);
+	StopDevice(dev);
+	/* Prevent any new queued work before releasing capture storage. */
+	irq_teardown(dev);
 	//printk("hws_remove  0\n");
 	for ( i = 0; i<dev->m_nCurreMaxVideoChl; i++)
 	{
@@ -6882,29 +6887,9 @@ static void hws_remove(struct pci_dev *pdev)
 	}
 	//-------------------------
 	//printk("hws_remove  1\n");
-	for(i=0;i<dev->m_nCurreMaxVideoChl;i++){
-		cancel_delayed_work_sync(&dev->audio[i].silence_work);
-		cancel_work_sync(&dev->audio[i].audiowork);
-		hrtimer_cancel(&dev->audio[i].publish_timer);
-		hws_audio_reset_stage(&dev->audio[i]);
-		if(dev->audio[i].resampled_buf)
-		{
-			vfree(dev->audio[i].resampled_buf);
-			dev->audio[i].resampled_buf = NULL;
-		}
-		if(dev->audio[i].card)
-		{
-			snd_card_free(dev->audio[i].card);
-			dev->audio[i].card=NULL;
-		}
-	}	
-	for(i=0;i<dev->m_nCurreMaxVideoChl;i++){
-		vdev = &dev->video[i].vdev;
-		hws_video_cancel_fallback_timer(&dev->video[i]);
-		cancel_work_sync(&dev->video[i].videowork);
-		video_unregister_device(vdev);
-		v4l2_device_unregister(&dev->video[i].v4l2_dev);
-	}
+	hws_audio_unregister(dev);
+	hws_video_unregister(dev);
+	DmaMemFreePool(dev);
 	//-----------------
 	if(dev->wq)
 	{
@@ -8332,10 +8317,17 @@ static int MainKsThreadHandle(void *arg)
 		//printk("MainKsThreadHandle Exit");
         return 0;
 }
-static void StartKSThread(struct hws_pcie_dev *pdx)
+static int StartKSThread(struct hws_pcie_dev *pdx)
 {
-	    pdx->mMain_tsk = kthread_run(MainKsThreadHandle,(void*)pdx,"StartKSThread task"); 
-	
+	pdx->mMain_tsk = kthread_run(MainKsThreadHandle, (void *)pdx,
+				      "StartKSThread task");
+	if (IS_ERR(pdx->mMain_tsk)) {
+		int ret = PTR_ERR(pdx->mMain_tsk);
+
+		pdx->mMain_tsk = NULL;
+		return ret;
+	}
+	return 0;
 }
 
 
@@ -8601,6 +8593,11 @@ static int hws_probe(struct pci_dev *pdev, const struct pci_device_id *pci_id)
 {
 	struct hws_pcie_dev *gdev=NULL;
 	int err = 0, ret = -ENODEV;
+	bool dma_allocated = false;
+	bool irq_registered = false;
+	bool diagnostics_initialized = false;
+	bool video_registered = false;
+	bool audio_registered = false;
 	//u8 val=0;
 	//u32 m_dev_ver=0;
 	//u32 m_dev_vid_ver=0;
@@ -8618,6 +8615,8 @@ static int hws_probe(struct pci_dev *pdev, const struct pci_device_id *pci_id)
 	//printk("hws_probe  probe\n");
 	//------------------------
 	gdev = alloc_dev_instance(pdev);
+	if (!gdev)
+		return -ENOMEM;
 	//sys_dvrs_hw_pdx = gdev;
 	gdev->pdev = pdev;
 	
@@ -8646,8 +8645,10 @@ static int hws_probe(struct pci_dev *pdev, const struct pci_device_id *pci_id)
 	pci_set_master(pdev);
 	//------------------------------------	
 	ret = probe_scan_for_msi(gdev, pdev);	
-	if (ret < 0)		
-	  goto disable_msi;	
+	if (ret < 0) {
+		err = ret;
+		goto disable_msi;
+	}
 	//------------------------
 	//printk("hws_probe  probe 5\n"); 
 	/* known root complex's max read request sizes */
@@ -8675,21 +8676,18 @@ static int hws_probe(struct pci_dev *pdev, const struct pci_device_id *pci_id)
   #endif
   	gdev->wq=NULL;
 	gdev->auwq=NULL;
-	gdev->map_bar0_addr = (u32 *)gdev->info.mem[0].internal_addr;
+	gdev->map_bar0_addr = gdev->info.mem[0].internal_addr;
 
-	if (!gdev->info.mem[0].internal_addr)
-		goto err_release;
+	if (!gdev->info.mem[0].internal_addr) {
+		err = -ENOMEM;
+		goto disable_msi;
+	}
 
 	gdev->info.mem[0].size = pci_resource_len(pdev, 0);
 	gdev->info.mem[0].memtype = UIO_MEM_PHYS;
 
   
 	
-	//printk(" pdev->irq = %d \n",pdev->irq); 
-	ret = irq_setup(gdev, pdev);
-	if (ret)
-		goto err_register;
-
 	//printk("pci_set_drvdata \n"); 
 	pci_set_drvdata(pdev, gdev);
 	//enable irq
@@ -8777,16 +8775,12 @@ static int hws_probe(struct pci_dev *pdev, const struct pci_device_id *pci_id)
 		 //tasklet_init(&gdev->dpc_audio_tasklet[3],DpcForIsr_Audio3,(unsigned long)gdev);
 		 
 		//----------------------
-	 	ret = DmaMemAllocPool(gdev);
-		 if(ret !=0)
-	  	{
-			goto err_mem_alloc;
-	   }
-	   //SetDMAAddress(gdev);
-	   InitVideoSys(gdev,0);
-	   StartKSThread(gdev);
-	 // just test
-	 //StartVideoCapture(gdev,0);
+		ret = DmaMemAllocPool(gdev);
+		if (ret != 0) {
+			err = ret;
+			goto err_register;
+		}
+		dma_allocated = true;
 	//-------------------
 	//printk("hws_probe probe exit \n"); 
 	//--------------------------------------
@@ -8794,42 +8788,91 @@ static int hws_probe(struct pci_dev *pdev, const struct pci_device_id *pci_id)
 	hws_adapters_init(gdev);
 	gdev->wq =   create_singlethread_workqueue("hwsuhdx1");
 	gdev->auwq = create_singlethread_workqueue("hwsuhdx1-audio");
+	if (!gdev->wq || !gdev->auwq) {
+		err = -ENOMEM;
+		goto err_runtime;
+	}
 	//----------------
 	hws_diag_reset();
 	hws_diag_init_procfs();
 	hws_diag_init_debugfs();
-	if( hws_video_register(gdev) )
-		goto err_mem_alloc;
+	diagnostics_initialized = true;
+	ret = hws_video_register(gdev);
+	if (ret) {
+		err = ret;
+		goto err_runtime;
+	}
+	video_registered = true;
 #if 1
-		if(hws_audio_register(gdev))
-		goto err_mem_alloc;
+	ret = hws_audio_register(gdev);
+	if (ret) {
+		err = ret;
+		goto err_runtime;
+	}
+	audio_registered = true;
 #endif	
+	/*
+	 * The IRQ handler queues video/audio work. Do not make it observable until
+	 * those work items and their queues have been fully initialized.
+	 */
+	ret = irq_setup(gdev, pdev);
+	if (ret) {
+		err = ret;
+		goto err_runtime;
+	}
+	irq_registered = true;
+	/* Enable producers only after all work items and user-facing nodes exist. */
+	InitVideoSys(gdev, 0);
+	ret = StartKSThread(gdev);
+	if (ret) {
+		err = ret;
+		goto err_runtime_active;
+	}
 	return 0;
-err_mem_alloc:
-hws_diag_remove_procfs();
-hws_diag_remove_debugfs();
-	
-		 gdev->m_bBufferAllocate = TRUE;
-		 DmaMemFreePool(gdev);
-		 gdev->m_bBufferAllocate = FALSE;
+err_runtime_active:
+	StopKSThread(gdev);
+	StopDevice(gdev);
+	if (irq_registered) {
+		irq_teardown(gdev);
+		irq_registered = false;
+	}
+	for (i = 0; i < gdev->m_nCurreMaxVideoChl; i++) {
+		tasklet_kill(&gdev->dpc_video_tasklet[i]);
+		tasklet_kill(&gdev->dpc_audio_tasklet[i]);
+	}
+err_runtime:
+	if (irq_registered) {
+		irq_teardown(gdev);
+		irq_registered = false;
+	}
+	if (diagnostics_initialized) {
+		hws_diag_remove_procfs();
+		hws_diag_remove_debugfs();
+	}
+	if (audio_registered)
+		hws_audio_unregister(gdev);
+	if (video_registered)
+		hws_video_unregister(gdev);
+	if (gdev->wq)
+		destroy_workqueue(gdev->wq);
+	if (gdev->auwq)
+		destroy_workqueue(gdev->auwq);
+	if (dma_allocated)
+		DmaMemFreePool(gdev);
 err_register:
 		iounmap(gdev->info.mem[0].internal_addr);
-		irq_teardown(gdev);
-		kfree(gdev);
+		if (irq_registered)
+			irq_teardown(gdev);
 disable_msi:	
-		if (gdev->msix_enabled) 
-		{		
-		pci_disable_msix(pdev); 	
-		gdev->msix_enabled = 0; 
-		}	
-		else if (gdev->msi_enabled)
-		{
-			pci_disable_msi(pdev);		
-			gdev->msi_enabled = 0;	
+		if (gdev->msix_enabled) {
+			pci_disable_msix(pdev);
+			gdev->msix_enabled = 0;
+		} else if (gdev->msi_enabled) {
+			pci_disable_msi(pdev);
+			gdev->msi_enabled = 0;
 		}
-err_release:
-		pci_release_regions(pdev);
 		pci_disable_device(pdev);
+		kfree(gdev);
 		return err;
 err_alloc:
 			kfree(gdev);

@@ -5,6 +5,7 @@ This adds a launch wrapper that starts OBS and records long-session diagnostics 
 ## Files
 
 - `tools/obs-diagnose.sh`
+- `tools/collect-evidence.sh`
 - `tools/install-obs-diagnose-desktop.sh`
 - `tools/obs-diag-priv.sh`
 - `tools/install-obs-diag-priv.sh`
@@ -20,12 +21,23 @@ This adds a launch wrapper that starts OBS and records long-session diagnostics 
   - kernel since run-start (+ filtered copy)
 - OBS logs generated during run (`~/.config/obs-studio/logs`)
 - PipeWire graph and timing evidence (`pw-dump`, `pw-top`, `pw-profiler`)
+- Low-overhead OBS process counters (`perf stat`)
+- Optional kernel scheduler/IRQ/hrtimer/workqueue trace via the restricted helper
 - Optional coredumps since run start
 - Automatic diag toggle:
   - `diag_enable` is set to `1` on wrapper start and restored to previous value on exit
   - controlled by `DIAG_AUTO_TOGGLE=0|1` (default `1`)
   - PipeWire evidence is controlled by `CAPTURE_PIPEWIRE=0|1` and
     `PW_PROFILER_ENABLE=0|1` (both default `1`)
+  - detailed PipeWire profiling is bounded by `PW_PROFILER_SAMPLES=600`
+  - `audio_trace_enable` is set to `1` and restored when
+    `AUDIO_TRACE_AUTO=1` and the updated helper is installed
+  - kernel tracing is collected automatically when `KERNEL_TRACE_AUTO=1`,
+    `trace-cmd` is installed, and the updated helper passes `--trace-capable`
+  - fixed-event kernel tracing is bounded by `KERNEL_TRACE_SECONDS=30` by
+    default to avoid distorting a long OBS session or producing huge artifacts
+  - `KERNEL_TRACE_FUNCTIONS=1` enables the higher-overhead HWS function trace
+    for a short focused session only
 
 Output is versioned by UTC timestamp + module srcversion:
 - `~/obs-diag-results/<timestamp>-<tag>-HwsUHDX1Capture-<srcversion>/`
@@ -52,8 +64,10 @@ tools/obs-diagnose.sh -g stream-session
 ## Optional privileged diagnostics (passwordless sudo)
 
 New driver builds expose read-only driver diagnostics at `/proc/hwsuhdx1` so the
-wrapper can sample them without sudo. This helper still enables unrestricted
-kernel journal reads and debugfs fallback on older driver builds.
+wrapper can sample them without sudo. The restricted helper additionally enables
+kernel journal reads, diagnostic parameter toggling, pstore listing, and a fixed
+`trace-cmd` event set that stops when the OBS process exits. It cannot execute
+arbitrary commands.
 
 Install helper + tight sudoers rule:
 
@@ -67,19 +81,27 @@ Verify:
 
 ```bash
 sudo -n /usr/local/sbin/hws-obs-diag-priv --self-test
+sudo -n /usr/local/sbin/hws-obs-diag-priv --trace-capable
 ```
 
 `tools/obs-diagnose.sh` auto-detects this helper and uses it when available.
+Live journal/PipeWire monitor processes are stopped as soon as OBS exits, and
+slow post-run queries are time-bounded so a diagnostic launch cannot remain
+running indefinitely after OBS has closed.
 
-## Deep audio trace mode (optional)
+If a previous copy of the helper is installed, rerun the install command above
+after updating this repository. Otherwise `meta.env` records
+`kernel_trace_status=helper_update_or_trace_access_required`.
+
+## Automatic Audio Trace Mode
 
 `audio_trace_enable` is intentionally separate from `diag_enable`.
-Use this only for focused debugging because it can generate high trace volume.
+Diagnostic OBS launches now toggle both automatically through the helper and
+restore their original values when OBS exits. To suppress trace lines for an
+ordinary long stream:
 
 ```bash
-echo 1 | sudo tee /sys/module/HwsUHDX1Capture/parameters/audio_trace_enable
-# run OBS diagnostic session
-echo 0 | sudo tee /sys/module/HwsUHDX1Capture/parameters/audio_trace_enable
+AUDIO_TRACE_AUTO=0 KERNEL_TRACE_AUTO=0 tools/obs-diagnose.sh
 ```
 
 Current `audio_diag` includes root-cause counters for:

@@ -13,6 +13,7 @@ RUN_V4L2_COMPLIANCE="${RUN_V4L2_COMPLIANCE:-1}"
 V4L2_COMPLIANCE_STREAM_FRAMES="${V4L2_COMPLIANCE_STREAM_FRAMES:-0}"
 CAPTURE_PIPEWIRE="${CAPTURE_PIPEWIRE:-1}"
 PW_PROFILER_SAMPLES="${PW_PROFILER_SAMPLES:-0}"
+CAPTURE_FULL_SNAPSHOT="${CAPTURE_FULL_SNAPSHOT:-1}"
 
 usage() {
   cat <<'USAGE'
@@ -34,6 +35,7 @@ Env overrides: DEVICE DURATION OUT_BASE RUN_TAG MODULE SIZE FPS DIAG_ROOT
   V4L2_COMPLIANCE_STREAM_FRAMES=<n>   Stream frames during compliance (default: 0)
   CAPTURE_PIPEWIRE=0|1                Capture PipeWire evidence (default: 1)
   PW_PROFILER_SAMPLES=<n>             Profiler samples during capture (default: 0/off)
+  CAPTURE_FULL_SNAPSHOT=0|1           Collect complete pre/post state snapshots (default: 1)
 USAGE
 }
 
@@ -59,7 +61,7 @@ if ! [[ "${FPS}" =~ ^[0-9]+$ ]] || [[ "${FPS}" -lt 1 ]]; then
   echo "Invalid fps: ${FPS}" >&2
   exit 2
 fi
-for toggle in RUN_V4L2_COMPLIANCE CAPTURE_PIPEWIRE; do
+for toggle in RUN_V4L2_COMPLIANCE CAPTURE_PIPEWIRE CAPTURE_FULL_SNAPSHOT; do
   if [[ "${!toggle}" != "0" && "${!toggle}" != "1" ]]; then
     echo "Invalid ${toggle}: ${!toggle} (expected 0 or 1)" >&2
     exit 2
@@ -95,6 +97,8 @@ pw_dump_before="${outdir}/pw-dump.before.json"
 pw_dump_after="${outdir}/pw-dump.after.json"
 pw_top_log="${outdir}/pw-top.log"
 pw_profiler_log="${outdir}/pw-profiler.json"
+repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+snapshot_tool="${repo_root}/tools/collect-evidence.sh"
 
 if [[ -z "${DIAG_ROOT}" ]]; then
   if [[ -r /proc/hwsuhdx1/video_diag ]]; then
@@ -201,6 +205,10 @@ capture_debugfs_snapshot "${DIAG_ROOT}/video_diag" "${video_diag_before}"
 capture_debugfs_snapshot "${DIAG_ROOT}/audio_diag" "${audio_diag_before}"
 capture_debugfs_snapshot "${DIAG_ROOT}/source_cadence" "${source_cadence_before}"
 capture_pw_dump "${pw_dump_before}"
+if [[ "${CAPTURE_FULL_SNAPSHOT}" == "1" && -x "${snapshot_tool}" ]]; then
+  "${snapshot_tool}" --out "${outdir}" --phase pre --module "${MODULE}" --device "${DEVICE}" \
+    > "${outdir}/snapshot.pre.stdout.txt" 2>&1 || true
+fi
 
 if command -v v4l2-ctl >/dev/null 2>&1; then
   v4l2-ctl --device="${DEVICE}" --all > "${v4l2_all}" 2>&1 || true
@@ -277,6 +285,10 @@ capture_debugfs_snapshot "${DIAG_ROOT}/video_diag" "${video_diag_after}"
 capture_debugfs_snapshot "${DIAG_ROOT}/audio_diag" "${audio_diag_after}"
 capture_debugfs_snapshot "${DIAG_ROOT}/source_cadence" "${source_cadence_after}"
 capture_pw_dump "${pw_dump_after}"
+if [[ "${CAPTURE_FULL_SNAPSHOT}" == "1" && -x "${snapshot_tool}" ]]; then
+  "${snapshot_tool}" --out "${outdir}" --phase post --module "${MODULE}" --device "${DEVICE}" \
+    > "${outdir}/snapshot.post.stdout.txt" 2>&1 || true
+fi
 
 actual_frames=0
 if [[ "${backend}" == "ffmpeg" ]]; then
@@ -395,6 +407,7 @@ fi
   echo "v4l2_compliance_stream_frames=${V4L2_COMPLIANCE_STREAM_FRAMES}"
   echo "capture_pipewire=${CAPTURE_PIPEWIRE}"
   echo "pw_profiler_samples=${PW_PROFILER_SAMPLES}"
+  echo "capture_full_snapshot=${CAPTURE_FULL_SNAPSHOT}"
   echo "v4l2_all=${v4l2_all}"
   echo "v4l2_compliance_log=${v4l2_compliance_log}"
   echo "pw_dump_before=${pw_dump_before}"
