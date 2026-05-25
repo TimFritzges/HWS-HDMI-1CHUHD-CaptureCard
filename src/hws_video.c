@@ -226,6 +226,8 @@ struct hws_diag_stats {
 	atomic64_t signal_active_debounce_confirms;
 	atomic64_t signal_inactive_debounce_confirms;
 	atomic64_t signal_stall_timeout_events;
+	atomic64_t producer_slot_recoveries;
+	atomic64_t producer_no_free_slots;
 };
 
 static struct hws_diag_stats hws_diag[MAX_VID_CHANNELS];
@@ -298,6 +300,8 @@ static inline void hws_diag_reset(void)
 		atomic64_set(&hws_diag[i].signal_active_debounce_confirms, 0);
 		atomic64_set(&hws_diag[i].signal_inactive_debounce_confirms, 0);
 		atomic64_set(&hws_diag[i].signal_stall_timeout_events, 0);
+		atomic64_set(&hws_diag[i].producer_slot_recoveries, 0);
+		atomic64_set(&hws_diag[i].producer_no_free_slots, 0);
 		WRITE_ONCE(hws_diag_signal_status_reg[i], 0);
 		WRITE_ONCE(hws_diag_signal_size_reg[i], 0);
 		WRITE_ONCE(hws_diag_signal_detected_width[i], 0);
@@ -925,10 +929,10 @@ static int hws_diag_show(struct seq_file *m, void *unused)
 {
 	int i;
 
-	seq_puts(m, "ch work_runs work_ns_total work_ns_max buf_processed buf_done buf_error copy_frames scaler_frames novideo_frames miss_fallbacks memcopy_ns_total scaler_ns_total fresh_runs nofresh_runs src_interval_ns_total src_interval_ns_max src_interval_samples reused_no_fresh_runs reused_backpressure_runs ts_non_monotonic_events seq_non_monotonic_events signal_live_transitions signal_stalled_transitions signal_no_signal_transitions no_signal_placeholder_frames stalled_placeholder_frames fallback_last_stable_ticks fallback_requested_ticks fallback_default_60_ticks drop_dst_too_small_negotiated drop_copy_failed copy_mode_direct copy_mode_scaled drop_copy_src_invalid drop_copy_size_mismatch drop_copy_memfault copy_fail_placeholder_done signal_active_debounce_confirms signal_inactive_debounce_confirms signal_stall_timeout_events signal_status_reg signal_size_reg signal_active_bit signal_interlace_bit signal_detected_width signal_detected_height signal_transition_reason\n");
+	seq_puts(m, "ch work_runs work_ns_total work_ns_max buf_processed buf_done buf_error copy_frames scaler_frames novideo_frames miss_fallbacks memcopy_ns_total scaler_ns_total fresh_runs nofresh_runs src_interval_ns_total src_interval_ns_max src_interval_samples reused_no_fresh_runs reused_backpressure_runs ts_non_monotonic_events seq_non_monotonic_events signal_live_transitions signal_stalled_transitions signal_no_signal_transitions no_signal_placeholder_frames stalled_placeholder_frames fallback_last_stable_ticks fallback_requested_ticks fallback_default_60_ticks drop_dst_too_small_negotiated drop_copy_failed copy_mode_direct copy_mode_scaled drop_copy_src_invalid drop_copy_size_mismatch drop_copy_memfault copy_fail_placeholder_done signal_active_debounce_confirms signal_inactive_debounce_confirms signal_stall_timeout_events producer_slot_recoveries producer_no_free_slots signal_status_reg signal_size_reg signal_active_bit signal_interlace_bit signal_detected_width signal_detected_height signal_transition_reason\n");
 	for (i = 0; i < MAX_VID_CHANNELS; i++) {
 		seq_printf(m,
-				"%d %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld 0x%x 0x%x %u %u %u %u %u\n",
+				"%d %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld 0x%x 0x%x %u %u %u %u %u\n",
 			i,
 			(long long)atomic64_read(&hws_diag[i].work_runs),
 			(long long)atomic64_read(&hws_diag[i].work_ns_total),
@@ -970,6 +974,8 @@ static int hws_diag_show(struct seq_file *m, void *unused)
 				(long long)atomic64_read(&hws_diag[i].signal_active_debounce_confirms),
 				(long long)atomic64_read(&hws_diag[i].signal_inactive_debounce_confirms),
 				(long long)atomic64_read(&hws_diag[i].signal_stall_timeout_events),
+				(long long)atomic64_read(&hws_diag[i].producer_slot_recoveries),
+				(long long)atomic64_read(&hws_diag[i].producer_no_free_slots),
 				READ_ONCE(hws_diag_signal_status_reg[i]),
 				READ_ONCE(hws_diag_signal_size_reg[i]),
 				READ_ONCE(hws_diag_signal_active_bit[i]),
@@ -1626,8 +1632,7 @@ static const framegrabber_pixfmt_t *framegrabber_g_support_pixelfmt_by_fourcc(u3
 	return &support_pixfmts[pixfmt_index];
 }
 
-#define HWS_VIDEO_DEVICE_CAPS	(V4L2_CAP_VIDEO_CAPTURE | V4L2_CAP_STREAMING | \
-				 V4L2_CAP_TIMEPERFRAME)
+#define HWS_VIDEO_DEVICE_CAPS	(V4L2_CAP_VIDEO_CAPTURE | V4L2_CAP_STREAMING)
 
 static int hws_vidioc_querycap(struct file *file, void *priv, struct v4l2_capability *cap)
 {
@@ -1894,6 +1899,7 @@ static int hws_vidioc_g_parm(struct file *file, void *fh, struct v4l2_streamparm
 	fps = hws_policy_select_fps(videodev, fallback_fps);
 
 	setfps->type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+	setfps->parm.capture.capability = V4L2_CAP_TIMEPERFRAME;
 	setfps->parm.capture.timeperframe.numerator = 1;
 	setfps->parm.capture.timeperframe.denominator = fps;
 	setfps->parm.capture.readbuffers = 0;
@@ -2679,6 +2685,7 @@ static int hws_vidioc_s_parm(struct file *file, void *fh, struct v4l2_streamparm
 	}
 
 	videodev->current_out_framerate = io_frame_rate;
+	a->parm.capture.capability = V4L2_CAP_TIMEPERFRAME;
 	a->parm.capture.timeperframe.numerator = 1;
 	a->parm.capture.timeperframe.denominator = io_frame_rate;
 	a->parm.capture.readbuffers = 0;
@@ -7062,6 +7069,29 @@ static void StopAudioCapture(struct hws_pcie_dev *pdx,int index)
 }
 //-----------------------------
 
+static int hws_video_reserve_write_slot_locked(struct hws_pcie_dev *pdx,
+						int channel)
+{
+	int preferred = pdx->m_VideoInfo[channel].m_nVideoIndex;
+	int offset;
+
+	for (offset = 0; offset < MAX_VIDEO_QUEUE; offset++) {
+		int index = (preferred + offset) % MAX_VIDEO_QUEUE;
+
+		if (pdx->m_VideoInfo[channel].pStatusInfo[index].byLock != MEM_UNLOCK)
+			continue;
+
+		pdx->m_VideoInfo[channel].pStatusInfo[index].byLock = MEM_WRITE;
+		pdx->m_VideoInfo[channel].m_nVideoIndex = index;
+		if (offset > 0)
+			atomic64_inc(&hws_diag[channel].producer_slot_recoveries);
+		return index;
+	}
+
+	atomic64_inc(&hws_diag[channel].producer_no_free_slots);
+	return -1;
+}
+
 
 //-----------------------------
 static int MemCopyVideoToSteam(struct hws_pcie_dev *pdx,int nDecoder)
@@ -7178,20 +7208,20 @@ static int MemCopyVideoToSteam(struct hws_pcie_dev *pdx,int nDecoder)
 				 * steal a retained or in-flight complete slot.
 				 */
 				spin_lock_irqsave(&pdx->videoslock[nDecoder], flags);
-				nIndex = pdx->m_VideoInfo[nDecoder].m_nVideoIndex;
 				if (mVideoBufIndex == 1) {
-					if (pdx->m_VideoInfo[nDecoder].pStatusInfo[nIndex].byLock == MEM_UNLOCK) {
-						pdx->m_VideoInfo[nDecoder].pStatusInfo[nIndex].byLock = MEM_WRITE;
+					nIndex = hws_video_reserve_write_slot_locked(pdx, nDecoder);
+					if (nIndex >= 0) {
 						bBuf = pdx->m_VideoInfo[nDecoder].m_pVideoBufData[nIndex];
 						bBuf1 = pdx->m_VideoInfo[nDecoder].m_pVideoBufData1[nIndex];
+					}
+				} else {
+					nIndex = pdx->m_VideoInfo[nDecoder].m_nVideoIndex;
+					if (pdx->m_VideoInfo[nDecoder].pStatusInfo[nIndex].byLock == MEM_WRITE) {
+						bBuf = pdx->m_VideoInfo[nDecoder].m_pVideoBufData2[nIndex];
+						bBuf1 = pdx->m_VideoInfo[nDecoder].m_pVideoBufData3[nIndex];
 					} else {
 						nIndex = -1;
 					}
-				} else if (pdx->m_VideoInfo[nDecoder].pStatusInfo[nIndex].byLock == MEM_WRITE) {
-					bBuf = pdx->m_VideoInfo[nDecoder].m_pVideoBufData2[nIndex];
-					bBuf1 = pdx->m_VideoInfo[nDecoder].m_pVideoBufData3[nIndex];
-				} else {
-					nIndex = -1;
 				}
 				spin_unlock_irqrestore(&pdx->videoslock[nDecoder], flags);
 

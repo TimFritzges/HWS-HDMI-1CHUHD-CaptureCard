@@ -1079,6 +1079,8 @@ video_stalled_placeholder_frames_delta=0
 video_fallback_last_stable_ticks_delta=0
 video_fallback_requested_ticks_delta=0
 video_fallback_default_60_ticks_delta=0
+video_producer_slot_recoveries_delta=0
+video_producer_no_free_slots_delta=0
 if [[ -s "${diag_delta_file}" ]]; then
   video_reused_no_fresh_delta="$(awk 'NR==1 {for(i=1;i<=NF;i++) if($i=="delta_reused_no_fresh_runs") c=i; next} c {sum+=$c} END{print sum+0}' "${diag_delta_file}")"
   video_reused_backpressure_delta="$(awk 'NR==1 {for(i=1;i<=NF;i++) if($i=="delta_reused_backpressure_runs") c=i; next} c {sum+=$c} END{print sum+0}' "${diag_delta_file}")"
@@ -1091,6 +1093,8 @@ if [[ -s "${diag_delta_file}" ]]; then
   video_fallback_last_stable_ticks_delta="$(awk 'NR==1 {for(i=1;i<=NF;i++) if($i=="delta_fallback_last_stable_ticks") c=i; next} c {sum+=$c} END{print sum+0}' "${diag_delta_file}")"
   video_fallback_requested_ticks_delta="$(awk 'NR==1 {for(i=1;i<=NF;i++) if($i=="delta_fallback_requested_ticks") c=i; next} c {sum+=$c} END{print sum+0}' "${diag_delta_file}")"
   video_fallback_default_60_ticks_delta="$(awk 'NR==1 {for(i=1;i<=NF;i++) if($i=="delta_fallback_default_60_ticks") c=i; next} c {sum+=$c} END{print sum+0}' "${diag_delta_file}")"
+  video_producer_slot_recoveries_delta="$(awk 'NR==1 {for(i=1;i<=NF;i++) if($i=="delta_producer_slot_recoveries") c=i; next} c {sum+=$c} END{print sum+0}' "${diag_delta_file}")"
+  video_producer_no_free_slots_delta="$(awk 'NR==1 {for(i=1;i<=NF;i++) if($i=="delta_producer_no_free_slots") c=i; next} c {sum+=$c} END{print sum+0}' "${diag_delta_file}")"
 fi
 audio_starvation_intervals=$((audio_source_lost_periods_delta + audio_timer_silence_injects_delta))
 if [[ "${audio_source_lost_periods_delta}" -gt 0 ]]; then
@@ -1101,7 +1105,7 @@ source_truth_health_verdict="pass"
 if [[ "${source_truth_mismatch_flag}" -eq 1 || "${audio_starvation_intervals}" -gt 0 || "${frame_delta_over_3x_target_events}" -gt 0 ]]; then
   source_truth_health_verdict="warn"
 fi
-if [[ "${drop_estimate}" -gt 0 || "${audio_memcopy_failures_delta}" -gt 0 ]]; then
+if [[ "${drop_estimate}" -gt 0 || "${audio_memcopy_failures_delta}" -gt 0 || "${video_producer_no_free_slots_delta}" -gt 0 ]]; then
   source_truth_health_verdict="fail"
 fi
 {
@@ -1223,6 +1227,8 @@ fi
   echo "video_fallback_last_stable_ticks_delta=${video_fallback_last_stable_ticks_delta}"
   echo "video_fallback_requested_ticks_delta=${video_fallback_requested_ticks_delta}"
   echo "video_fallback_default_60_ticks_delta=${video_fallback_default_60_ticks_delta}"
+  echo "video_producer_slot_recoveries_delta=${video_producer_slot_recoveries_delta}"
+  echo "video_producer_no_free_slots_delta=${video_producer_no_free_slots_delta}"
   echo "source_truth_health_verdict=${source_truth_health_verdict}"
   echo "retire_capture_urb_events=${retire_capture_urb_events}"
   echo "callbacks_suppressed_events=${callbacks_suppressed_events}"
