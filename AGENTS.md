@@ -119,9 +119,11 @@ Notes:
 - Trace lines when `audio_trace_enable=1`:
   - `hws_audio_drop ... reason=bad_packet|no_free_queue|memcopy_fail|stream_not_running`
   - `hws_audio_silence ... reason=no_video|fallback|timer|source_lost|underrun`
-- Video producer diagnostics include `producer_slot_recoveries` and
-  `producer_no_free_slots`. A recovery indicates the DMA writer avoided a
-  retained-frame slot; any no-free event fails the stability gate.
+- Video producer diagnostics include `producer_slot_recoveries`,
+  `producer_stale_frame_reclaims`, and `producer_no_free_slots`. A recovery
+  indicates the DMA writer avoided a retained-frame slot; a stale-frame
+  reclaim indicates source cadence outran delivery without violating frame
+  immutability; any no-free event fails the stability gate.
 
 ## Autonomous evidence workflow (2026-05-25)
 - Installed tools used automatically: `v4l-utils`, `ffmpeg`, `pipewire`,

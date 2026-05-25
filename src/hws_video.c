@@ -227,6 +227,7 @@ struct hws_diag_stats {
 	atomic64_t signal_inactive_debounce_confirms;
 	atomic64_t signal_stall_timeout_events;
 	atomic64_t producer_slot_recoveries;
+	atomic64_t producer_stale_frame_reclaims;
 	atomic64_t producer_no_free_slots;
 };
 
@@ -301,6 +302,7 @@ static inline void hws_diag_reset(void)
 		atomic64_set(&hws_diag[i].signal_inactive_debounce_confirms, 0);
 		atomic64_set(&hws_diag[i].signal_stall_timeout_events, 0);
 		atomic64_set(&hws_diag[i].producer_slot_recoveries, 0);
+		atomic64_set(&hws_diag[i].producer_stale_frame_reclaims, 0);
 		atomic64_set(&hws_diag[i].producer_no_free_slots, 0);
 		WRITE_ONCE(hws_diag_signal_status_reg[i], 0);
 		WRITE_ONCE(hws_diag_signal_size_reg[i], 0);
@@ -929,10 +931,10 @@ static int hws_diag_show(struct seq_file *m, void *unused)
 {
 	int i;
 
-	seq_puts(m, "ch work_runs work_ns_total work_ns_max buf_processed buf_done buf_error copy_frames scaler_frames novideo_frames miss_fallbacks memcopy_ns_total scaler_ns_total fresh_runs nofresh_runs src_interval_ns_total src_interval_ns_max src_interval_samples reused_no_fresh_runs reused_backpressure_runs ts_non_monotonic_events seq_non_monotonic_events signal_live_transitions signal_stalled_transitions signal_no_signal_transitions no_signal_placeholder_frames stalled_placeholder_frames fallback_last_stable_ticks fallback_requested_ticks fallback_default_60_ticks drop_dst_too_small_negotiated drop_copy_failed copy_mode_direct copy_mode_scaled drop_copy_src_invalid drop_copy_size_mismatch drop_copy_memfault copy_fail_placeholder_done signal_active_debounce_confirms signal_inactive_debounce_confirms signal_stall_timeout_events producer_slot_recoveries producer_no_free_slots signal_status_reg signal_size_reg signal_active_bit signal_interlace_bit signal_detected_width signal_detected_height signal_transition_reason\n");
+	seq_puts(m, "ch work_runs work_ns_total work_ns_max buf_processed buf_done buf_error copy_frames scaler_frames novideo_frames miss_fallbacks memcopy_ns_total scaler_ns_total fresh_runs nofresh_runs src_interval_ns_total src_interval_ns_max src_interval_samples reused_no_fresh_runs reused_backpressure_runs ts_non_monotonic_events seq_non_monotonic_events signal_live_transitions signal_stalled_transitions signal_no_signal_transitions no_signal_placeholder_frames stalled_placeholder_frames fallback_last_stable_ticks fallback_requested_ticks fallback_default_60_ticks drop_dst_too_small_negotiated drop_copy_failed copy_mode_direct copy_mode_scaled drop_copy_src_invalid drop_copy_size_mismatch drop_copy_memfault copy_fail_placeholder_done signal_active_debounce_confirms signal_inactive_debounce_confirms signal_stall_timeout_events producer_slot_recoveries producer_stale_frame_reclaims producer_no_free_slots signal_status_reg signal_size_reg signal_active_bit signal_interlace_bit signal_detected_width signal_detected_height signal_transition_reason\n");
 	for (i = 0; i < MAX_VID_CHANNELS; i++) {
 		seq_printf(m,
-				"%d %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld 0x%x 0x%x %u %u %u %u %u\n",
+				"%d %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld 0x%x 0x%x %u %u %u %u %u\n",
 			i,
 			(long long)atomic64_read(&hws_diag[i].work_runs),
 			(long long)atomic64_read(&hws_diag[i].work_ns_total),
@@ -975,6 +977,7 @@ static int hws_diag_show(struct seq_file *m, void *unused)
 				(long long)atomic64_read(&hws_diag[i].signal_inactive_debounce_confirms),
 				(long long)atomic64_read(&hws_diag[i].signal_stall_timeout_events),
 				(long long)atomic64_read(&hws_diag[i].producer_slot_recoveries),
+				(long long)atomic64_read(&hws_diag[i].producer_stale_frame_reclaims),
 				(long long)atomic64_read(&hws_diag[i].producer_no_free_slots),
 				READ_ONCE(hws_diag_signal_status_reg[i]),
 				READ_ONCE(hws_diag_signal_size_reg[i]),
@@ -5368,6 +5371,11 @@ static void video_data_process(struct work_struct *p_work)
 			nCopySize[2] = pdx->m_VideoInfo[nCh].m_VideoBufferSize[2];
 			nCopySize[3] = pdx->m_VideoInfo[nCh].m_VideoBufferSize[3];
 			interlace = pdx->m_VideoInfo[nCh].pStatusInfo[nVindex].dwinterlace;
+			/*
+			 * MEM_READ pins a complete source frame until the vb2 copy is
+			 * finished. The producer may reclaim only unread stale frames.
+			 */
+			pdx->m_VideoInfo[nCh].pStatusInfo[nVindex].byLock = MEM_READ;
 		}
 		if (nVindex == -1 &&
 		    videodev->last_complete_index >= 0 &&
@@ -5640,6 +5648,8 @@ finish_buffer:
 		    videodev->last_complete_index != nVindex &&
 		    pdx->m_VideoInfo[nCh].pStatusInfo[videodev->last_complete_index].byLock == MEM_LOCK)
 			pdx->m_VideoInfo[nCh].pStatusInfo[videodev->last_complete_index].byLock = MEM_UNLOCK;
+		if (pdx->m_VideoInfo[nCh].pStatusInfo[nVindex].byLock == MEM_READ)
+			pdx->m_VideoInfo[nCh].pStatusInfo[nVindex].byLock = MEM_LOCK;
 		videodev->last_complete_index = nVindex;
 		pdx->m_nRDVideoIndex[nCh] = nVindex + 1;
 		if (pdx->m_nRDVideoIndex[nCh] >= MAX_VIDEO_QUEUE)
@@ -7073,6 +7083,7 @@ static int hws_video_reserve_write_slot_locked(struct hws_pcie_dev *pdx,
 						int channel)
 {
 	int preferred = pdx->m_VideoInfo[channel].m_nVideoIndex;
+	int retained = pdx->video[channel].last_complete_index;
 	int offset;
 
 	for (offset = 0; offset < MAX_VIDEO_QUEUE; offset++) {
@@ -7085,6 +7096,24 @@ static int hws_video_reserve_write_slot_locked(struct hws_pcie_dev *pdx,
 		pdx->m_VideoInfo[channel].m_nVideoIndex = index;
 		if (offset > 0)
 			atomic64_inc(&hws_diag[channel].producer_slot_recoveries);
+		return index;
+	}
+
+	/*
+	 * Source frames that were completed but not selected by the worker are
+	 * stale once producer cadence outruns delivery. Replace only those: never
+	 * the retained fallback frame and never a MEM_READ/MEM_WRITE in-flight slot.
+	 */
+	for (offset = 0; offset < MAX_VIDEO_QUEUE; offset++) {
+		int index = (preferred + offset) % MAX_VIDEO_QUEUE;
+
+		if (index == retained ||
+		    pdx->m_VideoInfo[channel].pStatusInfo[index].byLock != MEM_LOCK)
+			continue;
+
+		pdx->m_VideoInfo[channel].pStatusInfo[index].byLock = MEM_WRITE;
+		pdx->m_VideoInfo[channel].m_nVideoIndex = index;
+		atomic64_inc(&hws_diag[channel].producer_stale_frame_reclaims);
 		return index;
 	}
 

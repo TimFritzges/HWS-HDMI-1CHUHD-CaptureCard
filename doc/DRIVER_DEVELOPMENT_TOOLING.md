@@ -75,9 +75,11 @@ New artifacts in `bench-results/<run>/` include:
   properties around the test.
 - `pw-top.log`: PipeWire error/xrun behavior while video is being captured.
 - `pw-profiler.json`: optional detailed cycle timing.
-- `video_diag` summaries include producer ring recovery and no-free-slot
-  counters. `producer_no_free_slots` is a failed gate because it means a
-  complete source frame could not be staged.
+- `video_diag` summaries include producer ring recovery, stale complete-frame
+  reclamation, and no-free-slot counters. `producer_stale_frame_reclaims`
+  records bounded dropped source frames when delivery is behind without
+  allowing an in-flight copy to be overwritten. `producer_no_free_slots` is a
+  failed gate because it means a complete source frame could not be staged.
 
 For a focused audio timing run, enable PipeWire profiling:
 

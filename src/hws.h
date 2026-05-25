@@ -114,6 +114,7 @@
 #define MEM_LOCK					1
 #define MEM_UNLOCK					0
 #define MEM_WRITE					2
+#define MEM_READ					3
 
 
 typedef unsigned int DWORD;
