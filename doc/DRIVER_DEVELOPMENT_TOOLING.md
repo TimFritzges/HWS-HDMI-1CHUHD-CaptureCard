@@ -11,7 +11,9 @@ remains reboot-gated.
   It cleans generated module objects before analyzer passes so checks cannot be
   silently skipped by an up-to-date build cache.
 - `scripts/bench.sh` captures V4L2 compliance results, video/audio driver
-  diagnostics, filtered kernel messages, and synchronized PipeWire snapshots.
+  diagnostics, filtered kernel messages, synchronized PipeWire snapshots, and
+  a bounded PipeWire recording of the HWS capture source for sample-integrity
+  inspection.
 - `scripts/postboot-diagnose.sh` runs the complete non-privileged validation
   suite after a module installation and reboot.
 - `scripts/trace-session.sh` explicitly wraps one reproduction in `trace-cmd`
@@ -75,6 +77,14 @@ New artifacts in `bench-results/<run>/` include:
   properties around the test.
 - `pw-top.log`: PipeWire error/xrun behavior while video is being captured.
 - `pw-profiler.json`: optional detailed cycle timing.
+- `audio-capture.wav`, `audio-capture-metadata.txt`,
+  `audio-capture-stats.log`, and `audio-capture-spectrogram.png`: post-PipeWire
+  sample evidence for audible corruption. Auto-targeting refuses to record a
+  non-HWS default source.
+- `audio_duplicate_half_seen_delta`: a warning that the hardware half-buffer
+  selector repeated during capture. This can be harmless interrupt behavior or
+  repeated stale PCM; compare it with the WAV/spectrogram before altering the
+  copy path.
 - `video_diag` summaries include producer ring recovery, stale complete-frame
   reclamation, and no-free-slot counters. `producer_stale_frame_reclaims`
   records bounded dropped source frames when delivery is behind without
@@ -86,6 +96,20 @@ For a focused audio timing run, enable PipeWire profiling:
 ```bash
 PW_PROFILER_SAMPLES=600 scripts/bench.sh -t 60 -g audio-profiler
 ```
+
+If `audio_capture_status=target_missing`, list the PipeWire node names and pass
+the HWS input explicitly:
+
+```bash
+pactl list short sources
+AUDIO_PW_TARGET=<hws-source-name> scripts/bench.sh -t 30 -g audio-sample
+```
+
+For useful spectrogram comparison, feed the capture card a controlled source
+such as a constant 1 kHz stereo tone at 48 kHz/16-bit, then retain both the WAV
+and generated PNG from each driver build. Random program audio can reveal
+gross corruption but is weaker evidence for rate, framing, or channel-order
+faults.
 
 For a conformance run that also exercises streaming buffers:
 
@@ -106,9 +130,13 @@ V4L2_COMPLIANCE_TIMEOUT_SEC=120 CAPTURE_TIMEOUT_GRACE_SEC=30 scripts/bench.sh -t
 tools/obs-diagnose.sh -g obs-repro
 ```
 
-The OBS wrapper records PipeWire topology before and after the session and runs
+The OBS wrapper records PipeWire topology before and after the session, saves a
+bounded 30-second HWS-source WAV/spectrogram sample after OBS starts, and runs
 bounded `pw-profiler`, `perf`, module diagnostic toggles, and the fixed-event
-kernel trace during the first bounded 30 seconds of the session by default.
+kernel trace during the first bounded 30 seconds of the session by default. It
+does not substitute an unrelated default source if HWS auto-detection fails;
+set `AUDIO_PW_TARGET=<name>` for an unusual node name or
+`AUDIO_SAMPLE_AUTO=0` to disable sample recording.
 Reinstall the privileged helper once after updating the repository:
 
 ```bash
@@ -117,7 +145,7 @@ sudo -n /usr/local/sbin/hws-obs-diag-priv --trace-capable
 ```
 
 Set `CAPTURE_PIPEWIRE=0`, `PW_PROFILER_ENABLE=0`, `PERF_AUTO=0`,
-`AUDIO_TRACE_AUTO=0`, or `KERNEL_TRACE_AUTO=0` only when measuring the
+`AUDIO_TRACE_AUTO=0`, `AUDIO_SAMPLE_AUTO=0`, or `KERNEL_TRACE_AUTO=0` only when measuring the
 diagnostic overhead itself.
 
 ## Targeted Kernel Trace
@@ -150,7 +178,8 @@ Close OBS, then run:
 scripts/postboot-diagnose.sh -d /dev/video0 -t 60 -g installed-check
 ```
 
-The command requires `sparse`, captures full pre/post state, runs a streaming
+The command requires `sparse`, captures full pre/post state, records bounded
+audio sample evidence from the identified HWS PipeWire source, runs a streaming
 V4L2 compliance pass and profiled benchmark, compares on-disk/runtime module
 identity, and writes a stability verdict. It exits non-zero if any required
 check fails or times out.

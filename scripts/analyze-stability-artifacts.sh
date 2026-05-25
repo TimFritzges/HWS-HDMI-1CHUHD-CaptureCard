@@ -48,13 +48,14 @@ FAIL_STALLED_NO_FRESH_MIN="${FAIL_STALLED_NO_FRESH_MIN:-1}"
 FAIL_PRODUCER_NO_FREE_MIN="${FAIL_PRODUCER_NO_FREE_MIN:-1}"
 FAIL_REGRESSION_SCORE_MIN="${FAIL_REGRESSION_SCORE_MIN:-100}"
 WARN_REGRESSION_SCORE_MIN="${WARN_REGRESSION_SCORE_MIN:-20}"
+WARN_AUDIO_DUPLICATE_HALF_MIN="${WARN_AUDIO_DUPLICATE_HALF_MIN:-1}"
 
 if [[ -r "${PROFILE}" ]]; then
   # shellcheck disable=SC1090
   source "${PROFILE}"
 fi
 
-echo -e "run_type\trun_id\taudio_source_lost_periods\taudio_timer_silence_injects\taudio_workqueue_requeues\taudio_memcopy_failures\taudio_queue_free_slots_min\taudio_queue_free_slots_max\tvideo_long_gap_events\tvideo_seq_gap_frames\tvideo_fallback_frames\tobs_select_timeout\tkernel_timeout\tsource_truth_mismatch\tregression_score\tverdict\tverdict_reason\tsource_path\tartifact_status\tvideo_ts_non_monotonic\tvideo_seq_non_monotonic\tvideo_reused_no_fresh\tvideo_reused_backpressure\taudio_source_starved_transitions\taudio_recovery_transitions\taudio_timer_late_events\tvideo_no_signal_placeholders\tvideo_stalled_placeholders\tvideo_fallback_last_stable_ticks\tvideo_fallback_requested_ticks\tvideo_fallback_default_60_ticks\tpersistent_no_signal_with_active_probe\tstalled_without_fresh_frames\tv4l2_compliance_status\tvideo_producer_slot_recoveries\tvideo_producer_stale_frame_reclaims\tvideo_producer_no_free_slots" > "${OUT}"
+echo -e "run_type\trun_id\taudio_source_lost_periods\taudio_timer_silence_injects\taudio_workqueue_requeues\taudio_memcopy_failures\taudio_queue_free_slots_min\taudio_queue_free_slots_max\tvideo_long_gap_events\tvideo_seq_gap_frames\tvideo_fallback_frames\tobs_select_timeout\tkernel_timeout\tsource_truth_mismatch\tregression_score\tverdict\tverdict_reason\tsource_path\tartifact_status\tvideo_ts_non_monotonic\tvideo_seq_non_monotonic\tvideo_reused_no_fresh\tvideo_reused_backpressure\taudio_source_starved_transitions\taudio_recovery_transitions\taudio_timer_late_events\taudio_duplicate_half_seen\tvideo_no_signal_placeholders\tvideo_stalled_placeholders\tvideo_fallback_last_stable_ticks\tvideo_fallback_requested_ticks\tvideo_fallback_default_60_ticks\tpersistent_no_signal_with_active_probe\tstalled_without_fresh_frames\tv4l2_compliance_status\tvideo_producer_slot_recoveries\tvideo_producer_stale_frame_reclaims\tvideo_producer_no_free_slots" > "${OUT}"
 
 verdict_for() {
   local memcopy="${1}"
@@ -69,6 +70,7 @@ verdict_for() {
   local stalled_no_fresh="${10:-0}"
   local compliance_status="${11:-unknown}"
   local producer_no_free="${12:-0}"
+  local duplicate_half="${13:-0}"
   if [[ "${artifact_status}" != "complete" ]]; then
     echo "invalid ${artifact_status}"
     return
@@ -113,6 +115,10 @@ verdict_for() {
     echo "fail high_regression_score"
     return
   fi
+  if [[ "${duplicate_half}" -ge "${WARN_AUDIO_DUPLICATE_HALF_MIN}" ]]; then
+    echo "warn audio_duplicate_half_seen"
+    return
+  fi
   if [[ "${score}" -ge "${WARN_REGRESSION_SCORE_MIN}" ]]; then
     echo "warn elevated_regression_score"
     return
@@ -132,10 +138,10 @@ parse_obs_run() {
   local long_gap=0 seq_gap=0 fallback=0 obs_timeout=0 kern_timeout=0 mismatch=0
   local ts_nonmono=0 seq_nonmono=0 reused_no_fresh=0 reused_backpressure=0
   local no_signal_placeholders=0 stalled_placeholders=0 fallback_last=0 fallback_requested=0 fallback_default=0
-  local starved_transitions=0 recovery_transitions=0 timer_late=0 artifact_status="missing_audio_diag"
+  local starved_transitions=0 recovery_transitions=0 timer_late=0 duplicate_half=0 artifact_status="missing_audio_diag"
 
   if [[ -s "${periodic}" ]]; then
-    read -r src_lost timer_silence requeues memcopy qmin qmax fallback starved_transitions recovery_transitions timer_late artifact_status < <(
+    read -r src_lost timer_silence requeues memcopy qmin qmax fallback starved_transitions recovery_transitions timer_late duplicate_half artifact_status < <(
       awk '
         /^-- ((hws )?debugfs|hws diag) audio_diag --/ {in_a=1; hdr=1; next}
         in_a && /^-- / {in_a=0}
@@ -154,6 +160,7 @@ parse_obs_run() {
             first_starved[ch]=$(h["source_starved_transitions"])
             first_recovery[ch]=$(h["recovery_transitions"])
             first_late[ch]=$(h["timer_late_events"])
+            first_duplicate[ch]=$(h["duplicate_half_seen"])
           }
           last_src[ch]=$(h["source_lost_periods"])
           last_sil[ch]=$(h["timer_silence_injects"])
@@ -165,6 +172,7 @@ parse_obs_run() {
           last_starved[ch]=$(h["source_starved_transitions"])
           last_recovery[ch]=$(h["recovery_transitions"])
           last_late[ch]=$(h["timer_late_events"])
+          last_duplicate[ch]=$(h["duplicate_half_seen"])
         }
         END {
           min_seen=""
@@ -178,12 +186,13 @@ parse_obs_run() {
             starved += (last_starved[k]-first_starved[k])
             recovery += (last_recovery[k]-first_recovery[k])
             late += (last_late[k]-first_late[k])
+            duplicate += (last_duplicate[k]-first_duplicate[k])
             if (min_seen=="" || last_qmin[k] < min_seen) min_seen=last_qmin[k]
             if (last_qmax[k] > max_seen) max_seen=last_qmax[k]
           }
           if (min_seen=="") min_seen=0
           status = length(last_src) ? "complete" : "missing_audio_diag"
-          printf "%d %d %d %d %d %d %d %d %d %d %s\n", src+0, sil+0, req+0, mem+0, min_seen+0, max_seen+0, fb+0, starved+0, recovery+0, late+0, status
+          printf "%d %d %d %d %d %d %d %d %d %d %d %s\n", src+0, sil+0, req+0, mem+0, min_seen+0, max_seen+0, fb+0, starved+0, recovery+0, late+0, duplicate+0, status
         }
       ' "${periodic}"
     )
@@ -249,8 +258,8 @@ parse_obs_run() {
   local score
   score="$(awk -v a="${src_lost}" -v b="${timer_silence}" -v c="${requeues}" -v d="${memcopy}" -v e="${kern_timeout}" -v f="${obs_timeout}" -v g="${long_gap}" -v h="${fallback}" -v i="${ts_nonmono}" -v j="${seq_nonmono}" -v k="${timer_late}" -v m="${mismatch}" 'BEGIN{print a*5 + b*3 + c + d*4 + e*2 + f*2 + g*4 + h + i*10 + j*10 + k + m*10}')"
 
-  read -r verdict verdict_reason < <(verdict_for "${memcopy}" "${mismatch}" "${score}" "${long_gap}" "${seq_gap}" "${ts_nonmono}" "${seq_nonmono}" "${artifact_status}")
-  echo -e "obs\t${run_id}\t${src_lost}\t${timer_silence}\t${requeues}\t${memcopy}\t${qmin}\t${qmax}\t${long_gap}\t${seq_gap}\t${fallback}\t${obs_timeout}\t${kern_timeout}\t${mismatch}\t${score}\t${verdict}\t${verdict_reason}\t${run_dir}\t${artifact_status}\t${ts_nonmono}\t${seq_nonmono}\t${reused_no_fresh}\t${reused_backpressure}\t${starved_transitions}\t${recovery_transitions}\t${timer_late}\t${no_signal_placeholders}\t${stalled_placeholders}\t${fallback_last}\t${fallback_requested}\t${fallback_default}\t0\t0\tnot_run\t0\t0\t0"
+  read -r verdict verdict_reason < <(verdict_for "${memcopy}" "${mismatch}" "${score}" "${long_gap}" "${seq_gap}" "${ts_nonmono}" "${seq_nonmono}" "${artifact_status}" 0 0 not_run 0 "${duplicate_half}")
+  echo -e "obs\t${run_id}\t${src_lost}\t${timer_silence}\t${requeues}\t${memcopy}\t${qmin}\t${qmax}\t${long_gap}\t${seq_gap}\t${fallback}\t${obs_timeout}\t${kern_timeout}\t${mismatch}\t${score}\t${verdict}\t${verdict_reason}\t${run_dir}\t${artifact_status}\t${ts_nonmono}\t${seq_nonmono}\t${reused_no_fresh}\t${reused_backpressure}\t${starved_transitions}\t${recovery_transitions}\t${timer_late}\t${duplicate_half}\t${no_signal_placeholders}\t${stalled_placeholders}\t${fallback_last}\t${fallback_requested}\t${fallback_default}\t0\t0\tnot_run\t0\t0\t0"
 }
 
 parse_bench_run() {
@@ -261,7 +270,7 @@ parse_bench_run() {
   run_id="$(basename "${run_dir}")"
 
   local src_lost timer_silence requeues memcopy qmin qmax seq_gap fallback mismatch long_gap obs_timeout kern_timeout
-  local ts_nonmono seq_nonmono reused_no_fresh reused_backpressure starved_transitions recovery_transitions timer_late
+  local ts_nonmono seq_nonmono reused_no_fresh reused_backpressure starved_transitions recovery_transitions timer_late duplicate_half
   local no_signal_placeholders stalled_placeholders fallback_last fallback_requested fallback_default
   local active_probe_placeholder stalled_no_fresh compliance_status capture_status producer_recoveries producer_stale_reclaims producer_no_free
   local diag_available audio_diag_available artifact_status
@@ -282,6 +291,7 @@ parse_bench_run() {
   starved_transitions="$(awk -F= '/^audio_source_starved_transitions_delta=/{print $2}' "${summary}" | tail -n1)"
   recovery_transitions="$(awk -F= '/^audio_recovery_transitions_delta=/{print $2}' "${summary}" | tail -n1)"
   timer_late="$(awk -F= '/^audio_timer_late_events_delta=/{print $2}' "${summary}" | tail -n1)"
+  duplicate_half="$(awk -F= '/^audio_duplicate_half_seen_delta=/{print $2}' "${summary}" | tail -n1)"
   no_signal_placeholders="$(awk -F= '/^video_no_signal_placeholder_frames_delta=/{print $2}' "${summary}" | tail -n1)"
   stalled_placeholders="$(awk -F= '/^video_stalled_placeholder_frames_delta=/{print $2}' "${summary}" | tail -n1)"
   fallback_last="$(awk -F= '/^video_fallback_last_stable_ticks_delta=/{print $2}' "${summary}" | tail -n1)"
@@ -302,7 +312,7 @@ parse_bench_run() {
   long_gap="${long_gap:-0}"; fallback="${fallback:-0}"; obs_timeout=0; kern_timeout=0
   ts_nonmono="${ts_nonmono:-0}"; seq_nonmono="${seq_nonmono:-0}"
   reused_no_fresh="${reused_no_fresh:-0}"; reused_backpressure="${reused_backpressure:-0}"
-  starved_transitions="${starved_transitions:-0}"; recovery_transitions="${recovery_transitions:-0}"; timer_late="${timer_late:-0}"
+  starved_transitions="${starved_transitions:-0}"; recovery_transitions="${recovery_transitions:-0}"; timer_late="${timer_late:-0}"; duplicate_half="${duplicate_half:-0}"
   no_signal_placeholders="${no_signal_placeholders:-0}"; stalled_placeholders="${stalled_placeholders:-0}"
   fallback_last="${fallback_last:-0}"; fallback_requested="${fallback_requested:-0}"; fallback_default="${fallback_default:-0}"
   active_probe_placeholder="${active_probe_placeholder:-0}"; stalled_no_fresh="${stalled_no_fresh:-0}"
@@ -321,8 +331,8 @@ parse_bench_run() {
   local score
   score="$(awk -v a="${src_lost}" -v b="${timer_silence}" -v c="${requeues}" -v d="${memcopy}" -v e="${seq_gap}" -v f="${long_gap}" -v g="${fallback}" -v h="${ts_nonmono}" -v i="${seq_nonmono}" -v j="${timer_late}" -v m="${mismatch}" -v p="${active_probe_placeholder}" -v s="${stalled_no_fresh}" -v n="${producer_no_free}" 'BEGIN{print a*5 + b*3 + c + d*4 + e*2 + f*4 + g + h*10 + i*10 + j + m*10 + p*10 + s*10 + n*4}')"
 
-  read -r verdict verdict_reason < <(verdict_for "${memcopy}" "${mismatch}" "${score}" "${long_gap}" "${seq_gap}" "${ts_nonmono}" "${seq_nonmono}" "${artifact_status}" "${active_probe_placeholder}" "${stalled_no_fresh}" "${compliance_status}" "${producer_no_free}")
-  echo -e "bench\t${run_id}\t${src_lost}\t${timer_silence}\t${requeues}\t${memcopy}\t${qmin}\t${qmax}\t${long_gap}\t${seq_gap}\t${fallback}\t${obs_timeout}\t${kern_timeout}\t${mismatch}\t${score}\t${verdict}\t${verdict_reason}\t${run_dir}\t${artifact_status}\t${ts_nonmono}\t${seq_nonmono}\t${reused_no_fresh}\t${reused_backpressure}\t${starved_transitions}\t${recovery_transitions}\t${timer_late}\t${no_signal_placeholders}\t${stalled_placeholders}\t${fallback_last}\t${fallback_requested}\t${fallback_default}\t${active_probe_placeholder}\t${stalled_no_fresh}\t${compliance_status}\t${producer_recoveries}\t${producer_stale_reclaims}\t${producer_no_free}"
+  read -r verdict verdict_reason < <(verdict_for "${memcopy}" "${mismatch}" "${score}" "${long_gap}" "${seq_gap}" "${ts_nonmono}" "${seq_nonmono}" "${artifact_status}" "${active_probe_placeholder}" "${stalled_no_fresh}" "${compliance_status}" "${producer_no_free}" "${duplicate_half}")
+  echo -e "bench\t${run_id}\t${src_lost}\t${timer_silence}\t${requeues}\t${memcopy}\t${qmin}\t${qmax}\t${long_gap}\t${seq_gap}\t${fallback}\t${obs_timeout}\t${kern_timeout}\t${mismatch}\t${score}\t${verdict}\t${verdict_reason}\t${run_dir}\t${artifact_status}\t${ts_nonmono}\t${seq_nonmono}\t${reused_no_fresh}\t${reused_backpressure}\t${starved_transitions}\t${recovery_transitions}\t${timer_late}\t${duplicate_half}\t${no_signal_placeholders}\t${stalled_placeholders}\t${fallback_last}\t${fallback_requested}\t${fallback_default}\t${active_probe_placeholder}\t${stalled_no_fresh}\t${compliance_status}\t${producer_recoveries}\t${producer_stale_reclaims}\t${producer_no_free}"
 }
 
 if [[ -z "${BENCH_SUMMARY}" && -d "${OBS_BASE}" ]]; then

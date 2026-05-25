@@ -14,6 +14,12 @@ CAPTURE_PIPEWIRE="${CAPTURE_PIPEWIRE:-1}"
 PW_PROFILER_ENABLE="${PW_PROFILER_ENABLE:-1}"
 PW_PROFILER_SAMPLES="${PW_PROFILER_SAMPLES:-600}"
 AUDIO_TRACE_AUTO="${AUDIO_TRACE_AUTO:-1}"
+AUDIO_SAMPLE_AUTO="${AUDIO_SAMPLE_AUTO:-1}"
+AUDIO_SAMPLE_SECONDS="${AUDIO_SAMPLE_SECONDS:-30}"
+AUDIO_PW_TARGET="${AUDIO_PW_TARGET:-auto}"
+AUDIO_RATE="${AUDIO_RATE:-48000}"
+AUDIO_CHANNELS="${AUDIO_CHANNELS:-2}"
+AUDIO_FORMAT="${AUDIO_FORMAT:-s16}"
 KERNEL_TRACE_AUTO="${KERNEL_TRACE_AUTO:-1}"
 KERNEL_TRACE_FUNCTIONS="${KERNEL_TRACE_FUNCTIONS:-0}"
 KERNEL_TRACE_SECONDS="${KERNEL_TRACE_SECONDS:-30}"
@@ -46,6 +52,10 @@ Environment:
   PW_PROFILER_ENABLE=0|1
   PW_PROFILER_SAMPLES=<n>
   AUDIO_TRACE_AUTO=0|1
+  AUDIO_SAMPLE_AUTO=0|1
+  AUDIO_SAMPLE_SECONDS=<n>
+  AUDIO_PW_TARGET=<name>|auto
+  AUDIO_RATE=<hz> AUDIO_CHANNELS=<n> AUDIO_FORMAT=<pw-format>
   KERNEL_TRACE_AUTO=0|1
   KERNEL_TRACE_FUNCTIONS=0|1
   KERNEL_TRACE_SECONDS=1..600
@@ -85,11 +95,17 @@ if ! [[ "${PW_PROFILER_SAMPLES}" =~ ^[0-9]+$ ]] || [[ "${PW_PROFILER_SAMPLES}" -
   echo "Invalid PW_PROFILER_SAMPLES: ${PW_PROFILER_SAMPLES}" >&2
   exit 2
 fi
+for numeric in AUDIO_SAMPLE_SECONDS AUDIO_RATE AUDIO_CHANNELS; do
+  if ! [[ "${!numeric}" =~ ^[0-9]+$ ]] || [[ "${!numeric}" -lt 1 ]]; then
+    echo "Invalid ${numeric}: ${!numeric}" >&2
+    exit 2
+  fi
+done
 if [[ "${DIAG_AUTO_TOGGLE}" != "0" && "${DIAG_AUTO_TOGGLE}" != "1" ]]; then
   echo "Invalid DIAG_AUTO_TOGGLE: ${DIAG_AUTO_TOGGLE}" >&2
   exit 2
 fi
-for toggle in CAPTURE_PIPEWIRE PW_PROFILER_ENABLE AUDIO_TRACE_AUTO \
+for toggle in CAPTURE_PIPEWIRE PW_PROFILER_ENABLE AUDIO_TRACE_AUTO AUDIO_SAMPLE_AUTO \
   KERNEL_TRACE_AUTO KERNEL_TRACE_FUNCTIONS PERF_AUTO SNAPSHOT_AUTO; do
   if [[ "${!toggle}" != "0" && "${!toggle}" != "1" ]]; then
     echo "Invalid ${toggle}: ${!toggle}" >&2
@@ -132,6 +148,11 @@ obs_profile_logs_dir="${run_dir}/obs-profile-logs"
 pw_dump_before="${run_dir}/pw-dump.before.json"
 pw_dump_after="${run_dir}/pw-dump.after.json"
 pw_profiler_log="${run_dir}/pw-profiler.json"
+audio_wav="${run_dir}/audio-sample.wav"
+audio_log="${run_dir}/audio-sample.log"
+audio_metadata="${run_dir}/audio-sample-metadata.txt"
+audio_stats="${run_dir}/audio-sample-stats.log"
+audio_spectrogram="${run_dir}/audio-sample-spectrogram.png"
 trace_dat="${run_dir}/kernel-trace.dat"
 trace_report="${run_dir}/kernel-trace.report.txt"
 trace_recorder_log="${run_dir}/kernel-trace.recorder.log"
@@ -160,6 +181,12 @@ start_epoch="$(date +%s)"
   echo "pw_profiler_enable=${PW_PROFILER_ENABLE}"
   echo "pw_profiler_samples=${PW_PROFILER_SAMPLES}"
   echo "audio_trace_auto=${AUDIO_TRACE_AUTO}"
+  echo "audio_sample_auto=${AUDIO_SAMPLE_AUTO}"
+  echo "audio_sample_seconds=${AUDIO_SAMPLE_SECONDS}"
+  echo "audio_pw_target=${AUDIO_PW_TARGET}"
+  echo "audio_rate=${AUDIO_RATE}"
+  echo "audio_channels=${AUDIO_CHANNELS}"
+  echo "audio_format=${AUDIO_FORMAT}"
   echo "kernel_trace_auto=${KERNEL_TRACE_AUTO}"
   echo "kernel_trace_functions=${KERNEL_TRACE_FUNCTIONS}"
   echo "kernel_trace_seconds=${KERNEL_TRACE_SECONDS}"
@@ -253,6 +280,52 @@ write_audio_trace() {
   fi
 }
 
+detect_hws_pw_target() {
+  local target=""
+
+  if [[ "${AUDIO_PW_TARGET}" != "auto" ]]; then
+    printf '%s\n' "${AUDIO_PW_TARGET}"
+    return
+  fi
+  if command -v pactl >/dev/null 2>&1; then
+    target="$(pactl list short sources 2>/dev/null | awk '
+      BEGIN { IGNORECASE=1 }
+      $2 ~ /(hws|huhdvideo|uhdx1|alsa_input\.pci-0000_0f_00\.0)/ { print $2; exit }
+    ')"
+  fi
+  if [[ -z "${target}" ]] && command -v wpctl >/dev/null 2>&1; then
+    target="$(wpctl status -n 2>/dev/null | awk '
+      BEGIN { IGNORECASE=1 }
+      /(hws|huhdvideo|uhdx1|alsa_input\.pci-0000_0f_00\.0)/ {
+        for (i = 1; i <= NF; i++)
+          if ($i ~ /alsa_input\./) {
+            print $i
+            exit
+          }
+      }
+    ')"
+  fi
+  printf '%s\n' "${target}"
+}
+
+generate_audio_sample_artifacts() {
+  if [[ ! -s "${audio_wav}" ]] || ! command -v ffmpeg >/dev/null 2>&1; then
+    return
+  fi
+  if command -v ffprobe >/dev/null 2>&1; then
+    ffprobe -v error -select_streams a:0 \
+      -show_entries stream=codec_name,sample_fmt,sample_rate,channels,channel_layout,duration \
+      -show_entries format=duration,size,bit_rate \
+      -of default=noprint_wrappers=1 "${audio_wav}" > "${audio_metadata}" 2>&1 || true
+  fi
+  ffmpeg -hide_banner -nostdin -i "${audio_wav}" \
+    -af "astats=metadata=0:reset=0,volumedetect" -f null - \
+    > "${audio_stats}" 2>&1 || true
+  ffmpeg -hide_banner -nostdin -loglevel error -y -i "${audio_wav}" \
+    -lavfi "showspectrumpic=s=1600x900:legend=1:scale=log:color=intensity" \
+    -frames:v 1 "${audio_spectrogram}" > /dev/null 2>&1 || true
+}
+
 restore_diag_once() {
   if [[ "${diag_set_on_start}" == "1" && "${diag_restore_on_exit}" == "0" && -n "${diag_restore_target}" ]]; then
     if write_diag "${diag_restore_target}"; then
@@ -303,6 +376,9 @@ echo "audio_trace_set_on_start=${audio_trace_set_on_start}" >> "${meta}"
 declare -a bg_pids=()
 declare -a bg_group_pids=()
 bg_collectors_stopped=0
+audio_sample_status="disabled"
+audio_sample_target=""
+audio_sample_pid=""
 
 start_bg() {
   setsid "$@" &
@@ -314,6 +390,11 @@ stop_background_collectors_once() {
 
   if [[ "${bg_collectors_stopped}" == "1" ]]; then
     return
+  fi
+  if [[ -n "${audio_sample_pid}" ]]; then
+    kill -INT "${audio_sample_pid}" >/dev/null 2>&1 || true
+    wait "${audio_sample_pid}" >/dev/null 2>&1 || true
+    audio_sample_pid=""
   fi
   for p in "${bg_group_pids[@]:-}"; do
     kill -TERM -- "-${p}" >/dev/null 2>&1 || kill "${p}" >/dev/null 2>&1 || true
@@ -360,6 +441,29 @@ if [[ "${CAPTURE_PIPEWIRE}" == "1" && "${PW_PROFILER_ENABLE}" == "1" ]] &&
    command -v pw-profiler >/dev/null 2>&1; then
   start_bg bash -lc "pw-profiler -J -n \"${PW_PROFILER_SAMPLES}\" > \"${pw_profiler_log}\" 2>&1"
 fi
+start_audio_sample() {
+  if [[ "${AUDIO_SAMPLE_AUTO}" != "1" ]]; then
+    return
+  fi
+  if command -v pw-record >/dev/null 2>&1; then
+    audio_sample_target="$(detect_hws_pw_target)"
+    if [[ -n "${audio_sample_target}" ]]; then
+      timeout --signal=INT --kill-after=5s "$((AUDIO_SAMPLE_SECONDS + 5))s" \
+        pw-record --target "${audio_sample_target}" --rate "${AUDIO_RATE}" \
+        --channels "${AUDIO_CHANNELS}" --format "${AUDIO_FORMAT}" --container wav \
+        --sample-count "$((AUDIO_SAMPLE_SECONDS * AUDIO_RATE))" "${audio_wav}" \
+        > "${audio_log}" 2>&1 &
+      audio_sample_pid="$!"
+      audio_sample_status="recording"
+    else
+      audio_sample_status="target_missing"
+      printf 'No HWS PipeWire source auto-detected; refusing to record an unrelated default source. Set AUDIO_PW_TARGET explicitly.\n' > "${audio_log}"
+    fi
+  else
+    audio_sample_status="tool_missing"
+    printf 'pw-record not found; audio sample skipped\n' > "${audio_log}"
+  fi
+}
 
 sampler() {
   while kill -0 "${obs_pid}" >/dev/null 2>&1; do
@@ -405,6 +509,7 @@ fi
 
 "${OBS_BIN}" "${obs_args[@]}" > "${obs_stdout_log}" 2>&1 &
 obs_pid=$!
+start_audio_sample
 sampler &
 bg_pids+=("$!")
 trace_pid=""
@@ -444,6 +549,14 @@ set -e
 stop_background_collectors_once
 restore_diag_once
 restore_audio_trace_once
+if [[ "${audio_sample_status}" == "recording" ]]; then
+  if [[ -s "${audio_wav}" ]]; then
+    audio_sample_status="complete"
+    generate_audio_sample_artifacts
+  else
+    audio_sample_status="no_artifact"
+  fi
+fi
 if [[ -n "${perf_pid}" ]]; then
   kill -INT "${perf_pid}" >/dev/null 2>&1 || true
   wait "${perf_pid}" >/dev/null 2>&1 || true
@@ -560,6 +673,12 @@ kernel_nvidia_gem_error_count="$(count_matches "${run_dir}/journal-kernel-since-
   echo "pw_dump_before=${pw_dump_before}"
   echo "pw_dump_after=${pw_dump_after}"
   echo "pw_profiler_log=${pw_profiler_log}"
+  echo "audio_sample_status=${audio_sample_status}"
+  echo "audio_sample_target=${audio_sample_target:-unavailable}"
+  echo "audio_wav=${audio_wav}"
+  echo "audio_metadata=${audio_metadata}"
+  echo "audio_stats=${audio_stats}"
+  echo "audio_spectrogram=${audio_spectrogram}"
   echo "obs_render_lag_line=${obs_render_lag_line}"
   echo "obs_encode_lag_line=${obs_encode_lag_line}"
   echo "obs_net_drop_line=${obs_net_drop_line}"

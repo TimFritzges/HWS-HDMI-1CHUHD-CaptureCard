@@ -13,6 +13,12 @@ COMPLIANCE_FRAMES="${COMPLIANCE_FRAMES:-60}"
 PW_PROFILER_SAMPLES="${PW_PROFILER_SAMPLES:-600}"
 V4L2_COMPLIANCE_TIMEOUT_SEC="${V4L2_COMPLIANCE_TIMEOUT_SEC:-90}"
 CAPTURE_TIMEOUT_GRACE_SEC="${CAPTURE_TIMEOUT_GRACE_SEC:-15}"
+CAPTURE_AUDIO="${CAPTURE_AUDIO:-1}"
+AUDIO_PW_TARGET="${AUDIO_PW_TARGET:-auto}"
+AUDIO_RATE="${AUDIO_RATE:-48000}"
+AUDIO_CHANNELS="${AUDIO_CHANNELS:-2}"
+AUDIO_FORMAT="${AUDIO_FORMAT:-s16}"
+AUDIO_SPECTROGRAM="${AUDIO_SPECTROGRAM:-1}"
 
 usage() {
   cat <<'USAGE'
@@ -34,6 +40,8 @@ Options:
 Environment:
   MODULE COMPLIANCE_FRAMES PW_PROFILER_SAMPLES
   V4L2_COMPLIANCE_TIMEOUT_SEC CAPTURE_TIMEOUT_GRACE_SEC
+  CAPTURE_AUDIO=0|1 AUDIO_PW_TARGET=<name>|auto AUDIO_RATE AUDIO_CHANNELS
+  AUDIO_FORMAT AUDIO_SPECTROGRAM=0|1
 
 Run only when OBS is closed; this workflow opens the V4L2 node.
 USAGE
@@ -54,7 +62,7 @@ while getopts ":d:t:s:f:o:g:h" opt; do
 done
 
 for numeric in DURATION FPS COMPLIANCE_FRAMES PW_PROFILER_SAMPLES \
-  V4L2_COMPLIANCE_TIMEOUT_SEC; do
+  V4L2_COMPLIANCE_TIMEOUT_SEC AUDIO_RATE AUDIO_CHANNELS; do
   if ! [[ "${!numeric}" =~ ^[0-9]+$ ]] || [[ "${!numeric}" -lt 1 ]]; then
     echo "Invalid ${numeric}: ${!numeric}" >&2
     exit 2
@@ -64,6 +72,12 @@ if ! [[ "${CAPTURE_TIMEOUT_GRACE_SEC}" =~ ^[0-9]+$ ]]; then
   echo "Invalid CAPTURE_TIMEOUT_GRACE_SEC: ${CAPTURE_TIMEOUT_GRACE_SEC}" >&2
   exit 2
 fi
+for toggle in CAPTURE_AUDIO AUDIO_SPECTROGRAM; do
+  if [[ "${!toggle}" != "0" && "${!toggle}" != "1" ]]; then
+    echo "Invalid ${toggle}: ${!toggle} (expected 0 or 1)" >&2
+    exit 2
+  fi
+done
 
 stamp="$(date -u +%Y%m%d-%H%M%S)"
 safe_tag="$(echo "${RUN_TAG}" | tr -cs 'A-Za-z0-9._-' '-')"
@@ -84,6 +98,12 @@ meta="${suite_dir}/suite.env"
   echo "v4l2_compliance_timeout_sec=${V4L2_COMPLIANCE_TIMEOUT_SEC}"
   echo "capture_timeout_grace_sec=${CAPTURE_TIMEOUT_GRACE_SEC}"
   echo "pw_profiler_samples=${PW_PROFILER_SAMPLES}"
+  echo "capture_audio=${CAPTURE_AUDIO}"
+  echo "audio_pw_target=${AUDIO_PW_TARGET}"
+  echo "audio_rate=${AUDIO_RATE}"
+  echo "audio_channels=${AUDIO_CHANNELS}"
+  echo "audio_format=${AUDIO_FORMAT}"
+  echo "audio_spectrogram=${AUDIO_SPECTROGRAM}"
 } > "${meta}"
 
 "${ROOT}/tools/collect-evidence.sh" --out "${suite_dir}" --phase suite-pre \
@@ -116,6 +136,12 @@ V4L2_COMPLIANCE_TIMEOUT_SEC="${V4L2_COMPLIANCE_TIMEOUT_SEC}" \
 CAPTURE_TIMEOUT_GRACE_SEC="${CAPTURE_TIMEOUT_GRACE_SEC}" \
 PW_PROFILER_SAMPLES="${PW_PROFILER_SAMPLES}" \
 CAPTURE_FULL_SNAPSHOT=1 \
+CAPTURE_AUDIO="${CAPTURE_AUDIO}" \
+AUDIO_PW_TARGET="${AUDIO_PW_TARGET}" \
+AUDIO_RATE="${AUDIO_RATE}" \
+AUDIO_CHANNELS="${AUDIO_CHANNELS}" \
+AUDIO_FORMAT="${AUDIO_FORMAT}" \
+AUDIO_SPECTROGRAM="${AUDIO_SPECTROGRAM}" \
   "${ROOT}/scripts/bench.sh" -d "${DEVICE}" -t "${DURATION}" -s "${SIZE}" \
     -f "${FPS}" -g "${safe_tag}" -o "${suite_dir}/bench" | tee "${bench_log}"
 bench_exit="${PIPESTATUS[0]}"

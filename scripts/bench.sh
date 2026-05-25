@@ -16,6 +16,12 @@ CAPTURE_TIMEOUT_GRACE_SEC="${CAPTURE_TIMEOUT_GRACE_SEC:-15}"
 CAPTURE_PIPEWIRE="${CAPTURE_PIPEWIRE:-1}"
 PW_PROFILER_SAMPLES="${PW_PROFILER_SAMPLES:-0}"
 CAPTURE_FULL_SNAPSHOT="${CAPTURE_FULL_SNAPSHOT:-1}"
+CAPTURE_AUDIO="${CAPTURE_AUDIO:-1}"
+AUDIO_PW_TARGET="${AUDIO_PW_TARGET:-auto}"
+AUDIO_RATE="${AUDIO_RATE:-48000}"
+AUDIO_CHANNELS="${AUDIO_CHANNELS:-2}"
+AUDIO_FORMAT="${AUDIO_FORMAT:-s16}"
+AUDIO_SPECTROGRAM="${AUDIO_SPECTROGRAM:-1}"
 
 usage() {
   cat <<'USAGE'
@@ -40,6 +46,12 @@ Env overrides: DEVICE DURATION OUT_BASE RUN_TAG MODULE SIZE FPS DIAG_ROOT
   CAPTURE_PIPEWIRE=0|1                Capture PipeWire evidence (default: 1)
   PW_PROFILER_SAMPLES=<n>             Profiler samples during capture (default: 0/off)
   CAPTURE_FULL_SNAPSHOT=0|1           Collect complete pre/post state snapshots (default: 1)
+  CAPTURE_AUDIO=0|1                   Record HWS PipeWire source WAV (default: 1)
+  AUDIO_PW_TARGET=<name>|auto         Explicit PipeWire source or auto-detect HWS (default: auto)
+  AUDIO_RATE=<hz>                     Requested recording rate (default: 48000)
+  AUDIO_CHANNELS=<n>                  Requested recording channels (default: 2)
+  AUDIO_FORMAT=<pw-format>            Requested PipeWire sample format (default: s16)
+  AUDIO_SPECTROGRAM=0|1              Generate PNG/statistics when WAV exists (default: 1)
 USAGE
 }
 
@@ -65,14 +77,15 @@ if ! [[ "${FPS}" =~ ^[0-9]+$ ]] || [[ "${FPS}" -lt 1 ]]; then
   echo "Invalid fps: ${FPS}" >&2
   exit 2
 fi
-for toggle in RUN_V4L2_COMPLIANCE CAPTURE_PIPEWIRE CAPTURE_FULL_SNAPSHOT; do
+for toggle in RUN_V4L2_COMPLIANCE CAPTURE_PIPEWIRE CAPTURE_FULL_SNAPSHOT \
+  CAPTURE_AUDIO AUDIO_SPECTROGRAM; do
   if [[ "${!toggle}" != "0" && "${!toggle}" != "1" ]]; then
     echo "Invalid ${toggle}: ${!toggle} (expected 0 or 1)" >&2
     exit 2
   fi
 done
 for numeric in V4L2_COMPLIANCE_STREAM_FRAMES V4L2_COMPLIANCE_TIMEOUT_SEC \
-  CAPTURE_TIMEOUT_GRACE_SEC PW_PROFILER_SAMPLES; do
+  CAPTURE_TIMEOUT_GRACE_SEC PW_PROFILER_SAMPLES AUDIO_RATE AUDIO_CHANNELS; do
   if ! [[ "${!numeric}" =~ ^[0-9]+$ ]]; then
     echo "Invalid ${numeric}: ${!numeric}" >&2
     exit 2
@@ -80,6 +93,10 @@ for numeric in V4L2_COMPLIANCE_STREAM_FRAMES V4L2_COMPLIANCE_TIMEOUT_SEC \
 done
 if [[ "${V4L2_COMPLIANCE_TIMEOUT_SEC}" -lt 1 ]]; then
   echo "Invalid V4L2_COMPLIANCE_TIMEOUT_SEC: ${V4L2_COMPLIANCE_TIMEOUT_SEC}" >&2
+  exit 2
+fi
+if [[ "${AUDIO_RATE}" -lt 1 || "${AUDIO_CHANNELS}" -lt 1 ]]; then
+  echo "Invalid audio format request: ${AUDIO_RATE} Hz, ${AUDIO_CHANNELS} channels" >&2
   exit 2
 fi
 
@@ -104,6 +121,11 @@ pw_dump_before="${outdir}/pw-dump.before.json"
 pw_dump_after="${outdir}/pw-dump.after.json"
 pw_top_log="${outdir}/pw-top.log"
 pw_profiler_log="${outdir}/pw-profiler.json"
+audio_wav="${outdir}/audio-capture.wav"
+audio_log="${outdir}/audio-capture.log"
+audio_probe_meta="${outdir}/audio-capture-metadata.txt"
+audio_stats="${outdir}/audio-capture-stats.log"
+audio_spectrogram="${outdir}/audio-capture-spectrogram.png"
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 snapshot_tool="${repo_root}/tools/collect-evidence.sh"
 
@@ -208,6 +230,102 @@ capture_pw_dump() {
   fi
 }
 
+detect_hws_pw_target() {
+  local target=""
+
+  if [[ "${AUDIO_PW_TARGET}" != "auto" ]]; then
+    printf '%s\n' "${AUDIO_PW_TARGET}"
+    return
+  fi
+  if command -v pactl >/dev/null 2>&1; then
+    target="$(pactl list short sources 2>/dev/null | awk '
+      BEGIN { IGNORECASE=1 }
+      $2 ~ /(hws|huhdvideo|uhdx1|alsa_input\.pci-0000_0f_00\.0)/ { print $2; exit }
+    ')"
+  fi
+  if [[ -z "${target}" ]] && command -v wpctl >/dev/null 2>&1; then
+    target="$(wpctl status -n 2>/dev/null | awk '
+      BEGIN { IGNORECASE=1 }
+      /(hws|huhdvideo|uhdx1|alsa_input\.pci-0000_0f_00\.0)/ {
+        for (i = 1; i <= NF; i++)
+          if ($i ~ /alsa_input\./) {
+            print $i
+            exit
+          }
+      }
+    ')"
+  fi
+  printf '%s\n' "${target}"
+}
+
+audio_pid=""
+audio_capture_status="disabled"
+audio_capture_exit_code=0
+audio_capture_target=""
+audio_capture_backend="none"
+start_audio_capture() {
+  local sample_count
+
+  if [[ "${CAPTURE_AUDIO}" != "1" ]]; then
+    return
+  fi
+  if ! command -v pw-record >/dev/null 2>&1; then
+    audio_capture_status="tool_missing"
+    printf 'pw-record not found; audio recording skipped\n' > "${audio_log}"
+    return
+  fi
+  audio_capture_target="$(detect_hws_pw_target)"
+  if [[ -z "${audio_capture_target}" ]]; then
+    audio_capture_status="target_missing"
+    printf 'No HWS PipeWire source auto-detected; refusing to record an unrelated default source. Set AUDIO_PW_TARGET explicitly.\n' > "${audio_log}"
+    return
+  fi
+  sample_count="$((DURATION * AUDIO_RATE))"
+  audio_capture_backend="pw-record"
+  audio_capture_status="running"
+  timeout --signal=INT --kill-after=5s "${capture_timeout_sec}s" \
+    pw-record --target "${audio_capture_target}" --rate "${AUDIO_RATE}" \
+    --channels "${AUDIO_CHANNELS}" --format "${AUDIO_FORMAT}" --container wav \
+    --sample-count "${sample_count}" "${audio_wav}" > "${audio_log}" 2>&1 &
+  audio_pid="$!"
+}
+
+finish_audio_capture() {
+  if [[ -z "${audio_pid}" ]]; then
+    return
+  fi
+  set +e
+  wait "${audio_pid}"
+  audio_capture_exit_code="$?"
+  set -e
+  if [[ "${audio_capture_exit_code}" == "0" && -s "${audio_wav}" ]]; then
+    audio_capture_status="pass"
+  elif [[ "${audio_capture_exit_code}" == "124" || "${audio_capture_exit_code}" == "137" ]]; then
+    audio_capture_status="timeout"
+  else
+    audio_capture_status="fail"
+  fi
+}
+
+generate_audio_artifacts() {
+  if [[ "${AUDIO_SPECTROGRAM}" != "1" || ! -s "${audio_wav}" ]] ||
+     ! command -v ffmpeg >/dev/null 2>&1; then
+    return
+  fi
+  if command -v ffprobe >/dev/null 2>&1; then
+    ffprobe -v error -select_streams a:0 \
+      -show_entries stream=codec_name,sample_fmt,sample_rate,channels,channel_layout,duration \
+      -show_entries format=duration,size,bit_rate \
+      -of default=noprint_wrappers=1 "${audio_wav}" > "${audio_probe_meta}" 2>&1 || true
+  fi
+  ffmpeg -hide_banner -nostdin -i "${audio_wav}" \
+    -af "astats=metadata=0:reset=0,volumedetect" -f null - \
+    > "${audio_stats}" 2>&1 || true
+  ffmpeg -hide_banner -nostdin -loglevel error -y -i "${audio_wav}" \
+    -lavfi "showspectrumpic=s=1600x900:legend=1:scale=log:color=intensity" \
+    -frames:v 1 "${audio_spectrogram}" > /dev/null 2>&1 || true
+}
+
 capture_debugfs_snapshot "${DIAG_ROOT}/video_diag" "${video_diag_before}"
 capture_debugfs_snapshot "${DIAG_ROOT}/audio_diag" "${audio_diag_before}"
 capture_debugfs_snapshot "${DIAG_ROOT}/source_cadence" "${source_cadence_before}"
@@ -278,6 +396,7 @@ backend="none"
 capture_status="backend_missing"
 capture_exit_code=127
 capture_timeout_sec="$((DURATION + CAPTURE_TIMEOUT_GRACE_SEC))"
+start_audio_capture
 if command -v ffmpeg >/dev/null 2>&1; then
   backend="ffmpeg"
   set +e
@@ -308,6 +427,8 @@ elif [[ "${capture_exit_code}" == "124" || "${capture_exit_code}" == "137" ]]; t
 elif [[ "${backend}" != "none" ]]; then
   capture_status="fail"
 fi
+finish_audio_capture
+generate_audio_artifacts
 stop_monitors
 trap - EXIT
 
@@ -354,6 +475,7 @@ audio_memcopy_failures_delta="$(diag_total_delta "${audio_diag_before}" "${audio
 audio_source_starved_transitions_delta="$(diag_total_delta "${audio_diag_before}" "${audio_diag_after}" source_starved_transitions)"
 audio_recovery_transitions_delta="$(diag_total_delta "${audio_diag_before}" "${audio_diag_after}" recovery_transitions)"
 audio_timer_late_events_delta="$(diag_total_delta "${audio_diag_before}" "${audio_diag_after}" timer_late_events)"
+audio_duplicate_half_seen_delta="$(diag_total_delta "${audio_diag_before}" "${audio_diag_after}" duplicate_half_seen)"
 video_reused_no_fresh_delta="$(diag_total_delta "${video_diag_before}" "${video_diag_after}" reused_no_fresh_runs)"
 video_reused_backpressure_delta="$(diag_total_delta "${video_diag_before}" "${video_diag_after}" reused_backpressure_runs)"
 video_ts_non_monotonic_delta="$(diag_total_delta "${video_diag_before}" "${video_diag_after}" ts_non_monotonic_events)"
@@ -424,6 +546,7 @@ fi
   echo "audio_source_starved_transitions_delta=${audio_source_starved_transitions_delta}"
   echo "audio_recovery_transitions_delta=${audio_recovery_transitions_delta}"
   echo "audio_timer_late_events_delta=${audio_timer_late_events_delta}"
+  echo "audio_duplicate_half_seen_delta=${audio_duplicate_half_seen_delta}"
   echo "video_reused_no_fresh_delta=${video_reused_no_fresh_delta}"
   echo "video_reused_backpressure_delta=${video_reused_backpressure_delta}"
   echo "video_ts_non_monotonic_delta=${video_ts_non_monotonic_delta}"
@@ -455,6 +578,18 @@ fi
   echo "capture_pipewire=${CAPTURE_PIPEWIRE}"
   echo "pw_profiler_samples=${PW_PROFILER_SAMPLES}"
   echo "capture_full_snapshot=${CAPTURE_FULL_SNAPSHOT}"
+  echo "capture_audio=${CAPTURE_AUDIO}"
+  echo "audio_capture_backend=${audio_capture_backend}"
+  echo "audio_capture_status=${audio_capture_status}"
+  echo "audio_capture_exit_code=${audio_capture_exit_code}"
+  echo "audio_capture_target=${audio_capture_target:-unavailable}"
+  echo "audio_rate=${AUDIO_RATE}"
+  echo "audio_channels=${AUDIO_CHANNELS}"
+  echo "audio_format=${AUDIO_FORMAT}"
+  echo "audio_wav=${audio_wav}"
+  echo "audio_probe_metadata=${audio_probe_meta}"
+  echo "audio_stats=${audio_stats}"
+  echo "audio_spectrogram=${audio_spectrogram}"
   echo "v4l2_all=${v4l2_all}"
   echo "v4l2_compliance_log=${v4l2_compliance_log}"
   echo "pw_dump_before=${pw_dump_before}"

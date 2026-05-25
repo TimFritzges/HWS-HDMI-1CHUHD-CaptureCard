@@ -25,6 +25,7 @@ AUDIO_PCM="${AUDIO_PCM:-auto}"
 AUDIO_RATE="${AUDIO_RATE:-48000}"
 AUDIO_CHANNELS="${AUDIO_CHANNELS:-2}"
 AUDIO_FORMAT="${AUDIO_FORMAT:-S16_LE}"
+AUDIO_SPECTROGRAM="${AUDIO_SPECTROGRAM:-1}"
 
 rate_per_sec() {
   awk -v d="${1}" -v s="${2}" 'BEGIN { if (s <= 0) printf "0.000"; else printf "%.3f", d / s }'
@@ -513,6 +514,7 @@ Environment:
   AUDIO_RATE       sample rate for audio probe, same as -Q
   AUDIO_CHANNELS   channel count for audio probe, same as -N
   AUDIO_FORMAT     format hint (ALSA style, default: S16_LE)
+  AUDIO_SPECTROGRAM 0|1, generate audio PNG/statistics for saved WAV (default: 1)
 USAGE
 }
 
@@ -572,6 +574,10 @@ if ! [[ "${AUDIO_CHANNELS}" =~ ^[0-9]+$ ]] || [[ "${AUDIO_CHANNELS}" -le 0 ]]; t
   echo "Invalid AUDIO_CHANNELS=${AUDIO_CHANNELS} (expected positive integer)" >&2
   exit 2
 fi
+if [[ "${AUDIO_SPECTROGRAM}" != "0" && "${AUDIO_SPECTROGRAM}" != "1" ]]; then
+  echo "Invalid AUDIO_SPECTROGRAM=${AUDIO_SPECTROGRAM} (expected 0 or 1)" >&2
+  exit 2
+fi
 
 save_raw_requested="${SAVE_RAW}"
 save_mkv_requested="${SAVE_MKV}"
@@ -618,6 +624,9 @@ mkv_capture_file="${save_dir_run}/${run_id}-capture.mkv"
 av_mkv_capture_file="${save_dir_run}/${run_id}-capture-av.mkv"
 audio_wav_file="${save_dir_run}/${run_id}-audio.wav"
 audio_raw_file="${save_dir_run}/${run_id}-audio.raw"
+audio_metadata_file="${save_dir_run}/${run_id}-audio-metadata.txt"
+audio_stats_file="${save_dir_run}/${run_id}-audio-stats.log"
+audio_spectrogram_file="${save_dir_run}/${run_id}-audio-spectrogram.png"
 history_file="${OUTDIR_BASE}/history-v4.csv"
 diag_before_file="${outdir}/${run_id}-diag.before.txt"
 diag_after_file="${outdir}/${run_id}-diag.after.txt"
@@ -664,6 +673,9 @@ if [[ -n "${SAVE_DIR}" ]]; then
   av_mkv_capture_file="${save_dir_run}/${run_id}-capture-av.mkv"
   audio_wav_file="${save_dir_run}/${run_id}-audio.wav"
   audio_raw_file="${save_dir_run}/${run_id}-audio.raw"
+  audio_metadata_file="${save_dir_run}/${run_id}-audio-metadata.txt"
+  audio_stats_file="${save_dir_run}/${run_id}-audio-stats.log"
+  audio_spectrogram_file="${save_dir_run}/${run_id}-audio-spectrogram.png"
 fi
 
 if [[ -f "${history_file}" ]]; then
@@ -849,11 +861,11 @@ if [[ "${AUDIO_TEST}" == "1" ]]; then
     if have_cmd timeout; then
       if [[ -n "${local_pw_target}" ]]; then
         timeout --signal=INT "${DURATION}s" pw-record --target "${local_pw_target}" --rate "${AUDIO_RATE}" --channels "${AUDIO_CHANNELS}" --format "${local_pw_format}" "${audio_probe_file}" > "${audio_log}" 2>&1 &
+        audio_pid=$!
+        audio_test_started=1
       else
-        timeout --signal=INT "${DURATION}s" pw-record --rate "${AUDIO_RATE}" --channels "${AUDIO_CHANNELS}" --format "${local_pw_format}" "${audio_probe_file}" > "${audio_log}" 2>&1 &
+        echo "audio_probe: no HWS PipeWire source found; refusing to capture a default unrelated source" > "${audio_log}"
       fi
-      audio_pid=$!
-      audio_test_started=1
     else
       echo "audio_probe: timeout command not available; skipping pw-record probe" > "${audio_log}"
     fi
@@ -1057,6 +1069,7 @@ audio_mean_recovery_periods="0.000"
 audio_source_starved_transitions_delta=0
 audio_recovery_transitions_delta=0
 audio_timer_late_events_delta=0
+audio_duplicate_half_seen_delta=0
 if [[ -s "${audio_diag_delta_file}" ]]; then
   audio_source_lost_periods_delta="$(awk 'NR==1 {for(i=1;i<=NF;i++) if($i=="delta_source_lost_periods") c=i; next} c {sum+=$c} END{print sum+0}' "${audio_diag_delta_file}")"
   audio_timer_silence_injects_delta="$(awk 'NR==1 {for(i=1;i<=NF;i++) if($i=="delta_timer_silence_injects") c=i; next} c {sum+=$c} END{print sum+0}' "${audio_diag_delta_file}")"
@@ -1067,6 +1080,7 @@ if [[ -s "${audio_diag_delta_file}" ]]; then
   audio_source_starved_transitions_delta="$(awk 'NR==1 {for(i=1;i<=NF;i++) if($i=="delta_source_starved_transitions") c=i; next} c {sum+=$c} END{print sum+0}' "${audio_diag_delta_file}")"
   audio_recovery_transitions_delta="$(awk 'NR==1 {for(i=1;i<=NF;i++) if($i=="delta_recovery_transitions") c=i; next} c {sum+=$c} END{print sum+0}' "${audio_diag_delta_file}")"
   audio_timer_late_events_delta="$(awk 'NR==1 {for(i=1;i<=NF;i++) if($i=="delta_timer_late_events") c=i; next} c {sum+=$c} END{print sum+0}' "${audio_diag_delta_file}")"
+  audio_duplicate_half_seen_delta="$(awk 'NR==1 {for(i=1;i<=NF;i++) if($i=="delta_duplicate_half_seen") c=i; next} c {sum+=$c} END{print sum+0}' "${audio_diag_delta_file}")"
 fi
 video_reused_no_fresh_delta=0
 video_reused_backpressure_delta=0
@@ -1168,6 +1182,20 @@ if [[ "${audio_wav_saved}" == "1" ]] && command -v ffmpeg >/dev/null 2>&1; then
   if [[ -s "${audio_raw_file}" ]]; then
     audio_raw_saved=1
   fi
+  if [[ "${AUDIO_SPECTROGRAM}" == "1" ]]; then
+    if command -v ffprobe >/dev/null 2>&1; then
+      ffprobe -v error -select_streams a:0 \
+        -show_entries stream=codec_name,sample_fmt,sample_rate,channels,channel_layout,duration \
+        -show_entries format=duration,size,bit_rate \
+        -of default=noprint_wrappers=1 "${audio_wav_file}" > "${audio_metadata_file}" 2>&1 || true
+    fi
+    ffmpeg -hide_banner -nostdin -i "${audio_wav_file}" \
+      -af "astats=metadata=0:reset=0,volumedetect" -f null - \
+      > "${audio_stats_file}" 2>&1 || true
+    ffmpeg -hide_banner -nostdin -loglevel error -y -i "${audio_wav_file}" \
+      -lavfi "showspectrumpic=s=1600x900:legend=1:scale=log:color=intensity" \
+      -frames:v 1 "${audio_spectrogram_file}" > /dev/null 2>&1 || true
+  fi
 fi
 
 # If both video MKV and audio WAV exist, generate a muxed A/V MKV.
@@ -1218,6 +1246,7 @@ fi
   echo "audio_source_starved_transitions_delta=${audio_source_starved_transitions_delta}"
   echo "audio_recovery_transitions_delta=${audio_recovery_transitions_delta}"
   echo "audio_timer_late_events_delta=${audio_timer_late_events_delta}"
+  echo "audio_duplicate_half_seen_delta=${audio_duplicate_half_seen_delta}"
   echo "video_reused_no_fresh_delta=${video_reused_no_fresh_delta}"
   echo "video_reused_backpressure_delta=${video_reused_backpressure_delta}"
   echo "video_ts_non_monotonic_delta=${video_ts_non_monotonic_delta}"
@@ -1276,6 +1305,10 @@ fi
   echo "audio_wav_saved=${audio_wav_saved}"
   echo "audio_raw_file=${audio_raw_file}"
   echo "audio_raw_saved=${audio_raw_saved}"
+  echo "audio_metadata_file=${audio_metadata_file}"
+  echo "audio_stats_file=${audio_stats_file}"
+  echo "audio_spectrogram_file=${audio_spectrogram_file}"
+  echo "audio_spectrogram_enabled=${AUDIO_SPECTROGRAM}"
   echo "raw_capture_file=${raw_capture_file}"
   echo "mkv_capture_file=${mkv_capture_file}"
   echo "av_mkv_capture_file=${av_mkv_capture_file}"

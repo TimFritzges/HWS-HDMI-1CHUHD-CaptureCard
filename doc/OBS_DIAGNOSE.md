@@ -21,6 +21,8 @@ This adds a launch wrapper that starts OBS and records long-session diagnostics 
   - kernel since run-start (+ filtered copy)
 - OBS logs generated during run (`~/.config/obs-studio/logs`)
 - PipeWire graph and timing evidence (`pw-dump`, `pw-top`, `pw-profiler`)
+- Bounded post-OBS-start HWS input audio evidence (`audio-sample.wav`,
+  metadata, statistics, and spectrogram PNG)
 - Low-overhead OBS process counters (`perf stat`)
 - Optional kernel scheduler/IRQ/hrtimer/workqueue trace via the restricted helper
 - Optional coredumps since run start
@@ -32,6 +34,11 @@ This adds a launch wrapper that starts OBS and records long-session diagnostics 
   - detailed PipeWire profiling is bounded by `PW_PROFILER_SAMPLES=600`
   - `audio_trace_enable` is set to `1` and restored when
     `AUDIO_TRACE_AUTO=1` and the updated helper is installed
+  - `AUDIO_SAMPLE_AUTO=1` records the first 30 seconds of the HWS PipeWire
+    source after OBS starts; it refuses to record an unrelated default source
+    when HWS auto-detection fails
+  - use `AUDIO_PW_TARGET=<name>` for an unusual source name or
+    `AUDIO_SAMPLE_AUTO=0` to disable sample recording
   - kernel tracing is collected automatically when `KERNEL_TRACE_AUTO=1`,
     `trace-cmd` is installed, and the updated helper passes `--trace-capable`
   - fixed-event kernel tracing is bounded by `KERNEL_TRACE_SECONDS=30` by
@@ -97,11 +104,11 @@ after updating this repository. Otherwise `meta.env` records
 
 `audio_trace_enable` is intentionally separate from `diag_enable`.
 Diagnostic OBS launches now toggle both automatically through the helper and
-restore their original values when OBS exits. To suppress trace lines for an
-ordinary long stream:
+restore their original values when OBS exits. To suppress trace lines and PCM
+recording for an ordinary long stream:
 
 ```bash
-AUDIO_TRACE_AUTO=0 KERNEL_TRACE_AUTO=0 tools/obs-diagnose.sh
+AUDIO_TRACE_AUTO=0 AUDIO_SAMPLE_AUTO=0 KERNEL_TRACE_AUTO=0 tools/obs-diagnose.sh
 ```
 
 Current `audio_diag` includes root-cause counters for:

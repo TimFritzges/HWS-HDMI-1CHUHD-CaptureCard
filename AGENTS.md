@@ -107,6 +107,9 @@ Notes:
 - Audio diagnostics now expose timing and queue pressure metrics:
   - Latency chains: `irq_to_copy_*`, `copy_to_deliver_*`, `irq_to_deliver_*`.
   - Queue pressure: `queue_free_slots_min/max/total/samples`.
+  - `duplicate_half_seen` is surfaced by the benchmark as
+    `audio_duplicate_half_seen_delta`; a non-zero value is a warning until PCM
+    evidence determines whether the repeated hardware half contained stale data.
 - Audio clock behavior added after Linux 7.0 compatibility work:
   - ALSA capture timing is driven by the PCM period timer while `pcm_running=1`.
   - Hardware audio packets are staged; the timer publishes one ALSA period per tick.
@@ -133,6 +136,11 @@ Notes:
   tracing changes that affect boot without explicit user approval.
 - `scripts/postboot-diagnose.sh` is the default isolated post-reboot gate. Run
   it only while OBS is closed because it opens the V4L2 node.
+- Isolated `scripts/bench.sh`/`scripts/postboot-diagnose.sh` runs record the
+  identified HWS PipeWire audio source by default and emit a WAV, metadata,
+  sample-statistics log, and spectrogram PNG. Auto-detection must never fall
+  back to recording an unrelated default source; pass `AUDIO_PW_TARGET`
+  explicitly if the HWS node name cannot be identified.
 - `scripts/static-check.sh --sparse yes --smatch yes` must report
   `sparse_status=pass`, `smatch_actionable_warning_count=0`, and
   `smatch_error_count=0`; `smatch_status=pass_with_style_warnings` is allowed
@@ -142,6 +150,9 @@ Notes:
 - `tools/obs-diagnose.sh` is already used by the user's OBS desktop launcher.
   It captures complete snapshots, PipeWire timing, `perf` statistics, driver
   counters, automatic audio trace lines, and fixed-event `trace-cmd` output.
+  It also records a bounded HWS-source audio WAV/spectrogram sample after OBS
+  starts when `AUDIO_SAMPLE_AUTO=1`; it must not fall back to another default
+  audio source when auto-detection fails.
   It must stop collector process groups immediately after OBS exits and bound
   post-run probes so it cannot leave diagnostic monitors running.
 - Tracefs is not user-readable on this host. The source helper
