@@ -68,7 +68,9 @@ scripts/bench.sh -d /dev/video0 -t 60 -s 1920x1080 -f 60 -g post-reboot
 New artifacts in `bench-results/<run>/` include:
 
 - `v4l2-compliance.log`: V4L2 API conformance, recorded as
-  `v4l2_compliance_status=pass|fail|tool_missing`.
+  `v4l2_compliance_status=pass|fail|timeout|tool_missing`. Compliance is
+  terminated after 90 seconds by default so a stuck driver cannot block the
+  artifact run indefinitely.
 - `pw-dump.before.json` and `pw-dump.after.json`: PipeWire graph and negotiated
   properties around the test.
 - `pw-top.log`: PipeWire error/xrun behavior while video is being captured.
@@ -84,6 +86,13 @@ For a conformance run that also exercises streaming buffers:
 
 ```bash
 V4L2_COMPLIANCE_STREAM_FRAMES=60 scripts/bench.sh -t 60 -g compliance-stream
+```
+
+Both the conformance stream and the capture backend are bounded. Override only
+for a deliberate investigation:
+
+```bash
+V4L2_COMPLIANCE_TIMEOUT_SEC=120 CAPTURE_TIMEOUT_GRACE_SEC=30 scripts/bench.sh -t 60 -g extended-timeout
 ```
 
 ## OBS Session Capture
@@ -139,7 +148,7 @@ scripts/postboot-diagnose.sh -d /dev/video0 -t 60 -g installed-check
 The command requires `sparse`, captures full pre/post state, runs a streaming
 V4L2 compliance pass and profiled benchmark, compares on-disk/runtime module
 identity, and writes a stability verdict. It exits non-zero if any required
-check fails.
+check fails or times out.
 
 ## Build And Install Checkpoint
 

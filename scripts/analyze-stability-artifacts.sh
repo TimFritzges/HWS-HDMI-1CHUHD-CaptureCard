@@ -95,7 +95,7 @@ verdict_for() {
     echo "fail stalled_without_fresh"
     return
   fi
-  if [[ "${compliance_status}" == "fail" ]]; then
+  if [[ "${compliance_status}" == "fail" || "${compliance_status}" == "timeout" ]]; then
     echo "fail v4l2_compliance"
     return
   fi
@@ -257,7 +257,7 @@ parse_bench_run() {
   local src_lost timer_silence requeues memcopy qmin qmax seq_gap fallback mismatch long_gap obs_timeout kern_timeout
   local ts_nonmono seq_nonmono reused_no_fresh reused_backpressure starved_transitions recovery_transitions timer_late
   local no_signal_placeholders stalled_placeholders fallback_last fallback_requested fallback_default
-  local active_probe_placeholder stalled_no_fresh compliance_status
+  local active_probe_placeholder stalled_no_fresh compliance_status capture_status
   local diag_available audio_diag_available artifact_status
   src_lost="$(awk -F= '/^audio_source_lost_periods_delta=/{print $2}' "${summary}" | tail -n1)"
   timer_silence="$(awk -F= '/^audio_timer_silence_injects_delta=/{print $2}' "${summary}" | tail -n1)"
@@ -284,6 +284,7 @@ parse_bench_run() {
   active_probe_placeholder="$(awk -F= '/^persistent_no_signal_with_active_probe=/{print $2}' "${summary}" | tail -n1)"
   stalled_no_fresh="$(awk -F= '/^stalled_without_fresh_frames=/{print $2}' "${summary}" | tail -n1)"
   compliance_status="$(awk -F= '/^v4l2_compliance_status=/{print $2}' "${summary}" | tail -n1)"
+  capture_status="$(awk -F= '/^capture_status=/{print $2}' "${summary}" | tail -n1)"
   diag_available="$(awk -F= '/^diag_(after_captured|available)=/{print $2}' "${summary}" | tail -n1)"
   audio_diag_available="$(awk -F= '/^(audio_diag_after_captured|audio_diag_available)=/{print $2}' "${summary}" | tail -n1)"
 
@@ -297,11 +298,14 @@ parse_bench_run() {
   fallback_last="${fallback_last:-0}"; fallback_requested="${fallback_requested:-0}"; fallback_default="${fallback_default:-0}"
   active_probe_placeholder="${active_probe_placeholder:-0}"; stalled_no_fresh="${stalled_no_fresh:-0}"
   compliance_status="${compliance_status:-not_recorded}"
+  capture_status="${capture_status:-not_recorded}"
   artifact_status="complete"
   if [[ "${diag_available:-0}" != "1" ]]; then
     artifact_status="missing_video_diag"
   elif [[ "${audio_diag_available:-0}" != "1" ]]; then
     artifact_status="missing_audio_diag"
+  elif [[ "${capture_status}" != "pass" ]]; then
+    artifact_status="capture_${capture_status}"
   fi
 
   local score

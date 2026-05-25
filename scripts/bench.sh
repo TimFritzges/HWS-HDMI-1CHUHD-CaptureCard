@@ -11,6 +11,8 @@ FPS="${FPS:-60}"
 DIAG_ROOT="${DIAG_ROOT:-}"
 RUN_V4L2_COMPLIANCE="${RUN_V4L2_COMPLIANCE:-1}"
 V4L2_COMPLIANCE_STREAM_FRAMES="${V4L2_COMPLIANCE_STREAM_FRAMES:-0}"
+V4L2_COMPLIANCE_TIMEOUT_SEC="${V4L2_COMPLIANCE_TIMEOUT_SEC:-90}"
+CAPTURE_TIMEOUT_GRACE_SEC="${CAPTURE_TIMEOUT_GRACE_SEC:-15}"
 CAPTURE_PIPEWIRE="${CAPTURE_PIPEWIRE:-1}"
 PW_PROFILER_SAMPLES="${PW_PROFILER_SAMPLES:-0}"
 CAPTURE_FULL_SNAPSHOT="${CAPTURE_FULL_SNAPSHOT:-1}"
@@ -33,6 +35,8 @@ Options:
 Env overrides: DEVICE DURATION OUT_BASE RUN_TAG MODULE SIZE FPS DIAG_ROOT
   RUN_V4L2_COMPLIANCE=0|1             Run isolated API conformance check (default: 1)
   V4L2_COMPLIANCE_STREAM_FRAMES=<n>   Stream frames during compliance (default: 0)
+  V4L2_COMPLIANCE_TIMEOUT_SEC=<n>      Terminate stuck compliance run (default: 90)
+  CAPTURE_TIMEOUT_GRACE_SEC=<n>        Grace above requested duration (default: 15)
   CAPTURE_PIPEWIRE=0|1                Capture PipeWire evidence (default: 1)
   PW_PROFILER_SAMPLES=<n>             Profiler samples during capture (default: 0/off)
   CAPTURE_FULL_SNAPSHOT=0|1           Collect complete pre/post state snapshots (default: 1)
@@ -67,12 +71,15 @@ for toggle in RUN_V4L2_COMPLIANCE CAPTURE_PIPEWIRE CAPTURE_FULL_SNAPSHOT; do
     exit 2
   fi
 done
-if ! [[ "${V4L2_COMPLIANCE_STREAM_FRAMES}" =~ ^[0-9]+$ ]]; then
-  echo "Invalid V4L2_COMPLIANCE_STREAM_FRAMES: ${V4L2_COMPLIANCE_STREAM_FRAMES}" >&2
-  exit 2
-fi
-if ! [[ "${PW_PROFILER_SAMPLES}" =~ ^[0-9]+$ ]]; then
-  echo "Invalid PW_PROFILER_SAMPLES: ${PW_PROFILER_SAMPLES}" >&2
+for numeric in V4L2_COMPLIANCE_STREAM_FRAMES V4L2_COMPLIANCE_TIMEOUT_SEC \
+  CAPTURE_TIMEOUT_GRACE_SEC PW_PROFILER_SAMPLES; do
+  if ! [[ "${!numeric}" =~ ^[0-9]+$ ]]; then
+    echo "Invalid ${numeric}: ${!numeric}" >&2
+    exit 2
+  fi
+done
+if [[ "${V4L2_COMPLIANCE_TIMEOUT_SEC}" -lt 1 ]]; then
+  echo "Invalid V4L2_COMPLIANCE_TIMEOUT_SEC: ${V4L2_COMPLIANCE_TIMEOUT_SEC}" >&2
   exit 2
 fi
 
@@ -217,14 +224,24 @@ else
 fi
 
 v4l2_compliance_status="disabled"
+v4l2_compliance_exit_code=0
 if [[ "${RUN_V4L2_COMPLIANCE}" == "1" ]]; then
   if command -v v4l2-compliance >/dev/null 2>&1; then
     compliance_args=(--device "${DEVICE}" --no-progress --color never)
     if [[ "${V4L2_COMPLIANCE_STREAM_FRAMES}" -gt 0 ]]; then
       compliance_args+=(--streaming "${V4L2_COMPLIANCE_STREAM_FRAMES}")
     fi
-    if v4l2-compliance "${compliance_args[@]}" > "${v4l2_compliance_log}" 2>&1; then
+    set +e
+    timeout --signal=TERM --kill-after=5s "${V4L2_COMPLIANCE_TIMEOUT_SEC}s" \
+      v4l2-compliance "${compliance_args[@]}" > "${v4l2_compliance_log}" 2>&1
+    v4l2_compliance_exit_code=$?
+    set -e
+    if [[ "${v4l2_compliance_exit_code}" == "0" ]]; then
       v4l2_compliance_status="pass"
+    elif [[ "${v4l2_compliance_exit_code}" == "124" || "${v4l2_compliance_exit_code}" == "137" ]]; then
+      v4l2_compliance_status="timeout"
+      printf '\nTIMEOUT: v4l2-compliance exceeded %ss\n' "${V4L2_COMPLIANCE_TIMEOUT_SEC}" \
+        >> "${v4l2_compliance_log}"
     else
       v4l2_compliance_status="fail"
     fi
@@ -258,19 +275,38 @@ if [[ "${CAPTURE_PIPEWIRE}" == "1" && "${PW_PROFILER_SAMPLES}" -gt 0 ]] &&
 fi
 
 backend="none"
+capture_status="backend_missing"
+capture_exit_code=127
+capture_timeout_sec="$((DURATION + CAPTURE_TIMEOUT_GRACE_SEC))"
 if command -v ffmpeg >/dev/null 2>&1; then
   backend="ffmpeg"
-  ffmpeg -hide_banner -nostdin -loglevel info -stats \
+  set +e
+  timeout --signal=TERM --kill-after=5s "${capture_timeout_sec}s" \
+    ffmpeg -hide_banner -nostdin -loglevel info -stats \
     -f v4l2 -framerate "${FPS}" -video_size "${SIZE}" -i "${DEVICE}" \
-    -t "${DURATION}" -an -f null - > "${capture_log}" 2>&1 || true
+    -t "${DURATION}" -an -f null - > "${capture_log}" 2>&1
+  capture_exit_code=$?
+  set -e
 elif command -v v4l2-ctl >/dev/null 2>&1; then
   backend="v4l2-ctl"
-  v4l2-ctl --verbose --device="${DEVICE}" \
+  set +e
+  timeout --signal=TERM --kill-after=5s "${capture_timeout_sec}s" \
+    v4l2-ctl --verbose --device="${DEVICE}" \
     --set-fmt-video=width="${SIZE%x*}",height="${SIZE#*x}",pixelformat=YUYV \
     --set-parm="${FPS}" --stream-mmap=3 --stream-poll \
-    --stream-count="$((DURATION * FPS))" --stream-to=/dev/null > "${capture_log}" 2>&1 || true
+    --stream-count="$((DURATION * FPS))" --stream-to=/dev/null > "${capture_log}" 2>&1
+  capture_exit_code=$?
+  set -e
 else
   echo "No capture backend found (ffmpeg or v4l2-ctl)" > "${capture_log}"
+fi
+if [[ "${capture_exit_code}" == "0" ]]; then
+  capture_status="pass"
+elif [[ "${capture_exit_code}" == "124" || "${capture_exit_code}" == "137" ]]; then
+  capture_status="timeout"
+  printf '\nTIMEOUT: capture exceeded %ss\n' "${capture_timeout_sec}" >> "${capture_log}"
+elif [[ "${backend}" != "none" ]]; then
+  capture_status="fail"
 fi
 stop_monitors
 trap - EXIT
@@ -368,6 +404,9 @@ fi
   echo "size=${SIZE}"
   echo "fps=${FPS}"
   echo "backend=${backend}"
+  echo "capture_status=${capture_status}"
+  echo "capture_exit_code=${capture_exit_code}"
+  echo "capture_timeout_sec=${capture_timeout_sec}"
   echo "actual_frames=${actual_frames}"
   echo "diag_available=${diag_available}"
   echo "audio_diag_available=${audio_diag_available}"
@@ -404,7 +443,9 @@ fi
   echo "persistent_no_signal_with_active_probe=${persistent_no_signal_with_active_probe}"
   echo "stalled_without_fresh_frames=${stalled_without_fresh_frames}"
   echo "v4l2_compliance_status=${v4l2_compliance_status}"
+  echo "v4l2_compliance_exit_code=${v4l2_compliance_exit_code}"
   echo "v4l2_compliance_stream_frames=${V4L2_COMPLIANCE_STREAM_FRAMES}"
+  echo "v4l2_compliance_timeout_sec=${V4L2_COMPLIANCE_TIMEOUT_SEC}"
   echo "capture_pipewire=${CAPTURE_PIPEWIRE}"
   echo "pw_profiler_samples=${PW_PROFILER_SAMPLES}"
   echo "capture_full_snapshot=${CAPTURE_FULL_SNAPSHOT}"

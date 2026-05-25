@@ -11,6 +11,8 @@ OUT_BASE="${OUT_BASE:-${ROOT}/bench-results}"
 RUN_TAG="${RUN_TAG:-postboot-autonomous}"
 COMPLIANCE_FRAMES="${COMPLIANCE_FRAMES:-60}"
 PW_PROFILER_SAMPLES="${PW_PROFILER_SAMPLES:-600}"
+V4L2_COMPLIANCE_TIMEOUT_SEC="${V4L2_COMPLIANCE_TIMEOUT_SEC:-90}"
+CAPTURE_TIMEOUT_GRACE_SEC="${CAPTURE_TIMEOUT_GRACE_SEC:-15}"
 
 usage() {
   cat <<'USAGE'
@@ -31,6 +33,7 @@ Options:
 
 Environment:
   MODULE COMPLIANCE_FRAMES PW_PROFILER_SAMPLES
+  V4L2_COMPLIANCE_TIMEOUT_SEC CAPTURE_TIMEOUT_GRACE_SEC
 
 Run only when OBS is closed; this workflow opens the V4L2 node.
 USAGE
@@ -50,12 +53,17 @@ while getopts ":d:t:s:f:o:g:h" opt; do
   esac
 done
 
-for numeric in DURATION FPS COMPLIANCE_FRAMES PW_PROFILER_SAMPLES; do
+for numeric in DURATION FPS COMPLIANCE_FRAMES PW_PROFILER_SAMPLES \
+  V4L2_COMPLIANCE_TIMEOUT_SEC; do
   if ! [[ "${!numeric}" =~ ^[0-9]+$ ]] || [[ "${!numeric}" -lt 1 ]]; then
     echo "Invalid ${numeric}: ${!numeric}" >&2
     exit 2
   fi
 done
+if ! [[ "${CAPTURE_TIMEOUT_GRACE_SEC}" =~ ^[0-9]+$ ]]; then
+  echo "Invalid CAPTURE_TIMEOUT_GRACE_SEC: ${CAPTURE_TIMEOUT_GRACE_SEC}" >&2
+  exit 2
+fi
 
 stamp="$(date -u +%Y%m%d-%H%M%S)"
 safe_tag="$(echo "${RUN_TAG}" | tr -cs 'A-Za-z0-9._-' '-')"
@@ -73,6 +81,8 @@ meta="${suite_dir}/suite.env"
   echo "size=${SIZE}"
   echo "fps=${FPS}"
   echo "compliance_frames=${COMPLIANCE_FRAMES}"
+  echo "v4l2_compliance_timeout_sec=${V4L2_COMPLIANCE_TIMEOUT_SEC}"
+  echo "capture_timeout_grace_sec=${CAPTURE_TIMEOUT_GRACE_SEC}"
   echo "pw_profiler_samples=${PW_PROFILER_SAMPLES}"
 } > "${meta}"
 
@@ -102,6 +112,8 @@ bench_log="${suite_dir}/bench.stdout.txt"
 bench_status="fail"
 set +e
 V4L2_COMPLIANCE_STREAM_FRAMES="${COMPLIANCE_FRAMES}" \
+V4L2_COMPLIANCE_TIMEOUT_SEC="${V4L2_COMPLIANCE_TIMEOUT_SEC}" \
+CAPTURE_TIMEOUT_GRACE_SEC="${CAPTURE_TIMEOUT_GRACE_SEC}" \
 PW_PROFILER_SAMPLES="${PW_PROFILER_SAMPLES}" \
 CAPTURE_FULL_SNAPSHOT=1 \
   "${ROOT}/scripts/bench.sh" -d "${DEVICE}" -t "${DURATION}" -s "${SIZE}" \

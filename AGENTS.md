@@ -38,6 +38,8 @@ A) `scripts/bench.sh`
 - Accept configuration via env vars/flags (device path, duration, output dir).
 - Must collect `v4l2-compliance`, pre/post HWS/PipeWire state snapshots, and
   profiling artifacts when the respective installed tools are available.
+- Streaming probes must be time-bounded and record explicit timeout status;
+  never let a stalled driver block completion of the diagnostic artifact.
 
 B) Fix `src/dkms.conf`
 - Remove deprecated features such as `CLEAN` / `REMAKE_INITRD`.
